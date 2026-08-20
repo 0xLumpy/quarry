@@ -19,7 +19,8 @@
     {"$ref": "#/$defs/aggregator_conformance_report"},
     {"$ref": "#/$defs/h0_test_report"},
     {"$ref": "#/$defs/h0_isolation_self_test"},
-    {"$ref": "#/$defs/schema_validation_report"}
+    {"$ref": "#/$defs/schema_validation_report"},
+    {"$ref": "#/$defs/docs_policy_parity_report"}
   ],
   "properties": {
     "artifact_type": {"$ref": "#/$defs/token"},
@@ -39,6 +40,7 @@
     "corpus_gate_id": {"const": "C-CORPUS-SYNTHETIC"},
     "derivation_tree_digests": {"items": {"$ref": "#/$defs/digest"}, "maxItems": 2, "minItems": 2, "type": "array"},
     "dependency_graph_digest": {"$ref": "#/$defs/digest"},
+    "docs_policy_materials": {"items": {"$ref": "#/$defs/docs_policy_material"}, "type": "array"},
     "environment": {"$ref": "#/$defs/environment"},
     "evidence_finished_at": {"$ref": "#/$defs/text"},
     "evidence_instance_id": {"$ref": "#/$defs/token"},
@@ -70,6 +72,7 @@
     "resource_limits_observed": {"$ref": "#/$defs/resources"},
     "runs": {"items": {"$ref": "#/$defs/h0_run"}, "type": "array"},
     "schema_version": {"const": "quarry.gate-artifact.v1"},
+    "selection": {"$ref": "#/$defs/docs_policy_selection"},
     "outcomes": {"items": {"$ref": "#/$defs/schema_validation_outcome"}, "type": "array"},
     "subjects": {"items": {"type": "object"}, "type": "array"},
     "source_wheel": {"$ref": "#/$defs/package_install_wheel"},
@@ -77,6 +80,7 @@
     "synthetic_value_inventory_digest": {"$ref": "#/$defs/digest"},
     "trial_invalidations_digest": {"$ref": "#/$defs/digest"},
     "test_nodeid": {"type": "string"},
+    "test_results": {"items": {"$ref": "#/$defs/docs_policy_test_result"}, "type": "array"},
     "test_source_digest": {"$ref": "#/$defs/digest"},
     "trials": {"items": {"$ref": "#/$defs/trial"}, "maxItems": 1000, "minItems": 1, "type": "array"},
     "warmup_runs": {"$ref": "#/$defs/count"}
@@ -153,6 +157,30 @@
       "type": "object"
     },
     "digest": {"pattern": "^sha256:[0-9a-f]{64}$", "type": "string"},
+    "docs_policy_material": {
+      "additionalProperties": false,
+      "properties": {"digest": {"$ref": "#/$defs/digest"}, "name": {"$ref": "#/$defs/token"}, "path": {"$ref": "#/$defs/text"}},
+      "required": ["digest", "name", "path"],
+      "type": "object"
+    },
+    "docs_policy_parity_report": {
+      "additionalProperties": false,
+      "properties": {"artifact_type": {"const": "docs-policy-parity-report"}, "candidate_identity_digest": {"$ref": "#/$defs/digest"}, "docs_policy_materials": {"items": {"$ref": "#/$defs/docs_policy_material"}, "minItems": 20, "maxItems": 20, "type": "array", "uniqueItems": true}, "environment": {"$ref": "#/$defs/environment"}, "evidence_finished_at": {"$ref": "#/$defs/text"}, "evidence_instance_id": {"$ref": "#/$defs/token"}, "evidence_started_at": {"$ref": "#/$defs/text"}, "gate_id": {"const": "B-DOCS-POLICY"}, "name": {"const": "docs-policy-parity"}, "release": {"const": "0.3.10"}, "schema_version": {"const": "quarry.gate-artifact.v1"}, "selection": {"$ref": "#/$defs/docs_policy_selection"}, "test_results": {"items": {"$ref": "#/$defs/docs_policy_test_result"}, "minItems": 13, "maxItems": 13, "type": "array"}, "test_source_digest": {"$ref": "#/$defs/digest"}},
+      "required": ["artifact_type", "candidate_identity_digest", "docs_policy_materials", "environment", "evidence_finished_at", "evidence_instance_id", "evidence_started_at", "gate_id", "name", "release", "schema_version", "selection", "test_results", "test_source_digest"],
+      "type": "object"
+    },
+    "docs_policy_test_result": {
+      "additionalProperties": false,
+      "properties": {"nodeid": {"minLength": 1, "type": "string"}, "status": {"const": "pass"}},
+      "required": ["nodeid", "status"],
+      "type": "object"
+    },
+    "docs_policy_selection": {
+      "additionalProperties": false,
+      "properties": {"collected": {"$ref": "#/$defs/count"}, "deselected": {"$ref": "#/$defs/count"}, "failed": {"$ref": "#/$defs/count"}, "passed": {"$ref": "#/$defs/count"}, "selected": {"$ref": "#/$defs/count"}, "skipped": {"$ref": "#/$defs/count"}, "xfailed": {"$ref": "#/$defs/count"}, "xpassed": {"$ref": "#/$defs/count"}},
+      "required": ["collected", "deselected", "failed", "passed", "selected", "skipped", "xfailed", "xpassed"],
+      "type": "object"
+    },
     "environment": {
       "additionalProperties": false,
       "properties": {"architecture": {"$ref": "#/$defs/text"}, "isolation_profile": {"$ref": "#/$defs/digest"}, "os": {"$ref": "#/$defs/text"}, "python": {"$ref": "#/$defs/text"}, "runner_image": {"$ref": "#/$defs/digest"}},

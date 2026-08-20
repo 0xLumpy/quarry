@@ -106,3 +106,85 @@ def test_all_fenced_yaml_examples_parse():
             except yaml.YAMLError as e:
                 bad.append(f"{md.name}: {e}")
     assert not bad, f"unparseable YAML examples: {bad}"
+
+
+def test_readme_states_the_current_source_count():
+    from quarry_recon import sources
+
+    assert len(sources.all_sources()) == 67
+    assert "67 sources" in (ROOT / "README.md").read_text()
+
+
+def test_source_registry_has_exact_ownership_and_transport_references():
+    from quarry_recon import network_policy, policy, sources
+
+    registered = set(sources.all_sources())
+    assert sources.validate() == []
+    assert set(policy.SOURCE_OWNERSHIP) == registered
+    assert set(network_policy.REGISTERED_TRANSPORT_DOORS) == registered
+
+
+def test_nuclei_policy_label_is_exact_in_registry_and_generated_docs():
+    from quarry_recon import nuclei_policy, sources
+
+    tools = yaml.safe_load((DATA / "tools.yaml").read_text())["tools"]
+    nuclei = next(tool for tool in tools if tool["bin"] == "nuclei")
+    label = "broad active vulnerability verification"
+    assert nuclei["role"].startswith(label)
+    assert f"| `nuclei` | {label.capitalize()}" in _read("tools.md")
+    assert nuclei_policy.OWNER_DESCRIPTIONS == {
+        "probe.nuclei_waf": "WAF fingerprinting",
+        "enrich.nuclei_waf": "WAF fingerprinting",
+        "params.nuclei_takeover": "subdomain takeover verification",
+        "params.nuclei_scan": label,
+    }
+    assert tuple(nuclei_policy.OWNER_DESCRIPTIONS) == nuclei_policy.OWNERS
+    assert set(nuclei_policy.OWNERS) <= {
+        source_id for source_id, source in sources.all_sources().items()
+        if source["tool"] == "nuclei"
+    }
+
+
+def test_private_reach_default_and_protected_exclusions_are_documented():
+    from quarry_recon.config import TargetProfile
+    from quarry_recon import netguard
+
+    target = yaml.safe_load((DATA / "target.template.yaml").read_text())
+    profile = TargetProfile("docs-policy", [], [], [], [], {}, [], {}, [])
+    assert target["MODES"]["BLOCK_PRIVATE_TARGETS"] is False
+    assert profile.block_private_targets is False
+    assert netguard.is_contactable_ip("10.0.0.1")
+    for protected in ("127.0.0.1", "169.254.169.254"):
+        assert not netguard.is_contactable_ip(protected)
+    page = _read("target-reference.md")
+    assert "`BLOCK_PRIVATE_TARGETS` | `false`" in page
+    for exclusion in ("Scanner-self", "loopback", "link-local", "metadata"):
+        assert exclusion in page
+
+
+def test_oob_public_self_hosted_and_off_transport_are_documented():
+    from quarry_recon.config import TargetProfile
+    from quarry_recon import nuclei_policy
+
+    oob = _read("oob.md")
+    readme = (ROOT / "README.md").read_text()
+    target = yaml.safe_load((DATA / "target.template.yaml").read_text())
+    profile = TargetProfile("docs-policy", [], [], [], [], {}, [], {}, [])
+    plan = nuclei_policy.default_plan_summary()
+    assert "public" in oob and "self-hosted" in oob
+    assert "ephemeral owner-only `0600` config file" in oob
+    assert "`-config`" in oob and "`--config`" in oob
+    assert "`-token`" not in oob and "`-itoken`" not in oob
+    assert target["MODES"]["OOB_ENABLED"] is True
+    assert profile.oob_enabled is True
+    assert plan["modes"] == {
+        "oob_backend": "public-interactsh", "oob_enabled": True,
+        "block_private_targets": False,
+    }
+    assert plan["channels"] == [
+        {"owner": "params.oob_probe", "enabled": True, "oob_backend": "public-interactsh"},
+        {"owner": "quarry.oob_poll", "enabled": True, "oob_backend": "public-interactsh"},
+        {"owner": "params.dalfox_blind_oob", "enabled": False, "oob_backend": "off"},
+        {"owner": "quarry.oob_import", "enabled": True, "oob_backend": "local-only"},
+    ]
+    assert "Set `MODES.OOB_ENABLED: false`" in readme

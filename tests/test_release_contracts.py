@@ -470,6 +470,41 @@ def _supporting_bodies(
             "release": "0.3.10",
             "schema_version": contracts.GATE_ARTIFACT_SCHEMA,
         })
+    elif gate_id == "B-DOCS-POLICY":
+        instance = evidence_instances[0]
+        materials = [{
+            "digest": next(row["digest"] for row in scope["input_bindings"] if row["name"] == name),
+            "name": name,
+            "path": next(row["path"] for row in scope["input_bindings"] if row["name"] == name),
+        } for name in contracts._DOCS_POLICY_MATERIALS]
+        selection = {
+            "collected": len(contracts._DOCS_POLICY_TEST_ROSTER), "deselected": 0, "failed": 0,
+            "passed": len(contracts._DOCS_POLICY_TEST_ROSTER),
+            "selected": len(contracts._DOCS_POLICY_TEST_ROSTER), "skipped": 0,
+            "xfailed": 0, "xpassed": 0,
+        }
+        bodies["parity-report"] = contracts.canonical_json_line({
+            "artifact_type": "docs-policy-parity-report",
+            "candidate_identity_digest": evidence.canonical_digest(identity),
+            "docs_policy_materials": materials,
+            "environment": instance["environment"],
+            "evidence_finished_at": instance["finished_at"],
+            "evidence_instance_id": instance["id"],
+            "evidence_started_at": instance["started_at"],
+            "gate_id": gate_id,
+            "name": "docs-policy-parity",
+            "release": "0.3.10",
+            "schema_version": contracts.GATE_ARTIFACT_SCHEMA,
+            "selection": selection,
+            "test_results": [
+                {"nodeid": nodeid, "status": "pass"}
+                for nodeid in contracts._DOCS_POLICY_TEST_ROSTER
+            ],
+            "test_source_digest": next(
+                row["digest"] for row in scope["input_bindings"]
+                if row["name"] == "docs-parity-tests"
+            ),
+        })
     elif gate_id == "B-HERMETIC-ALL":
         h0_environments = [
             copy.deepcopy(instance["environment"])
@@ -1187,6 +1222,13 @@ def _scenario(tmp_path: Path, *, approved_at: str = "2026-08-01T00:00:00Z"):
                         "collected": 10, "deselected": 4, "failed": 0, "passed": 6,
                         "selected": 6, "skipped": 0, "xfailed": 0, "xpassed": 0,
                     }
+                if gate_id == "B-DOCS-POLICY":
+                    selection = {
+                        "collected": len(contracts._DOCS_POLICY_TEST_ROSTER), "deselected": 0,
+                        "failed": 0, "passed": len(contracts._DOCS_POLICY_TEST_ROSTER),
+                        "selected": len(contracts._DOCS_POLICY_TEST_ROSTER), "skipped": 0,
+                        "xfailed": 0, "xpassed": 0,
+                    }
                 instances.append({
                     "artifacts": [],
                     "assertions": [assertion],
@@ -1327,6 +1369,8 @@ def _scenario(tmp_path: Path, *, approved_at: str = "2026-08-01T00:00:00Z"):
                 name: sum(instance["selection"][name] for instance in instances)
                 for name in selection
             }
+        if gate_id == "B-DOCS-POLICY":
+            selection = copy.deepcopy(instances[0]["selection"])
         rule = None
         reason = None
         status = "pass"
@@ -1644,6 +1688,7 @@ class TestCommittedContracts:
             "benchmark_report", "sbom", "provenance", "publication_subjects",
             "synthetic_corpus_disclosure_attestation", "aggregator_conformance_report",
             "h0_test_report", "h0_isolation_self_test", "schema_validation_report",
+            "docs_policy_parity_report",
         ]
         discriminators = []
         for name in variant_names:
@@ -1870,7 +1915,7 @@ class TestIncompleteSemanticRegistry:
             set(contracts.RESOURCE_SEMANTIC_GATES)
             | {
                 "A-IDENTITY", "A-EVIDENCE-SCHEMA", "A-TAXONOMY", "A-CORPUS", "A-THRESHOLDS", "A-SUPPORT",
-                "B-HERMETIC-ALL", "B-SCHEMA",
+                "B-HERMETIC-ALL", "B-SCHEMA", "B-DOCS-POLICY",
                 "C-PACKAGE-BUILD", "C-PACKAGE-INSTALL", "C-NETWORK-BOUNDARY", "C-NET-DENY",
                 *contracts.V310_05_SEMANTIC_GATES,
             }
@@ -1958,6 +2003,56 @@ class TestSchemaValidationSemanticEvidence:
         })
         with pytest.raises(evidence.EvidenceError, match="exact signed gate artifact"):
             contracts._semantic_schema_validation(gate, bodies, **context)
+
+
+class TestDocsPolicySemanticEvidence:
+    @staticmethod
+    def _case(tmp_path):
+        arguments = _scenario(tmp_path)
+        gate = _gate(arguments, "B-DOCS-POLICY")
+        bodies = {
+            row["name"]: (arguments["artifact_root"] / row["path"]).read_bytes()
+            for row in arguments["artifact_index"]["artifacts"]
+            if row["gate_id"] == "B-DOCS-POLICY"
+        }
+        report = contracts.read_evidence_report(
+            bodies.pop("gate-evidence"), identity=arguments["identity"], gate_id="B-DOCS-POLICY",
+        )
+        return gate, bodies, {
+            "identity": arguments["identity"], "input_bodies": arguments["input_bodies"],
+            "report": report, "scope": arguments["scope"],
+        }
+
+    def test_fixed_candidate_h0_roster_and_materials_are_accepted(self, tmp_path):
+        gate, bodies, context = self._case(tmp_path)
+        contracts._semantic_docs_policy(gate, bodies, **context)
+
+    def test_unsigned_parity_report_substitution_fails_closed(self, tmp_path):
+        gate, bodies, context = self._case(tmp_path)
+        document = json.loads(bodies["parity-report"])
+        document["test_results"].reverse()
+        bodies["parity-report"] = contracts.canonical_json_line(document)
+        with pytest.raises(evidence.EvidenceError, match="exact signed artifact digest"):
+            contracts._semantic_docs_policy(gate, bodies, **context)
+
+    @pytest.mark.parametrize(
+        ("mutate", "match"),
+        [
+            (lambda doc: doc.update(candidate_identity_digest=_digest("0")), "wrong candidate"),
+            (lambda doc: doc["test_results"].reverse(), "test roster or order"),
+            (lambda doc: doc["docs_policy_materials"].pop(), "material roster"),
+            (lambda doc: doc["selection"].update(passed=12), "counts do not reconcile"),
+        ],
+    )
+    def test_candidate_roster_material_and_count_substitution_fail_closed(self, tmp_path, mutate, match):
+        gate, bodies, context = self._case(tmp_path)
+        document = json.loads(bodies["parity-report"])
+        mutate(document)
+        bodies["parity-report"] = contracts.canonical_json_line(document)
+        next(item for item in gate["artifacts"] if item["name"] == "parity-report")["digest"] = \
+            contracts.raw_sha256(bodies["parity-report"])
+        with pytest.raises(evidence.EvidenceError, match=match):
+            contracts._semantic_docs_policy(gate, bodies, **context)
 
 
 class TestH0HermeticSemanticEvidence:

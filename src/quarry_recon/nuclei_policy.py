@@ -32,6 +32,12 @@ OWNERS = (
     "params.nuclei_takeover",
     "params.nuclei_scan",
 )
+OWNER_DESCRIPTIONS = {
+    "probe.nuclei_waf": "WAF fingerprinting",
+    "enrich.nuclei_waf": "WAF fingerprinting",
+    "params.nuclei_takeover": "subdomain takeover verification",
+    "params.nuclei_scan": "broad active vulnerability verification",
+}
 OOB_CHANNELS = (
     "params.oob_probe",
     "quarry.oob_poll",
@@ -1250,9 +1256,7 @@ def build_document(*, run_id: str, profile, template_root: Path, config_root: Pa
         )
         owners.append({
             "owner": owner,
-            "description": ("broad active vulnerability verification" if owner == "params.nuclei_scan"
-                            else "subdomain takeover verification" if owner == "params.nuclei_takeover"
-                            else "WAF fingerprinting"),
+            "description": OWNER_DESCRIPTIONS[owner],
             "flags": flags,
             "private_config": private_config,
             "oob_enabled": owner_channel["enabled"],
@@ -1343,13 +1347,7 @@ def _validate_accepted_flags(owner: dict, modes: dict) -> None:
     if type(flags) is not list or any(type(value) is not str or not value for value in flags):
         raise NucleiPolicyError("Nuclei owner flags are not a strict string vector")
     name = owner["owner"]
-    descriptions = {
-        "probe.nuclei_waf": "WAF fingerprinting",
-        "enrich.nuclei_waf": "WAF fingerprinting",
-        "params.nuclei_takeover": "subdomain takeover verification",
-        "params.nuclei_scan": "broad active vulnerability verification",
-    }
-    if owner["description"] != descriptions[name]:
+    if owner["description"] != OWNER_DESCRIPTIONS[name]:
         raise NucleiPolicyError("Nuclei owner description misstates its accepted policy")
     if name == "params.nuclei_scan":
         prefix = [

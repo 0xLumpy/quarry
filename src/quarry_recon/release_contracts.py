@@ -443,6 +443,27 @@ SCOPE_INPUT_PATHS = {
     **RUN_MANIFEST_INPUT_PATHS,
     **RUNNER_INPUT_PATHS,
     "release-contracts-tests": "tests/test_release_contracts.py",
+    "docs-parity-tests": "tests/test_docs_parity.py",
+    "docs-policy-readme": "README.md",
+    "docs-policy-oob": "docs/oob.md",
+    "docs-policy-target-reference": "docs/target-reference.md",
+    "docs-policy-configuration": "docs/configuration.md",
+    "docs-policy-secrets": "docs/secrets.md",
+    "docs-policy-external-integrations": "docs/external-integrations.md",
+    "docs-policy-outputs-coverage": "docs/outputs-and-coverage.md",
+    "docs-policy-release-gates": "docs/releases/RELEASE-GATES.md",
+    "docs-policy-tools-index": "docs/tools.md",
+    "docs-policy-tools-index-generator": "scripts/gen_tool_index.py",
+    "docs-policy-target-template": "src/quarry_recon/data/target.template.yaml",
+    "docs-policy-config-template": "src/quarry_recon/data/config.template.yaml",
+    "docs-policy-tools-registry": "src/quarry_recon/data/tools.yaml",
+    "docs-policy-sources-registry": "src/quarry_recon/data/sources.yaml",
+    "docs-policy-sources-module": "src/quarry_recon/sources.py",
+    "docs-policy-ownership-policy": "src/quarry_recon/policy.py",
+    "docs-policy-transport-doors": "src/quarry_recon/network_policy.py",
+    "docs-policy-target-profile": "src/quarry_recon/config.py",
+    "docs-policy-nuclei-runtime": "src/quarry_recon/nuclei_policy.py",
+    "docs-policy-private-reach-runtime": "src/quarry_recon/netguard.py",
     "release-contracts-validator": "src/quarry_recon/release_contracts.py",
     "resource-gate-report-validator": "src/quarry_recon/resource_contract.py",
     "schema-validation-registry": evidence.REGISTRY_PATH,
@@ -455,6 +476,45 @@ SCOPE_INPUT_PATHS = {
         for name, path in SCHEMA_VALIDATION_FIXTURE_PATHS.items()
     },
 }
+
+_DOCS_POLICY_TEST_PATH = "tests/test_docs_parity.py"
+_DOCS_POLICY_TEST_ROSTER = (
+    "tests/test_docs_parity.py::test_every_config_key_is_documented",
+    "tests/test_docs_parity.py::test_every_target_field_and_mode_is_documented",
+    "tests/test_docs_parity.py::test_every_secret_block_is_documented",
+    "tests/test_docs_parity.py::test_all_relative_doc_links_resolve",
+    "tests/test_docs_parity.py::test_every_command_is_documented_somewhere",
+    "tests/test_docs_parity.py::test_every_entity_is_documented",
+    "tests/test_docs_parity.py::test_every_coverage_kind_is_documented_with_its_class",
+    "tests/test_docs_parity.py::test_all_fenced_yaml_examples_parse",
+    "tests/test_docs_parity.py::test_readme_states_the_current_source_count",
+    "tests/test_docs_parity.py::test_source_registry_has_exact_ownership_and_transport_references",
+    "tests/test_docs_parity.py::test_nuclei_policy_label_is_exact_in_registry_and_generated_docs",
+    "tests/test_docs_parity.py::test_private_reach_default_and_protected_exclusions_are_documented",
+    "tests/test_docs_parity.py::test_oob_public_self_hosted_and_off_transport_are_documented",
+)
+_DOCS_POLICY_MATERIALS = (
+    "docs-policy-readme",
+    "docs-policy-oob",
+    "docs-policy-target-reference",
+    "docs-policy-configuration",
+    "docs-policy-secrets",
+    "docs-policy-external-integrations",
+    "docs-policy-outputs-coverage",
+    "docs-policy-release-gates",
+    "docs-policy-tools-index",
+    "docs-policy-tools-index-generator",
+    "docs-policy-target-template",
+    "docs-policy-config-template",
+    "docs-policy-tools-registry",
+    "docs-policy-sources-registry",
+    "docs-policy-sources-module",
+    "docs-policy-ownership-policy",
+    "docs-policy-transport-doors",
+    "docs-policy-target-profile",
+    "docs-policy-nuclei-runtime",
+    "docs-policy-private-reach-runtime",
+)
 PRODUCTION_TRUST_POLICY_PATH = "release/evidence/trust-policy-v1.json"
 
 _DIGEST_RE = evidence._DIGEST_RE
@@ -4011,6 +4071,76 @@ def _h0_artifact(
     return doc
 
 
+def _semantic_docs_policy(
+    gate: dict, bodies: Mapping[str, bytes], **context: object,
+) -> None:
+    """Bind the fixed docs-policy tests to one signed H0 result and their truth bytes."""
+    if gate["gate_id"] != "B-DOCS-POLICY":  # pragma: no cover - registry invariant
+        raise evidence.EvidenceError("docs-policy verifier received the wrong gate")
+    identity = context["identity"]
+    report = context["report"]
+    scope = context["scope"]
+    inputs = context["input_bodies"]
+    if not isinstance(identity, dict) or not isinstance(report, dict) or not isinstance(scope, dict) or not isinstance(inputs, Mapping):
+        raise evidence.EvidenceError("docs-policy verifier requires accepted release context")
+    signed = next((item for item in gate["artifacts"] if item["name"] == "parity-report"), None)
+    if (signed is None or signed["media_type"] != "application/json" or
+            signed["digest"] != raw_sha256(bodies["parity-report"])):
+        raise evidence.EvidenceError("docs-policy report does not match its exact signed artifact digest")
+    doc = _object(
+        _artifact_document(bodies["parity-report"], "B-DOCS-POLICY", "parity-report"),
+        "docs-policy parity report", {
+            "artifact_type", "candidate_identity_digest", "docs_policy_materials", "environment",
+            "evidence_finished_at", "evidence_instance_id", "evidence_started_at", "gate_id",
+            "name", "release", "schema_version", "selection", "test_results", "test_source_digest",
+        },
+    )
+    if {key: doc[key] for key in ("artifact_type", "candidate_identity_digest", "gate_id", "name", "release", "schema_version")} != {
+        "artifact_type": "docs-policy-parity-report",
+        "candidate_identity_digest": evidence.canonical_digest(identity),
+        "gate_id": "B-DOCS-POLICY",
+        "name": "docs-policy-parity",
+        "release": RELEASE,
+        "schema_version": GATE_ARTIFACT_SCHEMA,
+    }:
+        raise evidence.EvidenceError("docs-policy report has the wrong candidate, gate, release or name")
+    instances = report["instances"]
+    if len(instances) != 1:
+        raise evidence.EvidenceError("docs-policy report requires one exact signed H0 evidence instance")
+    instance = instances[0]
+    if (instance["lane"] != "H0-hermetic" or doc["evidence_instance_id"] != instance["id"] or
+            doc["environment"] != instance["environment"] or
+            doc["evidence_started_at"] != instance["started_at"] or
+            doc["evidence_finished_at"] != instance["finished_at"]):
+        raise evidence.EvidenceError("docs-policy report does not bind its exact signed H0 instance")
+    bindings = {item["name"]: item for item in scope["input_bindings"]}
+    test_binding = bindings.get("docs-parity-tests")
+    if (test_binding is None or test_binding["path"] != _DOCS_POLICY_TEST_PATH or
+            inputs.get("docs-parity-tests") is None or
+            raw_sha256(inputs["docs-parity-tests"]) != test_binding["digest"] or
+            doc["test_source_digest"] != test_binding["digest"]):
+        raise evidence.EvidenceError("docs-policy report does not bind the frozen parity test source")
+    expected_materials = []
+    for name in _DOCS_POLICY_MATERIALS:
+        binding = bindings.get(name)
+        if binding is None or inputs.get(name) is None or raw_sha256(inputs[name]) != binding["digest"]:
+            raise evidence.EvidenceError("docs-policy material is absent or drifted from the frozen scope")
+        expected_materials.append({"digest": binding["digest"], "name": name, "path": binding["path"]})
+    if doc["docs_policy_materials"] != expected_materials:
+        raise evidence.EvidenceError("docs-policy report does not bind the exact frozen material roster")
+    results = _array(doc["test_results"], "docs-policy parity report.test_results")
+    expected_results = [{"nodeid": nodeid, "status": "pass"} for nodeid in _DOCS_POLICY_TEST_ROSTER]
+    if results != expected_results:
+        raise evidence.EvidenceError("docs-policy report test roster or order is not exact and passing")
+    expected_selection = {
+        "collected": len(expected_results), "deselected": 0, "failed": 0,
+        "passed": len(expected_results), "selected": len(expected_results), "skipped": 0,
+        "xfailed": 0, "xpassed": 0,
+    }
+    if doc["selection"] != expected_selection or instance["selection"] != expected_selection or gate["selection"] != expected_selection:
+        raise evidence.EvidenceError("docs-policy report and signed gate counts do not reconcile")
+
+
 def _semantic_h0_hermetic_all(
     gate: dict, bodies: Mapping[str, bytes], **context: object,
 ) -> None:
@@ -4530,6 +4660,7 @@ SEMANTIC_VERIFIERS = MappingProxyType({
     "A-SUPPORT": _semantic_support,
     "B-HERMETIC-ALL": _semantic_h0_hermetic_all,
     "B-SCHEMA": _semantic_schema_validation,
+    "B-DOCS-POLICY": _semantic_docs_policy,
     "C-PACKAGE-BUILD": _semantic_package_build,
     "C-NETWORK-BOUNDARY": _semantic_network_boundary,
     "C-NET-DENY": _semantic_network_denial,

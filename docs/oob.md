@@ -32,10 +32,10 @@ oob:
 Standing up a server is upstream work — see [external-integrations.md](external-integrations.md).
 
 > **`auth_token` needs a `callback_server`.** Quarry drops it unless a valid callback host is configured,
-> so it is never sent to the public backend. It is passed to `interactsh-client -token` and to nuclei as
-> `-itoken` — a command-line flag, not a hidden file (only dalfox's blind-XSS token uses an ephemeral
-> `0600` config). Configured secrets are redacted from Quarry's records, but not from what a tool sends to
-> its own backend.
+> so it is never sent to the public backend. For every owner that needs it, Quarry writes the credential to
+> an ephemeral owner-only `0600` config file and passes that file with the tool's config-file option
+> (`-config` or `--config`); the token itself is never placed in argv. Configured secrets are redacted from Quarry's records, but not from
+> what a tool sends to its own backend.
 
 ## Delayed callbacks
 

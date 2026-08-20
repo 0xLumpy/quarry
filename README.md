@@ -4,7 +4,7 @@ Reconnaissance automation for bug bounty and authorized security testing.
 
 Quarry runs a full recon methodology from one CLI: subdomain discovery, DNS and HTTP
 fingerprinting, crawling, JS analysis, content discovery and parameter scanning — across 38 tools
-and 66 sources, into one structured JSONL store you can grep, export and hand to a human.
+and 67 sources, into one structured JSONL store you can grep, export and hand to a human.
 
 It is built for long runs on real targets. Typed tool outcomes, explicit coverage, durable evidence and
 honest remainder are core contracts. `v0.3.9` does not yet enforce those contracts uniformly across every
@@ -132,6 +132,7 @@ MODES:
   CONTENT_DISCOVERY: "off"    # off | light | balanced | deep
   CONTENT_RECURSION: 0
   BLOCK_PRIVATE_TARGETS: false
+  OOB_ENABLED: true           # set false to disable network OOB callback transport
   SECRET_VERIFICATION: false  # sends found credentials to their providers
   BLIND_XSS: false            # stored payloads that fire later
   DEEP_EVIDENCE: false        # downloads heapdumps instead of flagging them

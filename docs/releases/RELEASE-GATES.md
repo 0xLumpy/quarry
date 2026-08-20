@@ -199,11 +199,15 @@ These are mandatory on every change and run only in `H0-hermetic`.
 | `B-COVERAGE` | Quality | Line/branch coverage meets versioned repository and critical-module thresholds and does not regress beyond the allowed delta | Coverage data tied to collected test identities and threshold manifest |
 | `B-STATIC-SECURITY` | Security | Secret scan, static security rules, unsafe API inventory, archive/path/config fuzz properties, and dependency-manifest checks pass | Findings in a stable machine format with suppression IDs and expiry |
 | `B-DETERMINISM` | Functional | Canonical serializers, synthetic fixture generation, reports, manifests, and derived views are byte-stable across two isolated runs | Paired artifact tree digests and structured diff |
-| `B-DOCS-POLICY` | Professionalism | CLI/help/config/schema/source registry and policy labels agree; broad Nuclei, private reach, and public Interactsh choices are stated accurately | Generated parity report and policy/config digest |
+| `B-DOCS-POLICY` | Professionalism | CLI/help/config/schema/source registry and policy labels agree; broad Nuclei, private reach, and public Interactsh choices are stated accurately | Candidate-bound parity report: fixed passing test roster, raw test/material digests, and one signed H0 instance |
 
 At Phase 0 these gates are `open` as release gates even when constituent tests
 already pass locally, because accepted full-suite execution, release-runtime,
 threshold, and machine-evidence contracts have not been configured.
+
+`B-DOCS-POLICY` therefore remains `open` until its candidate-bound report is
+accepted from an H0-hermetic evidence instance; a locally passing parity suite
+does not close the gate.
 
 ### Phase C: release-candidate gates
 
