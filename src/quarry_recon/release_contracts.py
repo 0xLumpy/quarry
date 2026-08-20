@@ -3282,10 +3282,24 @@ PROVISIONAL_SEMANTIC_VERIFIERS = MappingProxyType({
     "E-ARTIFACTS": _semantic_publication_subjects,
 })
 
+
+def _semantic_identity(
+    _gate: dict, bodies: Mapping[str, bytes], **context: object,
+) -> None:
+    expected = context["identity"]
+    body = bodies["identity-verification"]
+    observed = read_candidate_identity(body)
+    if observed != expected or body != canonical_json_line(expected):
+        raise evidence.EvidenceError(
+            "identity-verification artifact is not the exact candidate identity"
+        )
+
+
 # Only obligation-owned parsers whose complete supporting graph is recomputed
 # are promoted.  In particular C-PERF-PHASE-FAIRNESS stays fail-closed until a
 # typed per-obligation roster can be reconciled with C-POLICY-TRACE.
 SEMANTIC_VERIFIERS = MappingProxyType({
+    "A-IDENTITY": _semantic_identity,
     "C-NETWORK-BOUNDARY": _semantic_network_boundary,
     "C-NET-DENY": _semantic_network_denial,
     "C-FAULT-DISK": _semantic_resource_fault,

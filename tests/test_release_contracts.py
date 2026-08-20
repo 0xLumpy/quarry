@@ -281,7 +281,9 @@ def _supporting_bodies(
 ) -> dict[str, bytes]:
     names = [name for name, _media_type in contracts.required_artifact_contract(gate_id)]
     bodies: dict[str, bytes] = {}
-    if gate_id == "C-PACKAGE-BUILD":
+    if gate_id == "A-IDENTITY":
+        bodies["identity-verification"] = contracts.canonical_json_line(identity)
+    elif gate_id == "C-PACKAGE-BUILD":
         bodies["sdist"] = _synthetic_sdist()
         bodies["wheel"] = _synthetic_wheel()
         bodies["package-inventory"] = contracts.canonical_json_line({
@@ -1417,13 +1419,13 @@ class TestIncompleteSemanticRegistry:
     def test_production_aggregation_refuses_unimplemented_obligation_semantics(self, tmp_path):
         assert set(contracts.SEMANTIC_VERIFIERS) == (
             set(contracts.RESOURCE_SEMANTIC_GATES)
-            | {"C-NETWORK-BOUNDARY", "C-NET-DENY"}
+            | {"A-IDENTITY", "C-NETWORK-BOUNDARY", "C-NET-DENY"}
         )
         assert "C-PERF-PHASE-FAIRNESS" not in contracts.SEMANTIC_VERIFIERS
         arguments = _scenario(tmp_path)
         with pytest.raises(
             evidence.EvidenceError,
-            match="A-IDENTITY has no registered obligation-specific semantic verifier",
+            match="A-TAXONOMY has no registered obligation-specific semantic verifier",
         ):
             contracts.aggregate_records(**arguments)
 
@@ -1932,8 +1934,8 @@ class TestArtifactsAndAggregation:
             (
                 "A-IDENTITY",
                 "identity-verification",
-                "unresolved-result",
-                "result digest is unresolved",
+                "wrong-commit",
+                "exact candidate identity",
             ),
             ("C-PACKAGE-BUILD", "wheel", "invalid-wheel", "readable ZIP archive"),
             ("C-SBOM", "sbom", "missing-dependency", "declared direct dependency"),
@@ -1976,7 +1978,9 @@ class TestArtifactsAndAggregation:
             changed = b"not-a-wheel\n"
         else:
             document = json.loads(body)
-            if mutation == "unresolved-result":
+            if mutation == "wrong-commit":
+                document["git_commit"] = "3" * 40
+            elif mutation == "unresolved-result":
                 document["records"][0]["result_digest"] = _digest("0")
             elif mutation == "missing-dependency":
                 document["components"] = [
