@@ -235,14 +235,25 @@ def test_policy_handoff_verifies_parses_and_starts_before_ack(monkeypatch):
                     pass
 
 
-def test_katana_standard_proxy_is_runner_injected_before_release_and_shares_authority(
-        monkeypatch):
+@pytest.mark.parametrize(
+    ("source_id", "tool", "cmd", "profile", "proxy_flag"),
+    (
+        ("crawl.katana_standard", "katana", ("katana", "-duc", "-silent"),
+         "target-http-proxy", "-proxy"),
+        ("probe.gowitness", "gowitness", ("gowitness", "scan", "file"),
+         "browser-pipe-proxy", "--chrome-proxy"),
+        ("enrich.gowitness", "gowitness", ("gowitness", "scan", "file"),
+         "browser-pipe-proxy", "--chrome-proxy"),
+    ),
+)
+def test_proxy_is_runner_injected_before_release_and_shares_authority(
+        monkeypatch, source_id, tool, cmd, profile, proxy_flag):
     report_read, report_write = os.pipe()
     ack_read, ack_write = os.pipe()
     events = []
     request = _request(
         environment=((PRIVATE_POLICY_ENV, "policy-wire"),),
-        tool="katana", cmd=("katana", "-duc", "-silent"),
+        tool=tool, cmd=cmd,
     )
     launcher = SimpleNamespace(
         pid=12345,
@@ -253,12 +264,14 @@ def test_katana_standard_proxy_is_runner_injected_before_release_and_shares_auth
         _network_proxy=None,
     )
     handoff = SimpleNamespace(child_pidfd=444, profile="standard")
+    expected_source_id = source_id
+    expected_profile = profile
 
     class FakePolicy:
         request_id = request.request_id
         tool = request.tool
-        source_id = "crawl.katana_standard"
-        transport_profile = "target-http-proxy"
+        source_id = expected_source_id
+        transport_profile = expected_profile
 
         @classmethod
         def from_json(cls, raw):
@@ -308,10 +321,10 @@ def test_katana_standard_proxy_is_runner_injected_before_release_and_shares_auth
         original_digest = protocol.request_digest(request)
         child_request = runner_worker._configure_network_broker(request, launcher)
         assert events == ["parse", "proxy_init", "proxy_start"]
-        assert request.argv == ("katana", "-duc", "-silent")
+        assert request.argv == cmd
         assert protocol.request_digest(request) == original_digest
         assert child_request.argv == request.argv + (
-            "-proxy", "http://127.0.0.1:43123",
+            proxy_flag, "http://127.0.0.1:43123",
         )
 
         launcher._release_callback(
@@ -325,6 +338,41 @@ def test_katana_standard_proxy_is_runner_injected_before_release_and_shares_auth
                     os.close(fd)
                 except OSError:
                     pass
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    (
+        ("gowitness", "scan", "file", "--chrome-proxy", "http://caller.invalid"),
+        ("gowitness", "scan", "file", "--proxy=http://caller.invalid"),
+    ),
+)
+def test_gowitness_caller_proxy_is_refused_before_proxy_start(monkeypatch, cmd):
+    request = _request(
+        environment=((PRIVATE_POLICY_ENV, "policy-wire"),), tool="gowitness", cmd=cmd,
+    )
+    launcher = SimpleNamespace(
+        _network_control_registry=None, _network_effect_fence=None,
+    )
+
+    class FakePolicy:
+        request_id = request.request_id
+        tool = request.tool
+        source_id = "probe.gowitness"
+        transport_profile = "browser-pipe-proxy"
+
+        @classmethod
+        def from_json(cls, raw):
+            assert raw == "policy-wire"
+            return cls()
+
+    monkeypatch.setattr(runner_worker, "BrokerPolicy", FakePolicy)
+    monkeypatch.setattr(
+        runner_worker, "PinnedBrowserProxy",
+        lambda *_args, **_kwargs: pytest.fail("caller proxy reached proxy startup"),
+    )
+    with pytest.raises(RuntimeError, match="network_proxy_caller_argument_forbidden"):
+        runner_worker._configure_network_broker(request, launcher)
 
 
 def test_incomplete_proxy_cancels_shared_fence_and_stops_broker(monkeypatch):

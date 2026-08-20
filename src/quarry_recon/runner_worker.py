@@ -82,6 +82,7 @@ _BROKER_BOOTSTRAP_SECONDS = 5.0
 _RUNNER_PROXY_FLAGS = frozenset({
     "-proxy", "--proxy", "-http-proxy", "--http-proxy",
     "-socks5", "--socks5", "-socks-proxy", "--socks-proxy",
+    "-chrome-proxy", "--chrome-proxy",
 })
 
 
@@ -1030,8 +1031,17 @@ def _configure_network_broker(request: WorkerRequest, launcher) -> WorkerRequest
     launcher._network_control_registry = registry
     launcher._network_effect_fence = effect_fence
     child_request = request
+    proxy_flag = None
     if (policy.source_id == "crawl.katana_standard"
             and policy.transport_profile == "target-http-proxy"):
+        proxy_flag = "-proxy"
+    elif (policy.source_id in {"probe.gowitness", "enrich.gowitness"}
+          and policy.transport_profile == "browser-pipe-proxy"):
+        # Gowitness passes this only to its Chromium helper.  The helper's
+        # exact executable identity is authorized by the browser-pipe profile,
+        # while this runner-owned endpoint remains the only target egress door.
+        proxy_flag = "--chrome-proxy"
+    if proxy_flag is not None:
         if any(value.split("=", 1)[0] in _RUNNER_PROXY_FLAGS
                for value in request.argv):
             raise RuntimeError("network_proxy_caller_argument_forbidden")
@@ -1050,7 +1060,7 @@ def _configure_network_broker(request: WorkerRequest, launcher) -> WorkerRequest
             raise RuntimeError("network_proxy_endpoint_invalid")
         child_request = dataclasses.replace(
             request,
-            argv=request.argv + ("-proxy", f"http://127.0.0.1:{port}"),
+            argv=request.argv + (proxy_flag, f"http://127.0.0.1:{port}"),
         )
 
     def bootstrap(*, deadline, clock) -> None:

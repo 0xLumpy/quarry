@@ -134,7 +134,13 @@ _register(("crawl.katana_headless",), "external-browser", "target",
           descendants=("chromium", "chrome_crashpad_handler"), required_argv=("-duc",))
 _register(("probe.gowitness", "enrich.gowitness"), "external-browser", "target",
           "browser-pipe-proxy", argv0=("gowitness",),
-          descendants=("chromium", "chrome_crashpad_handler"))
+          descendants=("chromium", "chrome_crashpad_handler"),
+          # The runner supplies Gowitness' Chrome endpoint.  Accepting a
+          # caller-selected proxy would split protected browser egress from
+          # the request-scoped proxy and its broker-held helper identity.
+          forbidden_argv=("-proxy", "--proxy", "-http-proxy", "--http-proxy",
+                          "-socks5", "--socks5", "-socks-proxy", "--socks-proxy",
+                          "-chrome-proxy", "--chrome-proxy"))
 _register(("probe.httpx", "enrich.httpx", "vertical.wildcard_http",
            "enrich.wildcard_a1d"), "external-http", "target",
           "target-http-exact", argv0=("httpx",),

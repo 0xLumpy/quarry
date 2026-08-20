@@ -199,6 +199,20 @@ def test_transport_lookup_never_falls_back_to_a_tool_basename():
         ) is None
 
 
+@pytest.mark.parametrize("source_id", ("probe.gowitness", "enrich.gowitness"))
+def test_gowitness_transport_requires_runner_owned_chrome_proxy(source_id):
+    assert network_policy.transport_door(
+        source_id, argv=("gowitness", "scan", "file"),
+    ).profile == "browser-pipe-proxy"
+    for caller_proxy in (
+        "--chrome-proxy", "--chrome-proxy=http://caller.invalid",
+        "--proxy", "--proxy=http://caller.invalid",
+    ):
+        assert network_policy.transport_door(
+            source_id, argv=("gowitness", "scan", "file", caller_proxy),
+        ) is None
+
+
 def test_transport_lookup_requires_exact_native_helper_identity():
     assert network_policy.transport_door(
         "horizontal.csp", helper="fetch.scoped_headers",
