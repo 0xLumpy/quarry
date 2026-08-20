@@ -1360,6 +1360,15 @@ class TestCommittedContracts:
             assert schema["properties"]["schema_version"]["const"] == \
                 contracts.SCHEMA_VERSIONS[name]
 
+        scope_schema = json.loads(
+            (ROOT / "release/evidence/schemas/release-scope-v1.schema.json").read_bytes()
+        )
+        bindings = scope_schema["properties"]["input_bindings"]
+        record_inputs = scope_schema["properties"]["record_inputs"]
+        assert bindings["minItems"] == bindings["maxItems"] == len(contracts.SCOPE_INPUT_PATHS)
+        assert record_inputs["minItems"] == record_inputs["maxItems"] == \
+            len(contracts.SCOPE_INPUT_PATHS) + 3
+
     def test_gate_artifact_schema_variants_are_disjoint_and_fail_closed_on_unknown_fields(self):
         schema = json.loads(
             (ROOT / contracts.SCHEMA_PATHS["gate-artifact-schema"]).read_text()

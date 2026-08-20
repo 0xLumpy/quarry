@@ -522,6 +522,9 @@ EXCLUDED: dict[str, tuple[str, str]] = {
     "quarry_recon.release_evidence:MAX_TAXONOMY_RECORD_BYTES": (
         "resource", "the allocation bound for one versioned pytest-taxonomy artifact; oversize input is "
                     "rejected rather than truncated or accepted as complete release evidence"),
+    "quarry_recon.release_evidence:MAX_H0_SHARD_OUTCOME_REPORT_BYTES": (
+        "resource", "the allocation bound for one candidate-agnostic H0 shard outcome report; an "
+                    "oversize fragment is rejected rather than truncated or accepted as evidence"),
     "quarry_recon.resource_contract:MAX_RESOLVER_HOST_BYTES": (
         "resource", "the encoded per-host allocation bound in one accepted resolver corpus; an oversized "
                     "identity is rejected before resolution rather than truncated"),

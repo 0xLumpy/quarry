@@ -39,7 +39,12 @@ _PRIMARY_LANE_MARKERS = tuple(marker for marker, _lane in _PRIMARY_LANES)
 _TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*$")
 _TAXONOMY_SCHEMA = "quarry.pytest-taxonomy.v1"
 _MAX_TAXONOMY_MANIFEST_BYTES = 2 * 1024 * 1024
+_H0_SHARD_REPORT_SCHEMA = "quarry.h0-shard-outcome-report.v1"
+_MAX_H0_SHARD_REPORT_BYTES = 64 * 1024
 TAXONOMY_MANIFEST_KEY = pytest.StashKey()
+H0_SHARD_REPORT_STATE_KEY = pytest.StashKey()
+H0_COLLECTION_FAILURES_KEY = pytest.StashKey()
+_h0_collection_config = None
 
 
 def pytest_addoption(parser):
@@ -48,6 +53,11 @@ def pytest_addoption(parser):
         "--quarry-taxonomy-manifest",
         metavar="PATH",
         help="write a new canonical diagnostic manifest for this collection",
+    )
+    group.addoption(
+        "--quarry-h0-shard-report",
+        metavar="PATH",
+        help="write a new canonical H0 shard outcome report after the test session",
     )
     group.addoption(
         "--quarry-shard-count",
@@ -124,6 +134,19 @@ def _utf8_key(value):
 
 def _test_shard(nodeid, count):
     return int.from_bytes(hashlib.sha256(_utf8_key(nodeid)).digest(), "big") % count
+
+
+def _h0_roster_digest(nodeids):
+    """Return the domain-separated digest for one sorted, unique node roster."""
+    ordered = sorted(nodeids, key=_utf8_key)
+    if len(ordered) != len(set(ordered)):
+        raise pytest.UsageError("H0 outcome report roster contains duplicate node ids")
+    hasher = hashlib.sha256(b"quarry.h0-shard-outcome-roster.v1\0")
+    for nodeid in ordered:
+        encoded = _utf8_key(nodeid)
+        hasher.update(len(encoded).to_bytes(8, "big"))
+        hasher.update(encoded)
+    return "sha256:" + hasher.hexdigest()
 
 
 def _apply_test_shard(config, items):
@@ -212,7 +235,7 @@ def _taxonomy_manifest_bytes(rows, selected_nodeids, *, mark_expression, keyword
     return encoded
 
 
-def _write_new_private(path, body):
+def _write_new_private(path, body, *, label="taxonomy manifest"):
     """Create one diagnostic output without following or overwriting its final path."""
     target = os.fspath(path)
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
@@ -220,14 +243,14 @@ def _write_new_private(path, body):
     try:
         fd = os.open(target, flags, 0o600)
     except OSError as exc:
-        raise pytest.UsageError(f"cannot create taxonomy manifest {target!r}: {exc}") from exc
+        raise pytest.UsageError(f"cannot create {label} {target!r}: {exc}") from exc
     created = True
     try:
         view = memoryview(body)
         while view:
             written = os.write(fd, view)
             if written <= 0:
-                raise OSError("short taxonomy manifest write")
+                raise OSError(f"short {label} write")
             view = view[written:]
         os.fsync(fd)
         os.close(fd)
@@ -244,7 +267,132 @@ def _write_new_private(path, body):
                 pass
         if not isinstance(exc, Exception):
             raise
-        raise pytest.UsageError(f"cannot write taxonomy manifest {target!r}: {exc}") from exc
+        raise pytest.UsageError(f"cannot write {label} {target!r}: {exc}") from exc
+
+
+def _start_h0_shard_report(config, rows, selected_nodeids):
+    """Freeze the H0 evidence boundary from taxonomy rows; never recollect."""
+    output = config.getoption("quarry_h0_shard_report")
+    if not output:
+        return
+    if (config.getoption("markexpr") or "") != "offline" or (config.getoption("keyword") or ""):
+        raise pytest.UsageError(
+            "H0 shard outcome report requires exactly '-m offline' and no keyword expression"
+        )
+    node_lane = {nodeid: lane for nodeid, lane, _tools, _synthetic in rows}
+    selected = sorted(selected_nodeids, key=_utf8_key)
+    if not selected:
+        raise pytest.UsageError("H0 shard outcome report refuses a vacuous selection")
+    unknown = set(selected) - set(node_lane)
+    if unknown:
+        raise pytest.UsageError(
+            "H0 shard outcome report selection has unknown node ids: "
+            f"{sorted(unknown, key=_utf8_key)!r}"
+        )
+    non_h0 = [nodeid for nodeid in selected if node_lane[nodeid] != "offline"]
+    if non_h0:
+        raise pytest.UsageError(
+            "H0 shard outcome report accepts only offline/H0 selection: "
+            f"{non_h0!r}"
+        )
+    full_h0 = sorted(
+        (nodeid for nodeid, lane, _tools, _synthetic in rows if lane == "offline"),
+        key=_utf8_key,
+    )
+    config.stash[H0_SHARD_REPORT_STATE_KEY] = {
+        "collection_failures": config.stash.get(H0_COLLECTION_FAILURES_KEY, 0),
+        "full_h0": full_h0,
+        "output": output,
+        "reports": {nodeid: {} for nodeid in selected},
+        "selected": selected,
+    }
+
+
+def _record_h0_report(state, report):
+    """Retain exactly one pytest setup/call/teardown report for each selected node."""
+    if report.nodeid not in state["reports"]:
+        raise pytest.UsageError(f"H0 shard outcome report received unknown result {report.nodeid!r}")
+    if report.when not in {"setup", "call", "teardown"}:
+        raise pytest.UsageError(f"H0 shard outcome report received unknown phase {report.when!r}")
+    if report.outcome not in {"passed", "failed", "skipped"}:
+        raise pytest.UsageError(f"H0 shard outcome report received unknown outcome {report.outcome!r}")
+    phases = state["reports"][report.nodeid]
+    if report.when in phases:
+        raise pytest.UsageError(
+            f"H0 shard outcome report received duplicate {report.when} result for {report.nodeid!r}"
+        )
+    phases[report.when] = (report.outcome, getattr(report, "wasxfail", None))
+
+
+def _h0_node_outcome(nodeid, phases):
+    """Compose pytest's phase reports into one mutually exclusive test outcome."""
+    setup = phases.get("setup")
+    call = phases.get("call")
+    teardown = phases.get("teardown")
+    if setup is None or teardown is None:
+        raise pytest.UsageError(f"H0 shard outcome report has incomplete results for {nodeid!r}")
+    if setup[0] == "failed" or teardown[0] == "failed":
+        return "failed"
+    if call is None:
+        if setup[0] == "skipped":
+            return "xfailed" if setup[1] else "skipped"
+        raise pytest.UsageError(f"H0 shard outcome report has incomplete results for {nodeid!r}")
+    terminal = call
+    outcome, wasxfail = terminal
+    if outcome == "passed":
+        return "xpassed" if wasxfail else "passed"
+    if outcome == "skipped":
+        return "xfailed" if wasxfail else "skipped"
+    return "xpassed" if wasxfail else "failed"
+
+
+def _h0_shard_report_bytes(config, state, exitstatus):
+    outcomes = {name: 0 for name in ("failed", "skipped", "xfailed", "xpassed", "passed")}
+    passed_nodes = []
+    for nodeid in state["selected"]:
+        node_outcome = _h0_node_outcome(nodeid, state["reports"][nodeid])
+        outcomes[node_outcome] += 1
+        if node_outcome == "passed":
+            passed_nodes.append(nodeid)
+    document = {
+        "collector": {
+            "name": "pytest",
+            "python_implementation": platform.python_implementation(),
+            "python_version": platform.python_version(),
+            "version": pytest.__version__,
+        },
+        "collection_failures": state["collection_failures"],
+        "full_h0_roster": {
+            "count": len(state["full_h0"]),
+            "digest": _h0_roster_digest(state["full_h0"]),
+        },
+        "keyword_expression": config.getoption("keyword") or "",
+        "mark_expression": config.getoption("markexpr") or "",
+        "outcomes": outcomes,
+        "passed_roster": {
+            "count": len(passed_nodes),
+            "digest": _h0_roster_digest(passed_nodes),
+        },
+        "schema_version": _H0_SHARD_REPORT_SCHEMA,
+        "selected_roster": {
+            "count": len(state["selected"]),
+            "digest": _h0_roster_digest(state["selected"]),
+        },
+        "session_exit_code": int(exitstatus),
+        "shard_count": config.getoption("quarry_shard_count"),
+        "shard_index": config.getoption("quarry_shard_index"),
+    }
+    try:
+        body = json.dumps(
+            document, allow_nan=False, ensure_ascii=False, separators=(",", ":"), sort_keys=True,
+        ).encode("utf-8", "strict")
+    except (RecursionError, TypeError, UnicodeEncodeError, ValueError) as exc:
+        raise pytest.UsageError(f"cannot encode H0 shard outcome report: {exc}") from exc
+    if len(body) > _MAX_H0_SHARD_REPORT_BYTES:
+        raise pytest.UsageError(
+            f"H0 shard outcome report is {len(body)} bytes; limit is {_MAX_H0_SHARD_REPORT_BYTES}"
+        )
+    return body
 
 
 @pytest.hookimpl(wrapper=True, tryfirst=True)
@@ -274,6 +422,25 @@ def pytest_collection_modifyitems(config, items):
     output = config.getoption("quarry_taxonomy_manifest")
     if output:
         _write_new_private(output, body)
+    _start_h0_shard_report(config, rows, [item.nodeid for item in items])
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    outcome = yield
+    state = item.config.stash.get(H0_SHARD_REPORT_STATE_KEY, None)
+    if state is not None:
+        _record_h0_report(state, outcome.get_result())
+
+
+def pytest_sessionfinish(session, exitstatus):
+    state = session.config.stash.get(H0_SHARD_REPORT_STATE_KEY, None)
+    if state is not None:
+        _write_new_private(
+            state["output"],
+            _h0_shard_report_bytes(session.config, state, exitstatus),
+            label="H0 shard outcome report",
+        )
 
 
 class FakeDirectContainment:
@@ -584,6 +751,7 @@ _saved: list = []
 
 
 def pytest_configure(config):
+    global _h0_collection_config
     blockers = [
         (subprocess, "Popen", _GuardedPopen),
         (subprocess, "run", _guarded_run),
@@ -593,12 +761,26 @@ def pytest_configure(config):
     for obj, attr, replacement in blockers:
         _saved.append((obj, attr, getattr(obj, attr)))
         setattr(obj, attr, replacement)
+    if config.getoption("quarry_h0_shard_report"):
+        config.stash[H0_COLLECTION_FAILURES_KEY] = 0
+        _h0_collection_config = config
+
+
+def pytest_collectreport(report):
+    """Keep collection errors distinct from per-node execution outcomes."""
+    if report.failed:
+        config = _h0_collection_config
+        if config is not None and config.stash.get(H0_COLLECTION_FAILURES_KEY, None) is not None:
+            config.stash[H0_COLLECTION_FAILURES_KEY] += 1
 
 
 def pytest_unconfigure(config):
+    global _h0_collection_config
     for obj, attr, original in reversed(_saved):
         setattr(obj, attr, original)
     _saved.clear()
+    if _h0_collection_config is config:
+        _h0_collection_config = None
 
 
 # ── layer 2: per-test autouse guard (local dev) ──

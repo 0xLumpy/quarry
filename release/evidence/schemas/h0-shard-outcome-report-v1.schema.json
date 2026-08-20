@@ -1,0 +1,54 @@
+{
+  "$defs": {
+    "collector": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {"const": "pytest"},
+        "python_implementation": {"minLength": 1, "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$", "type": "string"},
+        "python_version": {"minLength": 1, "pattern": "^[^\\u0000-\\u001f]+$", "type": "string"},
+        "version": {"minLength": 1, "pattern": "^[^\\u0000-\\u001f]+$", "type": "string"}
+      },
+      "required": ["name", "python_implementation", "python_version", "version"],
+      "type": "object"
+    },
+    "count": {"maximum": 9223372036854775807, "minimum": 0, "type": "integer"},
+    "digest": {"pattern": "^sha256:[0-9a-f]{64}$", "type": "string"},
+    "roster": {
+      "additionalProperties": false,
+      "properties": {"count": {"$ref": "#/$defs/count"}, "digest": {"$ref": "#/$defs/digest"}},
+      "required": ["count", "digest"],
+      "type": "object"
+    }
+  },
+  "$id": "urn:quarry:schema:h0-shard-outcome-report:v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "collector": {"$ref": "#/$defs/collector"},
+    "collection_failures": {"$ref": "#/$defs/count"},
+    "full_h0_roster": {"$ref": "#/$defs/roster"},
+    "keyword_expression": {"pattern": "^[^\\u0000-\\u001f]*$", "type": "string"},
+    "mark_expression": {"pattern": "^[^\\u0000-\\u001f]*$", "type": "string"},
+    "outcomes": {
+      "additionalProperties": false,
+      "properties": {
+        "failed": {"$ref": "#/$defs/count"}, "passed": {"$ref": "#/$defs/count"},
+        "skipped": {"$ref": "#/$defs/count"}, "xfailed": {"$ref": "#/$defs/count"},
+        "xpassed": {"$ref": "#/$defs/count"}
+      },
+      "required": ["failed", "passed", "skipped", "xfailed", "xpassed"],
+      "type": "object"
+    },
+    "passed_roster": {"$ref": "#/$defs/roster"},
+    "schema_version": {"const": "quarry.h0-shard-outcome-report.v1"},
+    "selected_roster": {"$ref": "#/$defs/roster"},
+    "session_exit_code": {"maximum": 5, "minimum": 0, "type": "integer"},
+    "shard_count": {"maximum": 64, "minimum": 1, "type": "integer"},
+    "shard_index": {"maximum": 63, "minimum": 0, "type": "integer"}
+  },
+  "required": [
+    "collector", "collection_failures", "full_h0_roster", "keyword_expression", "mark_expression",
+    "outcomes", "passed_roster", "schema_version", "selected_roster", "session_exit_code", "shard_count", "shard_index"
+  ],
+  "type": "object"
+}

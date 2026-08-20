@@ -44,11 +44,13 @@ CANDIDATE_SCHEMA = "quarry.candidate-identity.v1"
 GATE_SCHEMA = "quarry.release-gate.v1"
 REGISTRY_SCHEMA = "quarry.release-schema-registry.v1"
 PYTEST_TAXONOMY_SCHEMA = "quarry.pytest-taxonomy.v1"
+H0_SHARD_OUTCOME_REPORT_SCHEMA = "quarry.h0-shard-outcome-report.v1"
 VERIFICATION_JOB_MAP_SCHEMA = "quarry.verification-job-map.v1"
 SOURCE_TREE_ALGORITHM = "quarry.git-tree-sha256.v1"
 RELEASE_SCOPE = "0.3.10"
 MAX_RECORD_BYTES = 1024 * 1024
 MAX_TAXONOMY_RECORD_BYTES = 2 * 1024 * 1024
+MAX_H0_SHARD_OUTCOME_REPORT_BYTES = 64 * 1024
 MAX_JSON_DEPTH = 64
 MAX_JSON_INTEGER = (1 << 63) - 1
 
@@ -83,6 +85,8 @@ DEFAULT_IDENTITY_INPUTS = {
 # the already-frozen candidate-identity.v1 contract.
 PYTEST_TAXONOMY_SCHEMA_PATH = \
     "release/evidence/schemas/pytest-taxonomy-v1.schema.json"
+H0_SHARD_OUTCOME_REPORT_SCHEMA_PATH = \
+    "release/evidence/schemas/h0-shard-outcome-report-v1.schema.json"
 VERIFICATION_JOB_MAP_SCHEMA_PATH = \
     "release/evidence/schemas/verification-job-map-v1.schema.json"
 VERIFICATION_JOB_MAP_PATH = "release/evidence/verification-job-map-v1.json"
@@ -99,6 +103,7 @@ FUTURE_RUNNER_INPUTS = {
     "live-verification-script": "scripts/verify-quarry-live.sh",
     "offline-verification-script": "scripts/verify-quarry.sh",
     "pytest-taxonomy-schema": PYTEST_TAXONOMY_SCHEMA_PATH,
+    "h0-shard-outcome-report-schema": H0_SHARD_OUTCOME_REPORT_SCHEMA_PATH,
     "secret-baseline": ".secrets.baseline",
     "security-exception-checker": "scripts/check_security_exceptions.py",
     "security-exceptions": "release/evidence/security-exceptions-v1.json",
@@ -1337,6 +1342,99 @@ def read_pytest_taxonomy(data: bytes) -> dict:
         maximum=MAX_TAXONOMY_RECORD_BYTES,
     )
     return validate_pytest_taxonomy(document)
+
+
+def _validate_h0_roster(value: object, name: str) -> dict:
+    roster = _object(value, name, {"count", "digest"})
+    _exact_nonnegative_int(roster["count"], f"{name}.count")
+    _digest(roster["digest"], f"{name}.digest")
+    return roster
+
+
+def validate_h0_shard_outcome_report(document: object) -> dict:
+    """Validate one candidate-agnostic H0 pytest shard outcome fragment.
+
+    This reader deliberately validates only collection/execution facts.  It
+    does not bind a candidate, merge shards, or decide any release gate.
+    """
+    doc = _object(document, "H0 shard outcome report", {
+        "collector",
+        "collection_failures",
+        "full_h0_roster",
+        "keyword_expression",
+        "mark_expression",
+        "outcomes",
+        "passed_roster",
+        "schema_version",
+        "selected_roster",
+        "session_exit_code",
+        "shard_count",
+        "shard_index",
+    })
+    if doc["schema_version"] != H0_SHARD_OUTCOME_REPORT_SCHEMA:
+        raise EvidenceError(
+            f"unsupported H0 shard outcome report schema {doc['schema_version']!r}"
+        )
+    collector = _object(doc["collector"], "H0 shard outcome report.collector", {
+        "name", "python_implementation", "python_version", "version",
+    })
+    if collector["name"] != "pytest":
+        raise EvidenceError("H0 shard outcome report.collector.name must be exactly 'pytest'")
+    _token(collector["python_implementation"], "H0 shard outcome report.collector.python_implementation")
+    _nonempty_string(collector["python_version"], "H0 shard outcome report.collector.python_version")
+    _nonempty_string(collector["version"], "H0 shard outcome report.collector.version")
+    full = _validate_h0_roster(doc["full_h0_roster"], "H0 shard outcome report.full_h0_roster")
+    selected = _validate_h0_roster(doc["selected_roster"], "H0 shard outcome report.selected_roster")
+    passed = _validate_h0_roster(doc["passed_roster"], "H0 shard outcome report.passed_roster")
+    if full["count"] == 0 or selected["count"] == 0:
+        raise EvidenceError("H0 shard outcome report refuses a vacuous roster")
+    if selected["count"] > full["count"]:
+        raise EvidenceError("H0 shard outcome report selected roster exceeds the H0 roster")
+    if passed["count"] > selected["count"]:
+        raise EvidenceError("H0 shard outcome report passed roster exceeds the selected roster")
+    _control_free_string(doc["mark_expression"], "H0 shard outcome report.mark_expression")
+    _control_free_string(doc["keyword_expression"], "H0 shard outcome report.keyword_expression")
+    if doc["mark_expression"] != "offline" or doc["keyword_expression"] != "":
+        raise EvidenceError(
+            "H0 shard outcome report requires exactly the offline marker and no keyword filter"
+        )
+    shard_count = _exact_nonnegative_int(doc["shard_count"], "H0 shard outcome report.shard_count")
+    shard_index = _exact_nonnegative_int(doc["shard_index"], "H0 shard outcome report.shard_index")
+    if not 1 <= shard_count <= 64 or shard_index >= shard_count:
+        raise EvidenceError("H0 shard outcome report has an invalid shard count/index")
+    _exact_nonnegative_int(doc["collection_failures"], "H0 shard outcome report.collection_failures")
+    exit_code = _exact_nonnegative_int(
+        doc["session_exit_code"], "H0 shard outcome report.session_exit_code"
+    )
+    if exit_code > 5:
+        raise EvidenceError("H0 shard outcome report.session_exit_code must be a pytest exit code (0..5)")
+    outcomes = _object(doc["outcomes"], "H0 shard outcome report.outcomes", {
+        "failed", "passed", "skipped", "xfailed", "xpassed",
+    })
+    outcome_total = sum(
+        _exact_nonnegative_int(outcomes[name], f"H0 shard outcome report.outcomes.{name}")
+        for name in ("failed", "passed", "skipped", "xfailed", "xpassed")
+    )
+    if outcome_total != selected["count"]:
+        raise EvidenceError("H0 shard outcome report outcomes do not reconcile selected roster count")
+    if passed["count"] != outcomes["passed"]:
+        raise EvidenceError("H0 shard outcome report passed roster does not reconcile passed outcomes")
+    _bounded_record(
+        doc,
+        "H0 shard outcome report",
+        maximum=MAX_H0_SHARD_OUTCOME_REPORT_BYTES,
+    )
+    return doc
+
+
+def read_h0_shard_outcome_report(data: bytes) -> dict:
+    """Read an H0 shard fragment only when its bytes are exactly canonical JSON."""
+    document = _canonical_document_from_bytes(
+        data,
+        "H0 shard outcome report",
+        maximum=MAX_H0_SHARD_OUTCOME_REPORT_BYTES,
+    )
+    return validate_h0_shard_outcome_report(document)
 
 
 def _verification_job_map_shape(document: object) -> tuple[dict, list[dict]]:
