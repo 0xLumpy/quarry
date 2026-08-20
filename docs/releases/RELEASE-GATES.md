@@ -194,7 +194,7 @@ These are mandatory on every change and run only in `H0-hermetic`.
 |---|---|---|---|
 | `B-HERMETIC-ALL` | Functional/quality | Every `H0` test is collected and passes on the declared Python matrix; no unexpected skip/deselection/xfail/xpass; network-denial self-tests pass | Per-interpreter test report, collection manifest, isolation self-test, logs and digests |
 | `B-SCHEMA` | Schema | The formal `release_evidence` v1 registry (`candidate_identity`, `gate_record`, and `schema_registry`) round-trips its committed fixtures exactly and rejects unknown versions, unknown members, and malformed values. The v1 supported-legacy-migrations roster is explicitly empty; any future supported migration must be added to that frozen roster. Standalone owner schemas remain verified by their owner-gate contracts. | Candidate-bound schema-validation report binding the exact signed H0 instance, frozen registry, and committed fixture digests |
-| `B-MANIFEST` | Functional | Lifecycle, verdict, counts, digests, revisions, coverage, gaps, faults, and remainders satisfy semantic—not merely shape—validation | Invariant/property-test report and corrupt-fixture matrix |
+| `B-MANIFEST` | Functional | Run manifests, revision overlays/pointers, and campaign terminal/history satisfy semantic—not merely shape—validation. Report projections and crash/fault durability are separate gates. | Candidate-bound invariant report and corruption-refusal matrix, each tied to one signed H0 instance and frozen source/material bytes |
 | `B-QUALITY` | Quality | Formatting, lint, type, documentation/reference parity, dead-code policy, and complexity budgets meet the accepted threshold manifest | Tool identities/config digests and machine reports |
 | `B-COVERAGE` | Quality | Line/branch coverage meets versioned repository and critical-module thresholds and does not regress beyond the allowed delta | Coverage data tied to collected test identities and threshold manifest |
 | `B-STATIC-SECURITY` | Security | Secret scan, static security rules, unsafe API inventory, archive/path/config fuzz properties, and dependency-manifest checks pass | Findings in a stable machine format with suppression IDs and expiry |
@@ -208,6 +208,11 @@ threshold, and machine-evidence contracts have not been configured.
 `B-DOCS-POLICY` therefore remains `open` until its candidate-bound report is
 accepted from an H0-hermetic evidence instance; a locally passing parity suite
 does not close the gate.
+
+`B-MANIFEST` has local semantic/corruption substrate tests, but remains `open`
+until its candidate-bound reports are accepted from an H0-hermetic evidence
+instance. This checkpoint does not claim report-projection or crash-durability
+closure.
 
 ### Phase C: release-candidate gates
 

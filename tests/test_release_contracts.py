@@ -505,6 +505,71 @@ def _supporting_bodies(
                 if row["name"] == "docs-parity-tests"
             ),
         })
+    elif gate_id == "B-MANIFEST":
+        instance = evidence_instances[0]
+        cases_body = (ROOT / contracts.MANIFEST_PATHS["manifest-evidence-cases"]).read_bytes()
+        case_specs = contracts._read_manifest_evidence_cases(cases_body)
+        case_manifest_digest = contracts.raw_sha256(cases_body)
+        test_sources = [{
+            "digest": next(row["digest"] for row in scope["input_bindings"] if row["name"] == name),
+            "name": name,
+            "path": next(row["path"] for row in scope["input_bindings"] if row["name"] == name),
+        } for name in contracts._MANIFEST_TEST_SOURCES]
+        materials = [{
+            "digest": next(row["digest"] for row in scope["input_bindings"] if row["name"] == name),
+            "name": name,
+            "path": next(row["path"] for row in scope["input_bindings"] if row["name"] == name),
+        } for name in contracts._MANIFEST_MATERIALS]
+        node_selection = {
+            "collected": len(contracts._MANIFEST_TEST_ROSTER), "deselected": 0, "failed": 0,
+            "passed": len(contracts._MANIFEST_TEST_ROSTER),
+            "selected": len(contracts._MANIFEST_TEST_ROSTER), "skipped": 0,
+            "xfailed": 0, "xpassed": 0,
+        }
+        case_selection = {
+            "collected": sum(len(members) for _case, members in contracts._MANIFEST_CORRUPTION_CASES),
+            "deselected": 0, "failed": 0,
+            "passed": sum(len(members) for _case, members in contracts._MANIFEST_CORRUPTION_CASES),
+            "selected": sum(len(members) for _case, members in contracts._MANIFEST_CORRUPTION_CASES), "skipped": 0,
+            "xfailed": 0, "xpassed": 0,
+        }
+        common = {
+            "candidate_identity_digest": evidence.canonical_digest(identity),
+            "environment": instance["environment"],
+            "evidence_finished_at": instance["finished_at"],
+            "evidence_instance_id": instance["id"],
+            "evidence_started_at": instance["started_at"],
+            "gate_id": gate_id,
+            "manifest_materials": materials,
+            "case_manifest_digest": case_manifest_digest,
+            "release": "0.3.10",
+            "schema_version": contracts.GATE_ARTIFACT_SCHEMA,
+            "test_sources": test_sources,
+        }
+        bodies["corrupt-fixture-matrix"] = contracts.canonical_json_line({
+            **common,
+            "artifact_type": "manifest-corrupt-fixture-matrix",
+            "cases": [
+                {
+                    "id": case["id"],
+                    "members": [contracts._manifest_observed_result(spec) for spec in case["members"]],
+                }
+                for case in case_specs["corruption_cases"]
+            ],
+            "name": "corrupt-fixture-matrix",
+            "selection": case_selection,
+        })
+        bodies["invariant-report"] = contracts.canonical_json_line({
+            **common,
+            "artifact_type": "manifest-invariant-report",
+            "matrix_digest": contracts.raw_sha256(bodies["corrupt-fixture-matrix"]),
+            "name": "invariant-report",
+            "node_results": [
+                contracts._manifest_observed_result(spec)
+                for spec in case_specs["invariants"]
+            ],
+            "selection": node_selection,
+        })
     elif gate_id == "B-HERMETIC-ALL":
         h0_environments = [
             copy.deepcopy(instance["environment"])
@@ -1229,6 +1294,18 @@ def _scenario(tmp_path: Path, *, approved_at: str = "2026-08-01T00:00:00Z"):
                         "selected": len(contracts._DOCS_POLICY_TEST_ROSTER), "skipped": 0,
                         "xfailed": 0, "xpassed": 0,
                     }
+                if gate_id == "B-MANIFEST":
+                    selection = {
+                        "collected": len(contracts._MANIFEST_TEST_ROSTER) + sum(
+                            len(members) for _case, members in contracts._MANIFEST_CORRUPTION_CASES
+                        ), "deselected": 0,
+                        "failed": 0, "passed": len(contracts._MANIFEST_TEST_ROSTER) + sum(
+                            len(members) for _case, members in contracts._MANIFEST_CORRUPTION_CASES
+                        ), "selected": len(contracts._MANIFEST_TEST_ROSTER) + sum(
+                            len(members) for _case, members in contracts._MANIFEST_CORRUPTION_CASES
+                        ), "skipped": 0,
+                        "xfailed": 0, "xpassed": 0,
+                    }
                 instances.append({
                     "artifacts": [],
                     "assertions": [assertion],
@@ -1370,6 +1447,8 @@ def _scenario(tmp_path: Path, *, approved_at: str = "2026-08-01T00:00:00Z"):
                 for name in selection
             }
         if gate_id == "B-DOCS-POLICY":
+            selection = copy.deepcopy(instances[0]["selection"])
+        if gate_id == "B-MANIFEST":
             selection = copy.deepcopy(instances[0]["selection"])
         rule = None
         reason = None
@@ -1689,6 +1768,7 @@ class TestCommittedContracts:
             "synthetic_corpus_disclosure_attestation", "aggregator_conformance_report",
             "h0_test_report", "h0_isolation_self_test", "schema_validation_report",
             "docs_policy_parity_report",
+            "manifest_invariant_report", "manifest_corrupt_fixture_matrix",
         ]
         discriminators = []
         for name in variant_names:
@@ -1723,6 +1803,19 @@ class TestCommittedContracts:
         }
         assert schema["$defs"]["h0_roster"]["properties"]["count"]["maximum"] == \
             evidence.MAX_JSON_INTEGER
+        manifest_cases = schema["$defs"]["manifest_corrupt_fixture_matrix"]["properties"]["cases"]
+        assert manifest_cases["minItems"] == manifest_cases["maxItems"] == 3
+        assert [row["allOf"][1]["properties"]["members"]["minItems"]
+                for row in manifest_cases["prefixItems"]] == [12, 4, 6]
+        assert schema["$defs"]["manifest_invariant_report"]["properties"]["node_results"][
+            "minItems"
+        ] == 18
+        case_schema = json.loads((ROOT / contracts.SCHEMA_PATHS[
+            "manifest-evidence-cases-schema"
+        ]).read_text())
+        assert case_schema["properties"]["invariants"]["minItems"] == 18
+        assert [row["allOf"][1]["properties"]["members"]["minItems"]
+                for row in case_schema["properties"]["corruption_cases"]["prefixItems"]] == [12, 4, 6]
         isolation_instances = schema["$defs"]["h0_isolation_self_test"][
             "properties"
         ]["instances"]
@@ -1915,7 +2008,7 @@ class TestIncompleteSemanticRegistry:
             set(contracts.RESOURCE_SEMANTIC_GATES)
             | {
                 "A-IDENTITY", "A-EVIDENCE-SCHEMA", "A-TAXONOMY", "A-CORPUS", "A-THRESHOLDS", "A-SUPPORT",
-                "B-HERMETIC-ALL", "B-SCHEMA", "B-DOCS-POLICY",
+                "B-HERMETIC-ALL", "B-SCHEMA", "B-DOCS-POLICY", "B-MANIFEST",
                 "C-PACKAGE-BUILD", "C-PACKAGE-INSTALL", "C-NETWORK-BOUNDARY", "C-NET-DENY",
                 *contracts.V310_05_SEMANTIC_GATES,
             }
@@ -1924,7 +2017,7 @@ class TestIncompleteSemanticRegistry:
         arguments = _scenario(tmp_path)
         with pytest.raises(
             evidence.EvidenceError,
-            match="B-MANIFEST has no registered obligation-specific semantic verifier",
+            match="B-QUALITY has no registered obligation-specific semantic verifier",
         ):
             contracts.aggregate_records(**arguments)
 
@@ -2053,6 +2146,92 @@ class TestDocsPolicySemanticEvidence:
             contracts.raw_sha256(bodies["parity-report"])
         with pytest.raises(evidence.EvidenceError, match=match):
             contracts._semantic_docs_policy(gate, bodies, **context)
+
+
+class TestManifestSemanticEvidence:
+    @staticmethod
+    def _case(tmp_path):
+        arguments = _scenario(tmp_path)
+        gate = _gate(arguments, "B-MANIFEST")
+        bodies = {
+            row["name"]: (arguments["artifact_root"] / row["path"]).read_bytes()
+            for row in arguments["artifact_index"]["artifacts"]
+            if row["gate_id"] == "B-MANIFEST"
+        }
+        report = contracts.read_evidence_report(
+            bodies.pop("gate-evidence"), identity=arguments["identity"], gate_id="B-MANIFEST",
+        )
+        return gate, bodies, {
+            "identity": arguments["identity"], "input_bodies": arguments["input_bodies"],
+            "report": report, "scope": arguments["scope"],
+        }
+
+    def test_fixed_candidate_h0_manifest_rosters_are_accepted(self, tmp_path):
+        gate, bodies, context = self._case(tmp_path)
+        contracts._semantic_manifest(gate, bodies, **context)
+
+    def test_unsigned_manifest_artifact_substitution_fails_closed(self, tmp_path):
+        gate, bodies, context = self._case(tmp_path)
+        document = json.loads(bodies["invariant-report"])
+        document["node_results"].reverse()
+        bodies["invariant-report"] = contracts.canonical_json_line(document)
+        with pytest.raises(evidence.EvidenceError, match="exact signed artifact digest"):
+            contracts._semantic_manifest(gate, bodies, **context)
+
+    @pytest.mark.parametrize(
+        ("name", "mutate", "match"),
+        [
+            ("invariant-report", lambda doc: doc.update(candidate_identity_digest=_digest("0")), "wrong candidate"),
+            ("invariant-report", lambda doc: doc.update(evidence_instance_id="other-instance"), "exact signed H0"),
+            ("invariant-report", lambda doc: doc.update(evidence_finished_at="2026-08-14T10:10:09Z"), "exact signed H0"),
+            ("invariant-report", lambda doc: doc.update(case_manifest_digest=_digest("0")), "case manifest digest"),
+            ("invariant-report", lambda doc: doc["node_results"].reverse(), "node roster"),
+            ("invariant-report", lambda doc: doc["node_results"].pop(), "node roster"),
+            ("invariant-report", lambda doc: doc["node_results"][0]["observed"].update(outcome="refused"), "node roster"),
+            ("invariant-report", lambda doc: doc["node_results"][0]["observed"].update(code="wrong.code"), "node roster"),
+            ("invariant-report", lambda doc: doc["node_results"][0]["observed"].update(error_class="ManifestError"), "node roster"),
+            ("invariant-report", lambda doc: doc["node_results"][0].update(result_digest=_digest("0")), "node roster"),
+            ("corrupt-fixture-matrix", lambda doc: doc["cases"].reverse(), "case roster"),
+            ("corrupt-fixture-matrix", lambda doc: doc["cases"].pop(), "case roster"),
+            ("corrupt-fixture-matrix", lambda doc: doc["cases"][0]["members"][0]["observed"].update(outcome="pass"), "case roster"),
+            ("corrupt-fixture-matrix", lambda doc: doc["cases"][0]["members"][0]["observed"].update(code="wrong.code"), "case roster"),
+            ("corrupt-fixture-matrix", lambda doc: doc["cases"][0]["members"][0]["observed"].update(error_class="RevisionUnusable"), "case roster"),
+            ("corrupt-fixture-matrix", lambda doc: doc["cases"][0]["members"][0].update(result_digest=_digest("0")), "case roster"),
+            ("invariant-report", lambda doc: doc.update(matrix_digest=_digest("0")), "corruption matrix digest"),
+        ],
+    )
+    def test_candidate_h0_roster_case_and_cross_digest_substitution_fail_closed(
+        self, tmp_path, name, mutate, match,
+    ):
+        gate, bodies, context = self._case(tmp_path)
+        document = json.loads(bodies[name])
+        mutate(document)
+        bodies[name] = contracts.canonical_json_line(document)
+        next(item for item in gate["artifacts"] if item["name"] == name)["digest"] = \
+            contracts.raw_sha256(bodies[name])
+        with pytest.raises(evidence.EvidenceError, match=match):
+            contracts._semantic_manifest(gate, bodies, **context)
+
+    @pytest.mark.parametrize("name", ["manifest-run-contract-tests", "run-manifest-validator"])
+    def test_source_and_material_drift_fail_closed(self, tmp_path, name):
+        gate, bodies, context = self._case(tmp_path)
+        context["input_bodies"] = dict(context["input_bodies"])
+        context["input_bodies"][name] = b"drift\n"
+        with pytest.raises(evidence.EvidenceError, match="absent or drifted"):
+            contracts._semantic_manifest(gate, bodies, **context)
+
+    def test_case_manifest_substitution_fails_closed_even_when_scope_digest_is_replaced(self, tmp_path):
+        gate, bodies, context = self._case(tmp_path)
+        case_manifest = json.loads(context["input_bodies"]["manifest-evidence-cases"])
+        case_manifest["invariants"].reverse()
+        replacement = contracts.canonical_json_line(case_manifest)
+        context["input_bodies"] = dict(context["input_bodies"])
+        context["input_bodies"]["manifest-evidence-cases"] = replacement
+        context["scope"] = copy.deepcopy(context["scope"])
+        next(row for row in context["scope"]["input_bindings"]
+             if row["name"] == "manifest-evidence-cases")["digest"] = contracts.raw_sha256(replacement)
+        with pytest.raises(evidence.EvidenceError, match="invariant node roster or order"):
+            contracts._semantic_manifest(gate, bodies, **context)
 
 
 class TestH0HermeticSemanticEvidence:

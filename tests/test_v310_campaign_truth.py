@@ -104,7 +104,7 @@ def test_only_matching_positive_coverage_resolves_the_historical_gap():
     _covered(measure="urls"),
     Coverage(source_id="probe.httpx", measure="hosts", eligible=50, tested=10,
              omitted=40).to_dict(),
-])
+], ids=["wrong-source", "wrong-measure", "incomplete-coverage"])
 def test_mismatched_or_incomplete_coverage_cannot_resolve_a_gap(proof):
     book = campaign.Settlement()
     first = _decide(book, _summary(remainders=[_rem(now=1)], gaps=[_gap()]), child=1, new=1)
@@ -174,7 +174,7 @@ def _finished(tmp_path, cid="c-finished", *, abandoned=False):
         "eligible": None, "tested": None, "omitted": None, "reason": "forged",
         "first_child": 1, "last_child": 1,
     }]), "open gaps"),
-])
+], ids=["success", "clean", "terminal", "non-terminal", "open-gaps"])
 def test_contradictory_terminal_documents_are_unusable(tmp_path, mutate, reason):
     ledger = _finished(tmp_path)
     document = json.loads(ledger.path.read_text())

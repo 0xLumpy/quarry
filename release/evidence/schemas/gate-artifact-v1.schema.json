@@ -20,7 +20,9 @@
     {"$ref": "#/$defs/h0_test_report"},
     {"$ref": "#/$defs/h0_isolation_self_test"},
     {"$ref": "#/$defs/schema_validation_report"},
-    {"$ref": "#/$defs/docs_policy_parity_report"}
+    {"$ref": "#/$defs/docs_policy_parity_report"},
+    {"$ref": "#/$defs/manifest_invariant_report"},
+    {"$ref": "#/$defs/manifest_corrupt_fixture_matrix"}
   ],
   "properties": {
     "artifact_type": {"$ref": "#/$defs/token"},
@@ -29,6 +31,7 @@
     "benchmark_digest": {"$ref": "#/$defs/digest"},
     "builder": {"$ref": "#/$defs/builder"},
     "candidate_identity_digest": {"$ref": "#/$defs/digest"},
+    "case_manifest_digest": {"$ref": "#/$defs/digest"},
     "checkout_root": {"$ref": "#/$defs/absolute_path"},
     "clean_tree": {"type": "boolean"},
     "combined_output": {"$ref": "#/$defs/build_output"},
@@ -62,8 +65,12 @@
     "materials": {"items": {"$ref": "#/$defs/named_digest"}, "type": "array"},
     "measurements": {"items": {"$ref": "#/$defs/measurement"}, "type": "array"},
     "manifest_digest": {"$ref": "#/$defs/digest"},
+    "manifest_materials": {"items": {"$ref": "#/$defs/manifest_material"}, "type": "array"},
     "metrics": {"items": {"$ref": "#/$defs/baseline_metric"}, "type": "array"},
+    "matrix_digest": {"$ref": "#/$defs/digest"},
     "name": {"$ref": "#/$defs/token"},
+    "node_results": {"items": {"$ref": "#/$defs/manifest_node_result"}, "type": "array"},
+    "observed": {"$ref": "#/$defs/manifest_observed"},
     "package": {"$ref": "#/$defs/package"},
     "raw_trials_digest": {"$ref": "#/$defs/digest"},
     "records": {"items": {"$ref": "#/$defs/machine_record"}, "minItems": 1, "type": "array"},
@@ -81,6 +88,7 @@
     "trial_invalidations_digest": {"$ref": "#/$defs/digest"},
     "test_nodeid": {"type": "string"},
     "test_results": {"items": {"$ref": "#/$defs/docs_policy_test_result"}, "type": "array"},
+    "test_sources": {"items": {"$ref": "#/$defs/manifest_test_source"}, "type": "array"},
     "test_source_digest": {"$ref": "#/$defs/digest"},
     "trials": {"items": {"$ref": "#/$defs/trial"}, "maxItems": 1000, "minItems": 1, "type": "array"},
     "warmup_runs": {"$ref": "#/$defs/count"}
@@ -264,6 +272,54 @@
       "additionalProperties": false,
       "properties": {"id": {"$ref": "#/$defs/token"}, "result": {"$ref": "#/$defs/result"}, "result_digest": {"$ref": "#/$defs/digest"}, "status": {"const": "pass"}},
       "required": ["id", "result", "result_digest", "status"],
+      "type": "object"
+    },
+    "manifest_case": {
+      "additionalProperties": false,
+      "properties": {"id": {"$ref": "#/$defs/token"}, "members": {"items": {"$ref": "#/$defs/manifest_node_result"}, "minItems": 1, "type": "array"}},
+      "required": ["id", "members"],
+      "type": "object"
+    },
+    "manifest_corrupt_fixture_matrix": {
+      "additionalProperties": false,
+      "properties": {"artifact_type": {"const": "manifest-corrupt-fixture-matrix"}, "candidate_identity_digest": {"$ref": "#/$defs/digest"}, "case_manifest_digest": {"$ref": "#/$defs/digest"}, "cases": {"items": false, "maxItems": 3, "minItems": 3, "prefixItems": [{"allOf": [{"$ref": "#/$defs/manifest_case"}, {"properties": {"id": {"const": "run-manifest-corruption"}, "members": {"maxItems": 12, "minItems": 12}}, "required": ["id", "members"]}]}, {"allOf": [{"$ref": "#/$defs/manifest_case"}, {"properties": {"id": {"const": "revision-overlay-pointer-corruption"}, "members": {"maxItems": 4, "minItems": 4}}, "required": ["id", "members"]}]}, {"allOf": [{"$ref": "#/$defs/manifest_case"}, {"properties": {"id": {"const": "campaign-terminal-history-corruption"}, "members": {"maxItems": 6, "minItems": 6}}, "required": ["id", "members"]}]}], "type": "array"}, "environment": {"$ref": "#/$defs/environment"}, "evidence_finished_at": {"$ref": "#/$defs/text"}, "evidence_instance_id": {"$ref": "#/$defs/token"}, "evidence_started_at": {"$ref": "#/$defs/text"}, "gate_id": {"const": "B-MANIFEST"}, "manifest_materials": {"items": {"$ref": "#/$defs/manifest_material"}, "minItems": 7, "maxItems": 7, "type": "array"}, "name": {"const": "corrupt-fixture-matrix"}, "release": {"const": "0.3.10"}, "schema_version": {"const": "quarry.gate-artifact.v1"}, "selection": {"$ref": "#/$defs/manifest_selection"}, "test_sources": {"items": {"$ref": "#/$defs/manifest_test_source"}, "minItems": 3, "maxItems": 3, "type": "array"}},
+      "required": ["artifact_type", "candidate_identity_digest", "case_manifest_digest", "cases", "environment", "evidence_finished_at", "evidence_instance_id", "evidence_started_at", "gate_id", "manifest_materials", "name", "release", "schema_version", "selection", "test_sources"],
+      "type": "object"
+    },
+    "manifest_invariant_report": {
+      "additionalProperties": false,
+      "properties": {"artifact_type": {"const": "manifest-invariant-report"}, "candidate_identity_digest": {"$ref": "#/$defs/digest"}, "case_manifest_digest": {"$ref": "#/$defs/digest"}, "environment": {"$ref": "#/$defs/environment"}, "evidence_finished_at": {"$ref": "#/$defs/text"}, "evidence_instance_id": {"$ref": "#/$defs/token"}, "evidence_started_at": {"$ref": "#/$defs/text"}, "gate_id": {"const": "B-MANIFEST"}, "manifest_materials": {"items": {"$ref": "#/$defs/manifest_material"}, "minItems": 7, "maxItems": 7, "type": "array"}, "matrix_digest": {"$ref": "#/$defs/digest"}, "name": {"const": "invariant-report"}, "node_results": {"items": {"$ref": "#/$defs/manifest_node_result"}, "minItems": 18, "maxItems": 18, "type": "array"}, "release": {"const": "0.3.10"}, "schema_version": {"const": "quarry.gate-artifact.v1"}, "selection": {"$ref": "#/$defs/manifest_selection"}, "test_sources": {"items": {"$ref": "#/$defs/manifest_test_source"}, "minItems": 3, "maxItems": 3, "type": "array"}},
+      "required": ["artifact_type", "candidate_identity_digest", "case_manifest_digest", "environment", "evidence_finished_at", "evidence_instance_id", "evidence_started_at", "gate_id", "manifest_materials", "matrix_digest", "name", "node_results", "release", "schema_version", "selection", "test_sources"],
+      "type": "object"
+    },
+    "manifest_material": {
+      "additionalProperties": false,
+      "properties": {"digest": {"$ref": "#/$defs/digest"}, "name": {"$ref": "#/$defs/token"}, "path": {"$ref": "#/$defs/text"}},
+      "required": ["digest", "name", "path"],
+      "type": "object"
+    },
+    "manifest_node_result": {
+      "additionalProperties": false,
+      "properties": {"case_id": {"$ref": "#/$defs/token"}, "nodeid": {"minLength": 1, "type": "string"}, "observed": {"$ref": "#/$defs/manifest_observed"}, "result_digest": {"$ref": "#/$defs/digest"}, "test_status": {"const": "pass"}},
+      "required": ["case_id", "nodeid", "observed", "result_digest", "test_status"],
+      "type": "object"
+    },
+    "manifest_observed": {
+      "additionalProperties": false,
+      "properties": {"code": {"pattern": "^[a-z][a-z0-9._-]{0,127}$", "type": "string"}, "error_class": {"enum": ["ManifestError", "RevisionUnusable", "CampaignUnusable", null]}, "outcome": {"enum": ["pass", "refused", "unusable"]}},
+      "required": ["code", "error_class", "outcome"],
+      "type": "object"
+    },
+    "manifest_selection": {
+      "additionalProperties": false,
+      "properties": {"collected": {"$ref": "#/$defs/count"}, "deselected": {"$ref": "#/$defs/count"}, "failed": {"$ref": "#/$defs/count"}, "passed": {"$ref": "#/$defs/count"}, "selected": {"$ref": "#/$defs/count"}, "skipped": {"$ref": "#/$defs/count"}, "xfailed": {"$ref": "#/$defs/count"}, "xpassed": {"$ref": "#/$defs/count"}},
+      "required": ["collected", "deselected", "failed", "passed", "selected", "skipped", "xfailed", "xpassed"],
+      "type": "object"
+    },
+    "manifest_test_source": {
+      "additionalProperties": false,
+      "properties": {"digest": {"$ref": "#/$defs/digest"}, "name": {"$ref": "#/$defs/token"}, "path": {"$ref": "#/$defs/text"}},
+      "required": ["digest", "name", "path"],
       "type": "object"
     },
     "machine_report": {

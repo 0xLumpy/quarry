@@ -55,6 +55,7 @@ NETWORK_DENIAL_REPORT_SCHEMA = "quarry.network-denial-report.v1"
 PUBLICATION_SUBJECTS_SCHEMA = GATE_ARTIFACT_SCHEMA
 AGGREGATE_SCHEMA = "quarry.release-aggregate.v1"
 APPROVAL_SCHEMA = "quarry.detached-release-approval.v1"
+MANIFEST_EVIDENCE_CASES_SCHEMA = "quarry.manifest-evidence-cases.v1"
 
 RELEASE = evidence.RELEASE_SCOPE
 LANE_ORDER = (
@@ -389,6 +390,7 @@ SCHEMA_PATHS = {
     "corpus-selection-schema": "release/evidence/schemas/corpus-selection-v1.schema.json",
     "detached-approval-schema": "release/evidence/schemas/detached-approval-v1.schema.json",
     "gate-artifact-schema": "release/evidence/schemas/gate-artifact-v1.schema.json",
+    "manifest-evidence-cases-schema": "release/evidence/schemas/manifest-evidence-cases-v1.schema.json",
     "aggregator-conformance-manifest-schema": "release/evidence/schemas/aggregator-conformance-manifest-v1.schema.json",
     "gate-evidence-report-schema": "release/evidence/schemas/gate-evidence-report-v1.schema.json",
     "no-live-rule-schema": "release/evidence/schemas/no-live-rule-v1.schema.json",
@@ -407,6 +409,7 @@ SCHEMA_VERSIONS = {
     "corpus-selection-schema": CORPUS_MANIFEST_SCHEMA,
     "detached-approval-schema": APPROVAL_SCHEMA,
     "gate-artifact-schema": GATE_ARTIFACT_SCHEMA,
+    "manifest-evidence-cases-schema": MANIFEST_EVIDENCE_CASES_SCHEMA,
     "aggregator-conformance-manifest-schema": CONFORMANCE_MANIFEST_SCHEMA,
     "gate-evidence-report-schema": EVIDENCE_REPORT_SCHEMA,
     "no-live-rule-schema": NO_LIVE_RULE_SCHEMA,
@@ -425,6 +428,7 @@ MANIFEST_PATHS = {
     "no-live-rule": "release/evidence/no-live-rule-v1.json",
     "support-matrix": "release/evidence/support-matrix-v1.json",
     "threshold-benchmark": "release/evidence/threshold-benchmark-v1.json",
+    "manifest-evidence-cases": "release/evidence/manifest-evidence-cases-v1.json",
 }
 SCHEMA_VALIDATION_FIXTURE_MANIFEST_PATH = "release/evidence/schema-validation-fixtures-v1.json"
 SCHEMA_VALIDATION_FIXTURE_PATHS = {
@@ -436,6 +440,14 @@ RUNNER_INPUT_PATHS = dict(evidence.FUTURE_RUNNER_INPUTS)
 RUN_MANIFEST_INPUT_PATHS = {
     "run-manifest-schema": "release/evidence/schemas/run-manifest-v1.schema.json",
     "run-manifest-validator": "src/quarry_recon/run_manifest.py",
+    "manifest-revision-runtime": "src/quarry_recon/revision.py",
+    "manifest-campaign-runtime": "src/quarry_recon/campaign.py",
+    "manifest-settle-runtime": "src/quarry_recon/settle.py",
+    "manifest-store-runtime": "src/quarry_recon/store.py",
+    "manifest-state-runtime": "src/quarry_recon/state.py",
+    "manifest-run-contract-tests": "tests/test_run_manifest_contract.py",
+    "manifest-revision-tests": "tests/test_v310_revision_transaction.py",
+    "manifest-campaign-tests": "tests/test_v310_campaign_truth.py",
 }
 SCOPE_INPUT_PATHS = {
     **SCHEMA_PATHS,
@@ -514,6 +526,87 @@ _DOCS_POLICY_MATERIALS = (
     "docs-policy-target-profile",
     "docs-policy-nuclei-runtime",
     "docs-policy-private-reach-runtime",
+)
+
+_MANIFEST_TEST_SOURCES = (
+    "manifest-run-contract-tests",
+    "manifest-revision-tests",
+    "manifest-campaign-tests",
+)
+# This is the owner subset for B-MANIFEST's semantic authority.  Candidate
+# identity still binds the full source closure; projections and durability have
+# different gate owners and are intentionally not duplicated here.
+_MANIFEST_MATERIALS = (
+    "run-manifest-schema",
+    "run-manifest-validator",
+    "manifest-revision-runtime",
+    "manifest-campaign-runtime",
+    "manifest-settle-runtime",
+    "manifest-store-runtime",
+    "manifest-state-runtime",
+)
+_MANIFEST_TEST_ROSTER = (
+    "tests/test_run_manifest_contract.py::test_writer_emits_one_canonical_reconciled_v1_manifest",
+    "tests/test_run_manifest_contract.py::test_noncanonical_and_duplicate_member_encodings_are_not_commitments",
+    "tests/test_run_manifest_contract.py::test_lifecycle_identity_is_verified_by_authoritative_consumers",
+    "tests/test_v310_revision_transaction.py::test_disjoint_revisions_republish_the_full_effective_overlay",
+    "tests/test_v310_revision_transaction.py::test_revision_binds_pointer_entities_segments_raw_and_views",
+    "tests/test_v310_campaign_truth.py::test_a_later_silent_child_cannot_launder_an_earlier_gap",
+    "tests/test_v310_campaign_truth.py::test_gap_history_and_resolution_survive_reload",
+    "tests/test_run_manifest_contract.py::test_summary_projections_are_recomputed_from_authenticated_logs",
+    "tests/test_run_manifest_contract.py::test_malformed_remainder_is_explicitly_gapped_not_clean",
+    "tests/test_run_manifest_contract.py::test_event_sink_degradation_cannot_be_bound_to_a_clean_summary",
+    "tests/test_run_manifest_contract.py::test_envelope_degradation_cannot_be_bound_to_a_clean_summary",
+    "tests/test_v310_campaign_truth.py::test_only_matching_positive_coverage_resolves_the_historical_gap",
+    "tests/test_v310_campaign_truth.py::test_mismatched_or_incomplete_coverage_cannot_resolve_a_gap[wrong-source]",
+    "tests/test_v310_campaign_truth.py::test_mismatched_or_incomplete_coverage_cannot_resolve_a_gap[wrong-measure]",
+    "tests/test_v310_campaign_truth.py::test_mismatched_or_incomplete_coverage_cannot_resolve_a_gap[incomplete-coverage]",
+    "tests/test_v310_campaign_truth.py::test_matching_obligation_evidence_can_resolve_an_unmeasured_remainder_gap",
+    "tests/test_v310_campaign_truth.py::test_terminal_breakdown_must_equal_the_final_obligation_totals",
+    "tests/test_v310_campaign_truth.py::test_a_manifested_child_cannot_erase_the_mandatory_obligation_roster",
+)
+_MANIFEST_CORRUPTION_CASES = (
+    ("run-manifest-corruption", (
+        "tests/test_run_manifest_contract.py::test_semantic_manifest_corruption_refuses_every_consumer[extra-keys]",
+        "tests/test_run_manifest_contract.py::test_semantic_manifest_corruption_refuses_every_consumer[schema-version]",
+        "tests/test_run_manifest_contract.py::test_semantic_manifest_corruption_refuses_every_consumer[entity-counts]",
+        "tests/test_run_manifest_contract.py::test_semantic_manifest_corruption_refuses_every_consumer[tools-failed]",
+        "tests/test_run_manifest_contract.py::test_semantic_manifest_corruption_refuses_every_consumer[verdict]",
+        "tests/test_run_manifest_contract.py::test_semantic_manifest_corruption_refuses_every_consumer[generation]",
+        "tests/test_run_manifest_contract.py::test_semantic_manifest_corruption_refuses_every_consumer[base-files]",
+        "tests/test_run_manifest_contract.py::test_lifecycle_sidecar_has_one_strict_semantic_contract[extra-key]",
+        "tests/test_run_manifest_contract.py::test_lifecycle_sidecar_has_one_strict_semantic_contract[bad-updated]",
+        "tests/test_run_manifest_contract.py::test_lifecycle_sidecar_has_one_strict_semantic_contract[bad-detail]",
+        "tests/test_run_manifest_contract.py::test_lifecycle_sidecar_has_one_strict_semantic_contract[bad-stage]",
+        "tests/test_run_manifest_contract.py::test_lifecycle_sidecar_has_one_strict_semantic_contract[invalid-state]",
+    )),
+    ("revision-overlay-pointer-corruption", (
+        "tests/test_v310_revision_transaction.py::test_evidence_corruption_matrix_fails_closed[pointer]",
+        "tests/test_v310_revision_transaction.py::test_evidence_corruption_matrix_fails_closed[entity]",
+        "tests/test_v310_revision_transaction.py::test_evidence_corruption_matrix_fails_closed[segment]",
+        "tests/test_v310_revision_transaction.py::test_evidence_corruption_matrix_fails_closed[raw]",
+    )),
+    ("campaign-terminal-history-corruption", (
+        "tests/test_v310_campaign_truth.py::test_contradictory_terminal_documents_are_unusable[success]",
+        "tests/test_v310_campaign_truth.py::test_contradictory_terminal_documents_are_unusable[clean]",
+        "tests/test_v310_campaign_truth.py::test_contradictory_terminal_documents_are_unusable[terminal]",
+        "tests/test_v310_campaign_truth.py::test_contradictory_terminal_documents_are_unusable[non-terminal]",
+        "tests/test_v310_campaign_truth.py::test_contradictory_terminal_documents_are_unusable[open-gaps]",
+        "tests/test_v310_campaign_truth.py::test_a_forged_resolution_without_matching_evidence_is_unusable",
+    )),
+)
+_MANIFEST_CORRUPTION_CODE_ROSTER = (
+    (
+        "manifest.extra_keys", "manifest.schema_version", "manifest.entity_counts",
+        "manifest.tools_failed", "manifest.verdict", "manifest.generation", "manifest.base_files",
+        "lifecycle.extra_key", "lifecycle.bad_updated", "lifecycle.bad_detail",
+        "lifecycle.bad_stage", "lifecycle.invalid_state",
+    ),
+    ("revision.pointer", "revision.entity", "revision.segment", "revision.raw"),
+    (
+        "campaign.terminal_success", "campaign.terminal_clean", "campaign.terminal_cause",
+        "campaign.terminal_nonterminal", "campaign.open_gaps", "campaign.forged_resolution",
+    ),
 )
 PRODUCTION_TRUST_POLICY_PATH = "release/evidence/trust-policy-v1.json"
 
@@ -664,6 +757,93 @@ def _canonical_reader(data: bytes, name: str) -> object:
 def canonical_json_line(document: object) -> bytes:
     """Return the sole file representation for v1 contract/evidence JSON."""
     return evidence.canonical_json_bytes(document) + b"\n"
+
+
+def _manifest_result_digest(spec: Mapping[str, object], observed: Mapping[str, object]) -> str:
+    """Digest one frozen manifest case result without running any test code."""
+    return evidence.canonical_digest({
+        "case_id": spec["case_id"], "nodeid": spec["nodeid"], "observed": observed,
+    })
+
+
+def _manifest_observed_result(spec: Mapping[str, object]) -> dict:
+    """Build the canonical recorded result required by a frozen case spec."""
+    observed = {
+        "code": spec["expected_code"], "error_class": spec["error_class"],
+        "outcome": spec["expected_outcome"],
+    }
+    return {
+        "case_id": spec["case_id"], "nodeid": spec["nodeid"], "observed": observed,
+        "result_digest": _manifest_result_digest(spec, observed), "test_status": "pass",
+    }
+
+
+def _read_manifest_evidence_cases(data: bytes) -> dict:
+    """Read the frozen, candidate-independent B-MANIFEST result specification."""
+    doc = _object(_canonical_reader(data, "manifest evidence cases"), "manifest evidence cases", {
+        "corruption_cases", "invariants", "release", "schema_version",
+    })
+    if doc["release"] != RELEASE or doc["schema_version"] != MANIFEST_EVIDENCE_CASES_SCHEMA:
+        raise evidence.EvidenceError("manifest evidence cases has the wrong release or schema")
+
+    def read_spec(
+        value: object, name: str, expected_outcome: str, error_class: str | None,
+        code_prefix: str | None,
+    ) -> dict:
+        spec = _object(value, name, {
+            "case_id", "error_class", "expected_code", "expected_outcome", "nodeid", "selector",
+        })
+        _token(spec["case_id"], f"{name}.case_id")
+        _string(spec["nodeid"], f"{name}.nodeid")
+        _token(spec["selector"], f"{name}.selector")
+        if spec["expected_outcome"] != expected_outcome:
+            raise evidence.EvidenceError(f"{name}.expected_outcome is not {expected_outcome}")
+        expected_code = spec["case_id"] if code_prefix is None else code_prefix
+        if spec["expected_code"] != expected_code:
+            raise evidence.EvidenceError(f"{name}.expected_code is not the exact normalized code")
+        if spec["error_class"] != error_class:
+            raise evidence.EvidenceError(f"{name}.error_class is not the exact closed class")
+        return spec
+
+    invariants = _array(doc["invariants"], "manifest evidence cases.invariants")
+    if len(invariants) != len(_MANIFEST_TEST_ROSTER):
+        raise evidence.EvidenceError("manifest evidence invariant roster has the wrong cardinality")
+    expected_nodes = list(_MANIFEST_TEST_ROSTER)
+    parsed_invariants = [read_spec(spec, f"manifest invariant {index}", "pass", None, None)
+                         for index, spec in enumerate(invariants)]
+    if [spec["nodeid"] for spec in parsed_invariants] != expected_nodes:
+        raise evidence.EvidenceError("manifest evidence invariant node roster or order is not exact")
+
+    cases = _array(doc["corruption_cases"], "manifest evidence cases.corruption_cases")
+    if len(cases) != len(_MANIFEST_CORRUPTION_CASES):
+        raise evidence.EvidenceError("manifest evidence corruption case roster has the wrong cardinality")
+    parsed_cases = []
+    group_expectations = (
+        ("refused", "ManifestError"),
+        ("unusable", "RevisionUnusable"),
+        ("unusable", "CampaignUnusable"),
+    )
+    for index, (value, (expected_id, expected_members)) in enumerate(zip(cases, _MANIFEST_CORRUPTION_CASES)):
+        case = _object(value, f"manifest corruption case {index}", {"id", "members"})
+        if case["id"] != expected_id:
+            raise evidence.EvidenceError("manifest evidence corruption case roster or order is not exact")
+        members = _array(case["members"], f"manifest corruption case {index}.members")
+        if len(members) != len(expected_members):
+            raise evidence.EvidenceError("manifest evidence corruption member roster has the wrong cardinality")
+        outcome, error_class = group_expectations[index]
+        expected_codes = _MANIFEST_CORRUPTION_CODE_ROSTER[index]
+        parsed_members = [read_spec(
+            spec, f"manifest corruption case {index} member {member_index}", outcome,
+            error_class, expected_codes[member_index],
+        )
+                          for member_index, spec in enumerate(members)]
+        if [spec["nodeid"] for spec in parsed_members] != list(expected_members):
+            raise evidence.EvidenceError("manifest evidence corruption member roster or order is not exact")
+        parsed_cases.append({"id": expected_id, "members": parsed_members})
+    all_specs = parsed_invariants + [member for case in parsed_cases for member in case["members"]]
+    if len({spec["case_id"] for spec in all_specs}) != len(all_specs):
+        raise evidence.EvidenceError("manifest evidence case ids must be unique")
+    return {"invariants": parsed_invariants, "corruption_cases": parsed_cases}
 
 
 _CONFORMANCE_CASES = (
@@ -4141,6 +4321,114 @@ def _semantic_docs_policy(
         raise evidence.EvidenceError("docs-policy report and signed gate counts do not reconcile")
 
 
+def _semantic_manifest(
+    gate: dict, bodies: Mapping[str, bytes], **context: object,
+) -> None:
+    """Bind manifest invariants and corruption refusals to one H0 evidence instance."""
+    if gate["gate_id"] != "B-MANIFEST":  # pragma: no cover - registry invariant
+        raise evidence.EvidenceError("manifest verifier received the wrong gate")
+    identity = context["identity"]
+    report = context["report"]
+    scope = context["scope"]
+    inputs = context["input_bodies"]
+    if not isinstance(identity, dict) or not isinstance(report, dict) or not isinstance(scope, dict) or not isinstance(inputs, Mapping):
+        raise evidence.EvidenceError("manifest verifier requires accepted release context")
+    signed = {item["name"]: item for item in gate["artifacts"]}
+    for name in ("invariant-report", "corrupt-fixture-matrix"):
+        item = signed.get(name)
+        if (item is None or item["media_type"] != "application/json" or
+                item["digest"] != raw_sha256(bodies[name])):
+            raise evidence.EvidenceError("manifest artifact does not match its exact signed artifact digest")
+    instances = report["instances"]
+    if len(instances) != 1:
+        raise evidence.EvidenceError("manifest report requires one exact signed H0 evidence instance")
+    instance = instances[0]
+    if instance["lane"] != "H0-hermetic":
+        raise evidence.EvidenceError("manifest report requires an H0-hermetic evidence instance")
+    bindings = {item["name"]: item for item in scope["input_bindings"]}
+    expected_sources = []
+    for name in _MANIFEST_TEST_SOURCES:
+        binding = bindings.get(name)
+        if binding is None or inputs.get(name) is None or raw_sha256(inputs[name]) != binding["digest"]:
+            raise evidence.EvidenceError("manifest test source is absent or drifted from the frozen scope")
+        expected_sources.append({"digest": binding["digest"], "name": name, "path": binding["path"]})
+    expected_materials = []
+    for name in _MANIFEST_MATERIALS:
+        binding = bindings.get(name)
+        if binding is None or inputs.get(name) is None or raw_sha256(inputs[name]) != binding["digest"]:
+            raise evidence.EvidenceError("manifest material is absent or drifted from the frozen scope")
+        expected_materials.append({"digest": binding["digest"], "name": name, "path": binding["path"]})
+    cases_binding = bindings.get("manifest-evidence-cases")
+    cases_body = inputs.get("manifest-evidence-cases")
+    if (cases_binding is None or cases_body is None or
+            raw_sha256(cases_body) != cases_binding["digest"]):
+        raise evidence.EvidenceError("manifest case manifest is absent or drifted from the frozen scope")
+    case_specs = _read_manifest_evidence_cases(cases_body)
+    case_manifest_digest = raw_sha256(cases_body)
+    common_members = {
+        "artifact_type", "candidate_identity_digest", "environment", "evidence_finished_at",
+        "evidence_instance_id", "evidence_started_at", "gate_id", "manifest_materials", "name",
+        "release", "schema_version", "selection", "test_sources", "case_manifest_digest",
+    }
+    invariant = _object(
+        _artifact_document(bodies["invariant-report"], "B-MANIFEST", "invariant-report"),
+        "manifest invariant report", common_members | {"matrix_digest", "node_results"},
+    )
+    matrix = _object(
+        _artifact_document(bodies["corrupt-fixture-matrix"], "B-MANIFEST", "corrupt-fixture-matrix"),
+        "manifest corrupt fixture matrix", common_members | {"cases"},
+    )
+    expected_identity = {
+        "candidate_identity_digest": evidence.canonical_digest(identity), "gate_id": "B-MANIFEST",
+        "release": RELEASE, "schema_version": GATE_ARTIFACT_SCHEMA,
+    }
+    for doc, artifact_type, name in (
+        (invariant, "manifest-invariant-report", "invariant-report"),
+        (matrix, "manifest-corrupt-fixture-matrix", "corrupt-fixture-matrix"),
+    ):
+        if (doc["artifact_type"] != artifact_type or doc["name"] != name or
+                any(doc[key] != value for key, value in expected_identity.items())):
+            raise evidence.EvidenceError("manifest artifact has the wrong candidate, gate, release or name")
+        if (doc["evidence_instance_id"] != instance["id"] or
+                doc["environment"] != instance["environment"] or
+                doc["evidence_started_at"] != instance["started_at"] or
+                doc["evidence_finished_at"] != instance["finished_at"]):
+            raise evidence.EvidenceError("manifest artifact does not bind its exact signed H0 instance")
+        if doc["test_sources"] != expected_sources or doc["manifest_materials"] != expected_materials:
+            raise evidence.EvidenceError("manifest artifact does not bind the exact frozen source/material roster")
+        if doc["case_manifest_digest"] != case_manifest_digest:
+            raise evidence.EvidenceError("manifest artifact does not bind the exact frozen case manifest digest")
+    expected_nodes = [_manifest_observed_result(spec) for spec in case_specs["invariants"]]
+    node_selection = {
+        "collected": len(expected_nodes), "deselected": 0, "failed": 0,
+        "passed": len(expected_nodes), "selected": len(expected_nodes), "skipped": 0,
+        "xfailed": 0, "xpassed": 0,
+    }
+    if invariant["node_results"] != expected_nodes or invariant["selection"] != node_selection:
+        raise evidence.EvidenceError("manifest invariant node roster or counts do not reconcile")
+    expected_cases = [{
+        "id": case["id"],
+        "members": [_manifest_observed_result(spec) for spec in case["members"]],
+    } for case in case_specs["corruption_cases"]]
+    case_count = sum(len(case["members"]) for case in case_specs["corruption_cases"])
+    case_selection = {
+        "collected": case_count, "deselected": 0, "failed": 0,
+        "passed": case_count, "selected": case_count, "skipped": 0,
+        "xfailed": 0, "xpassed": 0,
+    }
+    if matrix["cases"] != expected_cases or matrix["selection"] != case_selection:
+        raise evidence.EvidenceError("manifest corruption case roster, observed result or digest does not reconcile")
+    total_selection = {
+        "collected": len(expected_nodes) + case_count, "deselected": 0, "failed": 0,
+        "passed": len(expected_nodes) + case_count, "selected": len(expected_nodes) + case_count,
+        "skipped": 0, "xfailed": 0, "xpassed": 0,
+    }
+    if instance["selection"] != total_selection or gate["selection"] != total_selection:
+        raise evidence.EvidenceError("manifest signed H0 selection does not cover both evidence partitions")
+    if invariant["matrix_digest"] != raw_sha256(bodies["corrupt-fixture-matrix"]):
+        raise evidence.EvidenceError("manifest invariant report does not bind the exact corruption matrix digest")
+
+
 def _semantic_h0_hermetic_all(
     gate: dict, bodies: Mapping[str, bytes], **context: object,
 ) -> None:
@@ -4661,6 +4949,7 @@ SEMANTIC_VERIFIERS = MappingProxyType({
     "B-HERMETIC-ALL": _semantic_h0_hermetic_all,
     "B-SCHEMA": _semantic_schema_validation,
     "B-DOCS-POLICY": _semantic_docs_policy,
+    "B-MANIFEST": _semantic_manifest,
     "C-PACKAGE-BUILD": _semantic_package_build,
     "C-NETWORK-BOUNDARY": _semantic_network_boundary,
     "C-NET-DENY": _semantic_network_denial,

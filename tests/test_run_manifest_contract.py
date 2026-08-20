@@ -60,6 +60,7 @@ def test_writer_emits_one_canonical_reconciled_v1_manifest(tmp_path):
         (lambda doc: doc["lifecycle"].__setitem__("generation", "wrong"), "generation"),
         (lambda doc: doc["base_files"][0].__setitem__("digest", "sha256:" + "f" * 64), "base_files"),
     ],
+    ids=["extra-keys", "schema-version", "entity-counts", "tools-failed", "verdict", "generation", "base-files"],
 )
 def test_semantic_manifest_corruption_refuses_every_consumer(tmp_path, mutate, fragment):
     run = _committed_run(tmp_path)
@@ -320,6 +321,7 @@ def test_base_artifact_roots_have_fixed_file_and_directory_kinds(tmp_path):
         lambda state_doc: state_doc["stages"].__setitem__("report", "done"),
         lambda state_doc: state_doc.update({"state": "finalization_failed", "stages": {}, "detail": None}),
     ],
+    ids=["extra-key", "bad-updated", "bad-detail", "bad-stage", "invalid-state"],
 )
 def test_lifecycle_sidecar_has_one_strict_semantic_contract(tmp_path, mutate):
     run = _committed_run(tmp_path)
