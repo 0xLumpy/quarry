@@ -1,0 +1,199 @@
+{
+  "$id": "urn:quarry:schema:network-boundary-trace:v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "candidate_identity_digest": {"pattern": "^sha256:[0-9a-f]{64}$", "type": "string"},
+    "gate_id": {"const": "C-NETWORK-BOUNDARY"},
+    "instances": {
+      "items": {"$ref": "#/$defs/instance"},
+      "maxItems": 32,
+      "minItems": 1,
+      "type": "array"
+    },
+    "release": {"const": "0.3.10"},
+    "schema_version": {"const": "quarry.network-boundary-trace.v1"}
+  },
+  "required": ["candidate_identity_digest", "gate_id", "instances", "release", "schema_version"],
+  "title": "Quarry C-NETWORK-BOUNDARY trace v1",
+  "type": "object",
+  "$defs": {
+    "broker_record": {
+      "additionalProperties": false,
+      "properties": {
+        "decision": {"enum": ["allow", "deny"]},
+        "peer": {"type": ["string", "null"]},
+        "port": {"maximum": 65535, "minimum": 0, "type": ["integer", "null"]},
+        "protocol": {"minimum": 0, "type": "integer"},
+        "reason": {"maxLength": 1024, "minLength": 1, "type": "string"},
+        "result": {"type": ["string", "null"]},
+        "sequence": {"minimum": 0, "type": "integer"},
+        "socket_type": {"minimum": 0, "type": "integer"},
+        "stage": {"maxLength": 64, "minLength": 1, "type": "string"},
+        "syscall": {"maxLength": 64, "minLength": 1, "type": "string"},
+        "tid": {"minimum": 1, "type": "integer"}
+      },
+      "required": ["decision", "peer", "port", "protocol", "reason", "result", "sequence", "socket_type", "stage", "syscall", "tid"],
+      "type": "object"
+    },
+    "broker_summary": {
+      "additionalProperties": false,
+      "properties": {
+        "active_operations": {"minimum": 0, "type": "integer"},
+        "complete": {"type": "boolean"},
+        "dropped_records": {"minimum": 0, "type": "integer"},
+        "fatal": {"type": ["string", "null"]},
+        "listener_hup": {"type": "boolean"},
+        "open_plans": {"minimum": 0, "type": "integer"},
+        "profile": {"enum": ["standard", "browser"]},
+        "records": {"items": {"$ref": "#/$defs/broker_record"}, "maxItems": 1024, "type": "array"},
+        "request_id": {"pattern": "^[0-9a-f]{32}$", "type": "string"},
+        "retained_connections": {"minimum": 0, "type": "integer"},
+        "schema_version": {"const": "quarry.network-broker-summary.v1"}
+      },
+      "required": ["active_operations", "complete", "dropped_records", "fatal", "listener_hup", "open_plans", "profile", "records", "request_id", "retained_connections", "schema_version"],
+      "type": "object"
+    },
+    "diagnostic": {
+      "additionalProperties": false,
+      "properties": {
+        "acceptance_errors": {"items": {"maxLength": 512, "minLength": 1, "type": "string"}, "maxItems": 32, "type": "array"},
+        "broker": {"$ref": "#/$defs/broker_summary"},
+        "dns_records": {"items": {"$ref": "#/$defs/dns_record"}, "maxItems": 128, "type": "array"},
+        "http_records": {"items": {"$ref": "#/$defs/http_record"}, "maxItems": 64, "type": "array"},
+        "proxy": {"$ref": "#/$defs/proxy_summary"},
+        "proxy_effects": {"$ref": "#/$defs/proxy_effects"},
+        "reaped": {"items": {"items": {"type": "integer"}, "maxItems": 2, "minItems": 2, "type": "array"}, "maxItems": 64, "type": "array"},
+        "refused": {"$ref": "#/$defs/refused"},
+        "schema_version": {"const": "quarry.network-boundary-h1.v1"},
+        "tracee_results": {"$ref": "#/$defs/tracee_results"}
+      },
+      "required": ["acceptance_errors", "broker", "dns_records", "http_records", "proxy", "proxy_effects", "reaped", "refused", "schema_version", "tracee_results"],
+      "type": "object"
+    },
+    "dns_record": {
+      "additionalProperties": false,
+      "properties": {
+        "count": {"minimum": 1, "type": "integer"},
+        "dns": {"maxLength": 253, "minLength": 1, "type": "string"},
+        "kind": {"maximum": 65535, "minimum": 1, "type": "integer"}
+      },
+      "required": ["count", "dns", "kind"],
+      "type": "object"
+    },
+    "environment": {
+      "additionalProperties": false,
+      "properties": {
+        "architecture": {"minLength": 1, "type": "string"},
+        "isolation_profile": {"pattern": "^sha256:[0-9a-f]{64}$", "type": "string"},
+        "os": {"minLength": 1, "type": "string"},
+        "python": {"minLength": 1, "type": "string"},
+        "runner_image": {"pattern": "^sha256:[0-9a-f]{64}$", "type": "string"}
+      },
+      "required": ["architecture", "isolation_profile", "os", "python", "runner_image"],
+      "type": "object"
+    },
+    "http_record": {
+      "additionalProperties": false,
+      "properties": {
+        "host": {"maxLength": 512, "minLength": 1, "type": "string"},
+        "path": {"maxLength": 2048, "minLength": 1, "type": "string"}
+      },
+      "required": ["host", "path"],
+      "type": "object"
+    },
+    "identity": {
+      "additionalProperties": false,
+      "properties": {
+        "lane": {"const": "H1-tool-integration"},
+        "python": {"minLength": 1, "type": "string"},
+        "runner_image": {"pattern": "^sha256:[0-9a-f]{64}$", "type": "string"}
+      },
+      "required": ["lane", "python", "runner_image"],
+      "type": "object"
+    },
+    "instance": {
+      "additionalProperties": false,
+      "properties": {
+        "diagnostic": {"$ref": "#/$defs/diagnostic"},
+        "environment": {"$ref": "#/$defs/environment"},
+        "identity": {"$ref": "#/$defs/identity"}
+      },
+      "required": ["diagnostic", "environment", "identity"],
+      "type": "object"
+    },
+    "proxy_effects": {
+      "additionalProperties": false,
+      "properties": {
+        "cidr_status": {"const": 404},
+        "idna_status": {"const": 404},
+        "rebind_first_status": {"const": 404},
+        "redirect_status": {"const": 200},
+        "start_location": {"const": "http://redirect.fixture.test:8080/final"},
+        "start_status": {"const": 302}
+      },
+      "required": ["cidr_status", "idna_status", "rebind_first_status", "redirect_status", "start_location", "start_status"],
+      "type": "object"
+    },
+    "proxy_record": {
+      "additionalProperties": false,
+      "properties": {
+        "decision": {"enum": ["allow", "deny"]},
+        "host": {"type": ["string", "null"]},
+        "method": {"maxLength": 64, "minLength": 1, "type": "string"},
+        "peer": {"type": ["string", "null"]},
+        "port": {"maximum": 65535, "minimum": 0, "type": ["integer", "null"]},
+        "reason": {"maxLength": 1024, "minLength": 1, "type": "string"},
+        "sequence": {"minimum": 0, "type": "integer"},
+        "stage": {"maxLength": 64, "minLength": 1, "type": "string"}
+      },
+      "required": ["decision", "host", "method", "peer", "port", "reason", "sequence", "stage"],
+      "type": "object"
+    },
+    "proxy_summary": {
+      "additionalProperties": false,
+      "properties": {
+        "active_sockets": {"minimum": 0, "type": "integer"},
+        "active_threads": {"minimum": 0, "type": "integer"},
+        "complete": {"type": "boolean"},
+        "dropped_records": {"minimum": 0, "type": "integer"},
+        "fatal": {"type": ["string", "null"]},
+        "open_plans": {"minimum": 0, "type": "integer"},
+        "records": {"items": {"$ref": "#/$defs/proxy_record"}, "maxItems": 8192, "type": "array"},
+        "request_id": {"pattern": "^[0-9a-f]{32}$", "type": "string"},
+        "schema_version": {"const": "quarry.browser-proxy-summary.v1"}
+      },
+      "required": ["active_sockets", "active_threads", "complete", "dropped_records", "fatal", "open_plans", "records", "request_id", "schema_version"],
+      "type": "object"
+    },
+    "refused": {
+      "additionalProperties": false,
+      "properties": {
+        "direct_ip": {"const": true},
+        "mixed": {"const": true},
+        "protected": {"const": true},
+        "rebind": {"const": true},
+        "scope": {"const": true},
+        "unicode_idna": {"const": true}
+      },
+      "required": ["direct_ip", "mixed", "protected", "rebind", "scope", "unicode_idna"],
+      "type": "object"
+    },
+    "tracee_results": {
+      "additionalProperties": false,
+      "properties": {
+        "approved": {"const": 0},
+        "control_plane": {"const": 1},
+        "direct_ip": {"const": 1},
+        "metadata": {"const": 1},
+        "scanner_self": {"const": 1},
+        "sendmsg_allowed": {"const": 1},
+        "sendmsg_control": {"const": 1},
+        "sendto_allowed": {"const": 1},
+        "sendto_metadata": {"const": 1}
+      },
+      "required": ["approved", "control_plane", "direct_ip", "metadata", "scanner_self", "sendmsg_allowed", "sendmsg_control", "sendto_allowed", "sendto_metadata"],
+      "type": "object"
+    }
+  }
+}

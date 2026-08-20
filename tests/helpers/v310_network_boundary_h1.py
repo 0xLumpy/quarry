@@ -170,6 +170,37 @@ def _request(proxy, host: str, path: str) -> bytes:
         proxy._close_tracked(upstream)
 
 
+def _http_status(response: bytes) -> int:
+    try:
+        head = response.split(b"\r\n", 1)[0]
+        protocol, raw_status, _reason = head.split(b" ", 2)
+        status = int(raw_status)
+    except (ValueError, TypeError) as exc:
+        raise RuntimeError("H1 proxy response status is malformed") from exc
+    if protocol != b"HTTP/1.1" or not 100 <= status <= 599:
+        raise RuntimeError("H1 proxy response status is malformed")
+    return status
+
+
+def _http_header(response: bytes, name: bytes) -> str:
+    try:
+        head, _body = response.split(b"\r\n\r\n", 1)
+    except ValueError as exc:
+        raise RuntimeError("H1 proxy response headers are malformed") from exc
+    prefix = name.lower() + b":"
+    values = [
+        line.split(b":", 1)[1].strip()
+        for line in head.split(b"\r\n")[1:]
+        if line.lower().startswith(prefix)
+    ]
+    if len(values) != 1:
+        raise RuntimeError("H1 proxy response header is missing or duplicated")
+    try:
+        return values[0].decode("ascii", "strict")
+    except UnicodeError as exc:
+        raise RuntimeError("H1 proxy response header is not ASCII") from exc
+
+
 def _refused(proxy, host: str) -> bool:
     try:
         upstream = proxy._dial("GET", host, _HTTP_PORT)
@@ -336,6 +367,14 @@ def main() -> int:
         idna = _request(browser_proxy, "xn--bcher-kva.fixture.test", "/idna")
         cidr = _request(browser_proxy, _FIXTURE_IP, "/cidr")
         rebind_first = _request(browser_proxy, "rebind.fixture.test", "/rebind")
+        proxy_effects = {
+            "start_status": _http_status(start),
+            "start_location": _http_header(start, b"location"),
+            "redirect_status": _http_status(redirect),
+            "idna_status": _http_status(idna),
+            "cidr_status": _http_status(cidr),
+            "rebind_first_status": _http_status(rebind_first),
+        }
         refused = {
             "unicode_idna": _refused(browser_proxy, "bücher.fixture.test"),
             "scope": _refused(browser_proxy, "oos.fixture.test"),
@@ -378,6 +417,7 @@ def main() -> int:
             "schema_version": "quarry.network-boundary-h1.v1",
             "broker": summary,
             "proxy": proxy_summary,
+            "proxy_effects": proxy_effects,
             "tracee_results": tracee_results,
             "dns_records": dns_records,
             "http_records": http_records,

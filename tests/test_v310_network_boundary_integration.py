@@ -10,6 +10,9 @@ import sys
 
 import pytest
 
+from quarry_recon import release_contracts as contracts
+from quarry_recon import release_evidence as evidence
+
 
 pytestmark = [
     pytest.mark.integration,
@@ -41,3 +44,32 @@ def test_network_boundary_adversary_emits_a_clean_bounded_diagnostic():
     assert diagnostic["schema_version"] == "quarry.network-boundary-h1.v1"
     assert diagnostic["acceptance_errors"] == [], diagnostic
     assert completed.returncode == 0, diagnostic
+    identity = {"candidate": "integration-fixture"}
+    environment = {
+        "architecture": "x86_64",
+        "isolation_profile": "sha256:" + "b" * 64,
+        "lane": "H1-tool-integration",
+        "os": "linux",
+        "python": "3.12.13",
+        "runner_image": "sha256:" + "a" * 64,
+    }
+    artifact = {
+        "candidate_identity_digest": evidence.canonical_digest(identity),
+        "gate_id": "C-NETWORK-BOUNDARY",
+        "instances": [{
+            "diagnostic": diagnostic,
+            "environment": {
+                key: environment[key] for key in environment if key != "lane"
+            },
+            "identity": {
+                "lane": environment["lane"], "python": environment["python"],
+                "runner_image": environment["runner_image"],
+            },
+        }],
+        "release": "0.3.10",
+        "schema_version": contracts.NETWORK_BOUNDARY_TRACE_SCHEMA,
+    }
+    assert contracts._validate_network_boundary_trace(
+        contracts.canonical_json_line(artifact),
+        identity=identity, support={"environments": [environment]},
+    ) == artifact

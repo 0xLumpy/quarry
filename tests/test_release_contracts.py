@@ -184,6 +184,96 @@ def _generic_supporting_body(gate_id: str, name: str, identity: dict) -> bytes:
     })
 
 
+def _network_boundary_body(identity: dict, support: dict) -> bytes:
+    h1 = next(row for row in support["environments"] if row["lane"] == "H1-tool-integration")
+    direct = (
+        ("connect", "10.203.0.1", "allow", "ok"),
+        ("connect", "8.8.4.4", "deny", None),
+        ("connect", "10.203.0.2", "deny", None),
+        ("connect", "169.254.169.254", "deny", None),
+        ("connect", "10.203.0.99", "deny", None),
+        ("sendto", "10.203.0.1", "allow", "1"),
+        ("sendto", "169.254.169.254", "deny", None),
+        ("sendmsg", "10.203.0.1", "allow", "1"),
+        ("sendmsg", "10.203.0.99", "deny", None),
+    )
+    refused = (
+        "bücher.fixture.test", "oos.fixture.test", "8.8.4.4",
+        "mixed.fixture.test", "protected.fixture.test", "rebind.fixture.test",
+    )
+    diagnostic = {
+        "acceptance_errors": [],
+        "broker": {
+            "active_operations": 0, "complete": True, "dropped_records": 0,
+            "fatal": None, "listener_hup": True, "open_plans": 0,
+            "profile": "standard", "request_id": "a" * 32,
+            "retained_connections": 0,
+            "schema_version": "quarry.network-broker-summary.v1",
+            "records": [{
+                "decision": decision, "peer": peer,
+                "port": 8080 if peer.startswith("10.203") else 80,
+                "protocol": 6 if syscall == "connect" else 17,
+                "reason": "fixed boundary witness", "result": result,
+                "sequence": sequence,
+                "socket_type": 1 if syscall == "connect" else 2,
+                "stage": "settled", "syscall": syscall, "tid": 100,
+            } for sequence, (syscall, peer, decision, result) in enumerate(direct)],
+        },
+        "dns_records": [{
+            "count": 2 if name == "rebind.fixture.test" else 1,
+            "dns": name, "kind": 1,
+        } for name in sorted(contracts._NETWORK_BOUNDARY_DNS_NAMES)],
+        "http_records": [
+            {"host": host, "path": path}
+            for host, path in sorted(contracts._NETWORK_BOUNDARY_HTTP_CONTACTS)
+        ],
+        "proxy": {
+            "active_sockets": 0, "active_threads": 0, "complete": True,
+            "dropped_records": 0, "fatal": None, "open_plans": 0,
+            "request_id": "a" * 32,
+            "schema_version": "quarry.browser-proxy-summary.v1",
+            "records": [{
+                "decision": "deny", "host": host, "method": "GET",
+                "peer": None, "port": 8080, "reason": "fixed boundary refusal",
+                "sequence": sequence, "stage": "authority",
+            } for sequence, host in enumerate(refused)],
+        },
+        "proxy_effects": {
+            "cidr_status": 404, "idna_status": 404, "rebind_first_status": 404,
+            "redirect_status": 200,
+            "start_location": "http://redirect.fixture.test:8080/final",
+            "start_status": 302,
+        },
+        "reaped": [],
+        "refused": {
+            "direct_ip": True, "mixed": True, "protected": True,
+            "rebind": True, "scope": True, "unicode_idna": True,
+        },
+        "schema_version": "quarry.network-boundary-h1.v1",
+        "tracee_results": {
+            "approved": 0, "control_plane": 1, "direct_ip": 1, "metadata": 1,
+            "scanner_self": 1, "sendmsg_allowed": 1, "sendmsg_control": 1,
+            "sendto_allowed": 1, "sendto_metadata": 1,
+        },
+    }
+    return contracts.canonical_json_line({
+        "candidate_identity_digest": evidence.canonical_digest(identity),
+        "gate_id": "C-NETWORK-BOUNDARY",
+        "instances": [{
+            "diagnostic": diagnostic,
+            "environment": {key: h1[key] for key in (
+                "architecture", "isolation_profile", "os", "python", "runner_image",
+            )},
+            "identity": {
+                "lane": h1["lane"], "python": h1["python"],
+                "runner_image": h1["runner_image"],
+            },
+        }],
+        "release": "0.3.10",
+        "schema_version": contracts.NETWORK_BOUNDARY_TRACE_SCHEMA,
+    })
+
+
 def _supporting_bodies(
     gate_id: str, *, identity: dict, scope: dict, support: dict, thresholds: dict,
     benchmark: dict | None, measurements: list[dict], environment: dict,
@@ -208,6 +298,8 @@ def _supporting_bodies(
                 "size": len(bodies[name]),
             } for name, media_type in (("sdist", "application/gzip"), ("wheel", "application/zip"))],
         })
+    elif gate_id == "C-NETWORK-BOUNDARY":
+        bodies["network-boundary-trace"] = _network_boundary_body(identity, support)
     elif gate_id == "C-NET-DENY":
         environments = sorted(
             (row for row in support["environments"]
@@ -1324,7 +1416,8 @@ class TestSignatures:
 class TestIncompleteSemanticRegistry:
     def test_production_aggregation_refuses_unimplemented_obligation_semantics(self, tmp_path):
         assert set(contracts.SEMANTIC_VERIFIERS) == (
-            set(contracts.RESOURCE_SEMANTIC_GATES) | {"C-NET-DENY"}
+            set(contracts.RESOURCE_SEMANTIC_GATES)
+            | {"C-NETWORK-BOUNDARY", "C-NET-DENY"}
         )
         assert "C-PERF-PHASE-FAIRNESS" not in contracts.SEMANTIC_VERIFIERS
         arguments = _scenario(tmp_path)

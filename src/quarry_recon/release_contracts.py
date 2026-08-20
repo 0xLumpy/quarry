@@ -12,6 +12,7 @@ from __future__ import annotations
 import base64
 import binascii
 import csv
+import errno
 import hashlib
 import io
 import os
@@ -45,6 +46,7 @@ BENCHMARK_INVALIDATIONS_SCHEMA = GATE_ARTIFACT_SCHEMA
 BENCHMARK_BASELINE_SCHEMA = GATE_ARTIFACT_SCHEMA
 BENCHMARK_REPORT_SCHEMA = GATE_ARTIFACT_SCHEMA
 RESOURCE_GATE_REPORT_SCHEMA = resource_contract.SCHEMA_VERSION
+NETWORK_BOUNDARY_TRACE_SCHEMA = "quarry.network-boundary-trace.v1"
 NETWORK_DENIAL_REPORT_SCHEMA = "quarry.network-denial-report.v1"
 PUBLICATION_SUBJECTS_SCHEMA = GATE_ARTIFACT_SCHEMA
 AGGREGATE_SCHEMA = "quarry.release-aggregate.v1"
@@ -378,6 +380,7 @@ SCHEMA_PATHS = {
     "gate-artifact-schema": "release/evidence/schemas/gate-artifact-v1.schema.json",
     "gate-evidence-report-schema": "release/evidence/schemas/gate-evidence-report-v1.schema.json",
     "no-live-rule-schema": "release/evidence/schemas/no-live-rule-v1.schema.json",
+    "network-boundary-trace-schema": "release/evidence/schemas/network-boundary-trace-v1.schema.json",
     "network-denial-report-schema": "release/evidence/schemas/network-denial-report-v1.schema.json",
     "release-scope-schema": "release/evidence/schemas/release-scope-v1.schema.json",
     "resource-gate-report-schema": "release/evidence/schemas/resource-gate-report-v1.schema.json",
@@ -394,6 +397,7 @@ SCHEMA_VERSIONS = {
     "gate-artifact-schema": GATE_ARTIFACT_SCHEMA,
     "gate-evidence-report-schema": EVIDENCE_REPORT_SCHEMA,
     "no-live-rule-schema": NO_LIVE_RULE_SCHEMA,
+    "network-boundary-trace-schema": NETWORK_BOUNDARY_TRACE_SCHEMA,
     "network-denial-report-schema": NETWORK_DENIAL_REPORT_SCHEMA,
     "release-scope-schema": RELEASE_SCOPE_SCHEMA,
     "resource-gate-report-schema": RESOURCE_GATE_REPORT_SCHEMA,
@@ -1954,6 +1958,296 @@ _NETWORK_DENIAL_ATTEMPTS = (
     "native-tool", "proxy", "resolver", "socket", "subprocess",
 )
 
+_NETWORK_BOUNDARY_DNS_NAMES = frozenset({
+    "fixture.test", "redirect.fixture.test", "xn--bcher-kva.fixture.test",
+    "rebind.fixture.test", "mixed.fixture.test", "protected.fixture.test",
+})
+_NETWORK_BOUNDARY_HTTP_CONTACTS = frozenset({
+    ("fixture.test:8080", "/start"),
+    ("redirect.fixture.test:8080", "/final"),
+    ("xn--bcher-kva.fixture.test:8080", "/idna"),
+    ("10.203.0.1:8080", "/cidr"),
+    ("rebind.fixture.test:8080", "/rebind"),
+})
+
+
+def _network_boundary_environment(row: dict) -> dict:
+    return {key: row[key] for key in (
+        "architecture", "isolation_profile", "os", "python", "runner_image",
+    )}
+
+
+def _validate_network_boundary_summary(summary: object, *, proxy: bool) -> list[dict]:
+    name = "network boundary proxy" if proxy else "network boundary broker"
+    members = (
+        {"active_sockets", "active_threads", "complete", "dropped_records", "fatal",
+         "open_plans", "records", "request_id", "schema_version"}
+        if proxy else
+        {"active_operations", "complete", "dropped_records", "fatal", "listener_hup",
+         "open_plans", "profile", "records", "request_id", "retained_connections",
+         "schema_version"}
+    )
+    item = _object(summary, name, members)
+    expected_schema = (
+        "quarry.browser-proxy-summary.v1" if proxy
+        else "quarry.network-broker-summary.v1"
+    )
+    if item["schema_version"] != expected_schema:
+        raise evidence.EvidenceError(f"{name} schema is unsupported")
+    request_id = _string(item["request_id"], f"{name}.request_id")
+    if re.fullmatch(r"[0-9a-f]{32}", request_id) is None:
+        raise evidence.EvidenceError(f"{name} request identity is invalid")
+    dropped = _integer(item["dropped_records"], f"{name}.dropped_records")
+    open_plans = _integer(item["open_plans"], f"{name}.open_plans")
+    if (item["complete"] is not True or item["fatal"] is not None
+            or dropped != 0 or open_plans != 0):
+        raise evidence.EvidenceError(f"{name} did not settle completely")
+    if proxy:
+        active_sockets = _integer(item["active_sockets"], f"{name}.active_sockets")
+        active_threads = _integer(item["active_threads"], f"{name}.active_threads")
+        if active_sockets != 0 or active_threads != 0:
+            raise evidence.EvidenceError("network boundary proxy retained active work")
+        record_members = {
+            "decision", "host", "method", "peer", "port", "reason", "sequence", "stage",
+        }
+    else:
+        active_operations = _integer(
+            item["active_operations"], f"{name}.active_operations",
+        )
+        retained_connections = _integer(
+            item["retained_connections"], f"{name}.retained_connections",
+        )
+        if (item["profile"] != "standard" or item["listener_hup"] is not True
+                or active_operations != 0 or retained_connections != 0):
+            raise evidence.EvidenceError("network boundary broker retained authority or work")
+        record_members = {
+            "decision", "peer", "port", "protocol", "reason", "result", "sequence",
+            "socket_type", "stage", "syscall", "tid",
+        }
+    records = _array(item["records"], f"{name}.records")
+    maximum = 8192 if proxy else 1024
+    if not records or len(records) > maximum:
+        raise evidence.EvidenceError(f"{name} record count is outside its bound")
+    sequences = []
+    for index, record in enumerate(records):
+        observed = _object(record, f"{name}.records[{index}]", record_members)
+        sequence = _integer(observed["sequence"], f"{name}.records[{index}].sequence")
+        sequences.append(sequence)
+        if observed["decision"] not in {"allow", "deny"}:
+            raise evidence.EvidenceError(f"{name} record decision is invalid")
+        _string(observed["stage"], f"{name}.records[{index}].stage")
+        _string(observed["reason"], f"{name}.records[{index}].reason")
+        for field in (("method",) if proxy else ("syscall",)):
+            _string(observed[field], f"{name}.records[{index}].{field}")
+        for field in ("host", "peer") if proxy else ("peer", "result"):
+            if observed[field] is not None:
+                _string(observed[field], f"{name}.records[{index}].{field}")
+        if observed["port"] is not None:
+            if not 0 <= _integer(observed["port"], f"{name}.records[{index}].port") <= 65535:
+                raise evidence.EvidenceError(f"{name} record port is invalid")
+        if not proxy:
+            for field in ("protocol", "socket_type", "tid"):
+                _integer(observed[field], f"{name}.records[{index}].{field}")
+            if observed["tid"] < 1:
+                raise evidence.EvidenceError("network boundary broker record TID is invalid")
+    if sequences != sorted(sequences) or len(sequences) != len(set(sequences)):
+        raise evidence.EvidenceError(f"{name} records are not in unique sequence order")
+    return records
+
+
+def _validate_network_boundary_diagnostic(value: object) -> None:
+    diagnostic = _object(value, "network boundary diagnostic", {
+        "acceptance_errors", "broker", "dns_records", "http_records", "proxy",
+        "proxy_effects", "reaped", "refused", "schema_version", "tracee_results",
+    })
+    if diagnostic["schema_version"] != "quarry.network-boundary-h1.v1":
+        raise evidence.EvidenceError("network boundary diagnostic schema is unsupported")
+    if diagnostic["acceptance_errors"] != []:
+        raise evidence.EvidenceError("network boundary diagnostic contains acceptance errors")
+    if diagnostic["reaped"] != []:
+        raise evidence.EvidenceError("network boundary diagnostic retained adopted descendants")
+    expected_tracee = {
+        "approved": 0,
+        "direct_ip": errno.EPERM,
+        "scanner_self": errno.EPERM,
+        "metadata": errno.EPERM,
+        "control_plane": errno.EPERM,
+        "sendto_allowed": 1,
+        "sendto_metadata": errno.EPERM,
+        "sendmsg_allowed": 1,
+        "sendmsg_control": errno.EPERM,
+    }
+    tracee = _object(
+        diagnostic["tracee_results"], "network boundary tracee results",
+        set(expected_tracee),
+    )
+    for field in expected_tracee:
+        _integer(tracee[field], f"network boundary tracee results.{field}")
+    if tracee != expected_tracee:
+        raise evidence.EvidenceError("network boundary tracee effects do not match the fixed matrix")
+    expected_refused = {
+        "unicode_idna": True, "scope": True, "direct_ip": True,
+        "mixed": True, "protected": True, "rebind": True,
+    }
+    refused = _object(
+        diagnostic["refused"], "network boundary proxy refusal matrix",
+        set(expected_refused),
+    )
+    if any(refused[field] is not True for field in expected_refused):
+        raise evidence.EvidenceError("network boundary proxy refusal matrix is incomplete")
+    expected_effects = {
+        "start_status": 302,
+        "start_location": "http://redirect.fixture.test:8080/final",
+        "redirect_status": 200,
+        "idna_status": 404,
+        "cidr_status": 404,
+        "rebind_first_status": 404,
+    }
+    effects = _object(
+        diagnostic["proxy_effects"], "network boundary proxy effects",
+        set(expected_effects),
+    )
+    for field in (
+        "start_status", "redirect_status", "idna_status", "cidr_status",
+        "rebind_first_status",
+    ):
+        _integer(effects[field], f"network boundary proxy effects.{field}")
+    _string(effects["start_location"], "network boundary proxy effects.start_location")
+    if effects != expected_effects:
+        raise evidence.EvidenceError("network boundary proxy effects do not match the fixed matrix")
+
+    broker = _validate_network_boundary_summary(diagnostic["broker"], proxy=False)
+    proxy = _validate_network_boundary_summary(diagnostic["proxy"], proxy=True)
+    if diagnostic["broker"]["request_id"] != diagnostic["proxy"]["request_id"]:
+        raise evidence.EvidenceError("network boundary mediator summaries name different invocations")
+    direct = {
+        (record["peer"], record["decision"])
+        for record in broker if record["syscall"] == "connect"
+    }
+    if not {
+        ("10.203.0.1", "allow"), ("8.8.4.4", "deny"),
+        ("10.203.0.2", "deny"), ("169.254.169.254", "deny"),
+        ("10.203.0.99", "deny"),
+    } <= direct:
+        raise evidence.EvidenceError("network boundary direct-peer decisions are incomplete")
+    datagrams = {
+        (record["syscall"], record["peer"], record["decision"],
+         record["stage"], record["result"])
+        for record in broker if record["syscall"] in {"sendto", "sendmsg"}
+    }
+    if not {
+        ("sendto", "10.203.0.1", "allow", "settled", "1"),
+        ("sendto", "169.254.169.254", "deny", "settled", None),
+        ("sendmsg", "10.203.0.1", "allow", "settled", "1"),
+        ("sendmsg", "10.203.0.99", "deny", "settled", None),
+    } <= datagrams:
+        raise evidence.EvidenceError("network boundary datagram decisions are incomplete")
+    proxy_decisions = {
+        (record["host"], record["decision"]) for record in proxy
+    }
+    if not {
+        ("bücher.fixture.test", "deny"), ("oos.fixture.test", "deny"),
+        ("8.8.4.4", "deny"), ("mixed.fixture.test", "deny"),
+        ("protected.fixture.test", "deny"), ("rebind.fixture.test", "deny"),
+    } <= proxy_decisions:
+        raise evidence.EvidenceError("network boundary proxy decisions are incomplete")
+
+    dns_records = _array(diagnostic["dns_records"], "network boundary DNS records")
+    if not dns_records or len(dns_records) > 128:
+        raise evidence.EvidenceError("network boundary DNS record count is outside its bound")
+    names = set()
+    rebind_counts = []
+    for index, record in enumerate(dns_records):
+        item = _object(record, f"network boundary DNS record {index}", {"count", "dns", "kind"})
+        name = _string(item["dns"], f"network boundary DNS record {index}.dns")
+        kind = _integer(item["kind"], f"network boundary DNS record {index}.kind")
+        count = _integer(item["count"], f"network boundary DNS record {index}.count")
+        if kind not in {1, 28} or count < 1:
+            raise evidence.EvidenceError("network boundary DNS record is outside the fixed query matrix")
+        names.add(name)
+        if name == "rebind.fixture.test":
+            rebind_counts.append(count)
+    if names != _NETWORK_BOUNDARY_DNS_NAMES or not rebind_counts or max(rebind_counts) < 2:
+        raise evidence.EvidenceError("network boundary DNS effects are incomplete")
+
+    http_records = _array(diagnostic["http_records"], "network boundary HTTP records")
+    if not http_records or len(http_records) > 64:
+        raise evidence.EvidenceError("network boundary HTTP record count is outside its bound")
+    contacts = set()
+    for index, record in enumerate(http_records):
+        item = _object(record, f"network boundary HTTP record {index}", {"host", "path"})
+        contacts.add((
+            _string(item["host"], f"network boundary HTTP record {index}.host"),
+            _string(item["path"], f"network boundary HTTP record {index}.path"),
+        ))
+    if contacts != _NETWORK_BOUNDARY_HTTP_CONTACTS:
+        raise evidence.EvidenceError("network boundary HTTP contact set is not exact")
+
+
+def _validate_network_boundary_trace(body: bytes, *, identity: dict, support: dict) -> dict:
+    """Validate the candidate-bound H1 namespace and mediator witness."""
+    doc = _object(
+        _artifact_document(body, "C-NETWORK-BOUNDARY", "network-boundary-trace"),
+        "network boundary trace",
+        {"candidate_identity_digest", "gate_id", "instances", "release", "schema_version"},
+    )
+    if doc["schema_version"] != NETWORK_BOUNDARY_TRACE_SCHEMA or doc["release"] != RELEASE:
+        raise evidence.EvidenceError("network boundary trace schema or release is unsupported")
+    if doc["gate_id"] != "C-NETWORK-BOUNDARY":
+        raise evidence.EvidenceError("network boundary trace is bound to the wrong gate")
+    if doc["candidate_identity_digest"] != evidence.canonical_digest(identity):
+        raise evidence.EvidenceError("network boundary trace is bound to the wrong candidate")
+
+    supported = [
+        row for row in support["environments"] if row["lane"] == "H1-tool-integration"
+    ]
+    if not supported or len(supported) > 32:
+        raise evidence.EvidenceError("support matrix has no bounded H1 environment set")
+    for index, row in enumerate(supported):
+        for field in ("architecture", "os", "python"):
+            _token(row[field], f"support matrix H1 environment {index}.{field}")
+        for field in ("isolation_profile", "runner_image"):
+            _digest(row[field], f"support matrix H1 environment {index}.{field}")
+    expected = sorted(supported, key=lambda row: (row["runner_image"], row["python"]))
+    expected_keys = [(row["runner_image"], row["python"]) for row in expected]
+    if len(expected_keys) != len(set(expected_keys)):
+        raise evidence.EvidenceError("support matrix has ambiguous H1 identities")
+
+    instances = _array(doc["instances"], "network boundary trace.instances")
+    if not 1 <= len(instances) <= 32:
+        raise evidence.EvidenceError("network boundary trace instance count is outside its bound")
+    observed_keys = []
+    observed_environments = []
+    for index, record in enumerate(instances):
+        item = _object(record, f"network boundary trace.instances[{index}]", {
+            "diagnostic", "environment", "identity",
+        })
+        identity_record = _object(item["identity"], f"network boundary identity {index}", {
+            "lane", "python", "runner_image",
+        })
+        if identity_record["lane"] != "H1-tool-integration":
+            raise evidence.EvidenceError("network boundary trace has a non-H1 identity")
+        _token(identity_record["python"], f"network boundary identity {index}.python")
+        _digest(identity_record["runner_image"], f"network boundary identity {index}.runner_image")
+        observed_keys.append((identity_record["runner_image"], identity_record["python"]))
+        environment = _object(item["environment"], f"network boundary environment {index}", {
+            "architecture", "isolation_profile", "os", "python", "runner_image",
+        })
+        for field in ("architecture", "os", "python"):
+            _token(environment[field], f"network boundary environment {index}.{field}")
+        for field in ("isolation_profile", "runner_image"):
+            _digest(environment[field], f"network boundary environment {index}.{field}")
+        if (environment["python"], environment["runner_image"]) != \
+                (identity_record["python"], identity_record["runner_image"]):
+            raise evidence.EvidenceError("network boundary identity disagrees with its environment")
+        observed_environments.append(environment)
+        _validate_network_boundary_diagnostic(item["diagnostic"])
+    if observed_keys != expected_keys or observed_environments != [
+            _network_boundary_environment(row) for row in expected
+    ]:
+        raise evidence.EvidenceError("network boundary trace does not cover exact supported H1 images")
+    return doc
+
 
 def _validate_network_denial_report(body: bytes, *, identity: dict, support: dict) -> dict:
     """Validate the one complete, image-bound C-NET-DENY denial matrix."""
@@ -2933,6 +3227,15 @@ def _semantic_network_denial(
     )
 
 
+def _semantic_network_boundary(
+    _gate: dict, bodies: Mapping[str, bytes], **context: object,
+) -> None:
+    _validate_network_boundary_trace(
+        bodies["network-boundary-trace"],
+        identity=context["identity"], support=context["support"],
+    )
+
+
 def _semantic_sbom(
     _gate: dict, bodies: Mapping[str, bytes], **context: object,
 ) -> None:
@@ -2983,6 +3286,7 @@ PROVISIONAL_SEMANTIC_VERIFIERS = MappingProxyType({
 # are promoted.  In particular C-PERF-PHASE-FAIRNESS stays fail-closed until a
 # typed per-obligation roster can be reconciled with C-POLICY-TRACE.
 SEMANTIC_VERIFIERS = MappingProxyType({
+    "C-NETWORK-BOUNDARY": _semantic_network_boundary,
     "C-NET-DENY": _semantic_network_denial,
     "C-FAULT-DISK": _semantic_resource_fault,
     "C-FAULT-RESOLVER": _semantic_resource_fault,
