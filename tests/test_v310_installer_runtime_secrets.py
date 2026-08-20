@@ -720,6 +720,26 @@ def test_runtime_environment_is_allowlisted_and_record_contains_names_not_values
         prepared.close()
 
 
+def test_managed_launch_uses_private_home_and_xdg_state(tmp_path, monkeypatch):
+    executable = _executable(tmp_path / "adapter", "OK")
+    ambient = tmp_path / "ambient"
+    monkeypatch.setenv("HOME", str(ambient / "home"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(ambient / "config"))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(ambient / "cache"))
+    monkeypatch.setenv("XDG_DATA_HOME", str(ambient / "data"))
+
+    prepared = runtime_identity.prepare_launch("fixture", [str(executable)])
+    try:
+        for name, child in (("HOME", "home"), ("XDG_CONFIG_HOME", "xdg-config"),
+                            ("XDG_CACHE_HOME", "xdg-cache"), ("XDG_DATA_HOME", "xdg-data")):
+            value = Path(prepared.environment[name])
+            assert value == prepared.anchor_root / child
+            assert value.is_dir() and value != Path(os.environ[name])
+        runtime_identity.revalidate_launch(prepared)
+    finally:
+        prepared.close()
+
+
 def test_dynamic_adapter_config_is_reconciled_as_a_file_not_misparsed_as_a_tree(tmp_path):
     executable = _executable(tmp_path / "adapter", "OK")
     config = tmp_path / "provider-config.yaml"

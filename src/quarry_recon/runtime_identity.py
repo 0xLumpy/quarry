@@ -913,6 +913,11 @@ def _launch_anchors(identities: list[dict], payloads=(), input_specs=(), *,
             (xdg_root / "cache").mkdir(mode=0o700)
             (xdg_root / "home").mkdir(mode=0o500)
             os.chmod(xdg_root, 0o500)
+        # Every managed child gets disposable user/config state.  Create these before sealing the
+        # launch root so tools cannot consult or mutate the operator's HOME/XDG trees.  Nuclei's
+        # detached config mapping above remains authoritative and is selected below.
+        for relative in ("home", "xdg-config", "xdg-cache", "xdg-data"):
+            (root / relative).mkdir(mode=0o700)
         directory_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
             os.fsync(directory_fd)
@@ -1452,6 +1457,12 @@ def prepare_launch(tool_name: str, argv: list[str], *, caller_env: "dict | None"
         )
 
         environment = _minimal_environment(tool, list(anchors.values()), caller_env)
+        environment.update({
+            "HOME": str(anchor_root / "home"),
+            "XDG_CONFIG_HOME": str(anchor_root / "xdg-config"),
+            "XDG_CACHE_HOME": str(anchor_root / "xdg-cache"),
+            "XDG_DATA_HOME": str(anchor_root / "xdg-data"),
+        })
         environment.update(entry_environment)
         for name, key in environment_inputs.items():
             environment[name] = str(input_paths[key])
