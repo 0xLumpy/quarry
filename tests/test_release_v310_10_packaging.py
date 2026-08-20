@@ -89,13 +89,12 @@ def test_installed_candidate_comes_from_the_wheel_and_exposes_the_cli():
     package = importlib.resources.files("quarry_recon")
     assert package.joinpath("data/target.template.yaml").is_file()
     assert package.joinpath("data/tools.yaml").is_file()
-    if os.environ.get("QUARRY_EXPECT_WHEEL_INSTALL") == "1":
-        installed = {
-            pathlib.PurePosixPath(str(path)).as_posix()
-            for path in distribution.files or ()
-        }
-        assert "quarry_recon/data/target.template.yaml" in installed
-        assert "quarry_recon/data/tools.yaml" in installed
+    raw_prefix = os.environ.get("QUARRY_PACKAGE_INSTALL_PREFIX", "")
+    if raw_prefix:
+        prefix = pathlib.Path(raw_prefix).resolve(strict=True)
+        assert prefix.is_dir()
+        assert (prefix / "bin" / "python").is_file()
+        assert (prefix / "bin" / "quarry").is_file()
 
 
 def test_dependency_audit_emits_a_vulnerability_free_cyclonedx_document():

@@ -145,6 +145,7 @@ def _synthetic_wheel() -> bytes:
         f"{dist}/licenses/LICENSE": b"Synthetic MIT license fixture\n",
         "quarry_recon/__init__.py": b"__version__ = '0.3.10'\n",
         "quarry_recon/data/default.yaml": b"fixture: true\n",
+        "quarry_recon/data/target.template.yaml": b"fixture: target\n",
         "quarry_recon/data/release-scope-v1.schema.json": b"{}\n",
     }
     record_name = f"{dist}/RECORD"
@@ -563,6 +564,73 @@ def _supporting_bodies(
             "release": "0.3.10",
             "schema_version": contracts.PACKAGE_INVENTORY_SCHEMA,
             "subjects": subjects,
+        })
+    elif gate_id == "C-PACKAGE-INSTALL":
+        wheel = next(
+            row for row in indexed
+            if row["gate_id"] == "C-PACKAGE-BUILD" and row["name"] == "wheel"
+        )
+        prefix = "/tmp/quarry-p0-install-prefix"
+        checkout = "/tmp/quarry-p0-checkout"
+        cwd = "/tmp/quarry-p0-invocation"
+        dist = f"{prefix}/lib/python3.12/site-packages/quarry_recon-0.3.10.dist-info"
+        installed = {
+            f"{prefix}/bin/quarry": b"#!/synthetic/p0/python\n",
+        }
+        with zipfile.ZipFile(io.BytesIO(_synthetic_wheel())) as archive:
+            for member in archive.namelist():
+                installed[f"{prefix}/lib/python3.12/site-packages/{member}"] = archive.read(member)
+        installed.update({
+            f"{dist}/INSTALLER": b"pip\n",
+            f"{dist}/REQUESTED": b"",
+            f"{dist}/direct_url.json": b'{"archive_info":{},"url":"file:///synthetic.whl"}\n',
+        })
+        files = [{
+            "digest": contracts.raw_sha256(body), "path": path, "size": len(body),
+        } for path, body in sorted(installed.items())]
+        common = {
+            "candidate_identity_digest": evidence.canonical_digest(identity),
+            "checkout_root": checkout,
+            "environment": environment,
+            "evidence_instance_id": evidence_instance_id,
+            "finished_at": "2026-08-14T10:20:01Z",
+            "gate_id": gate_id,
+            "install_prefix": prefix,
+            "invocation_cwd": cwd,
+            "package": {"name": "quarry-recon", "version": "0.3.10"},
+            "release": "0.3.10",
+            "source_wheel": {"digest": wheel["digest"], "size": wheel["size"]},
+            "started_at": "2026-08-14T10:20:00Z",
+        }
+        bodies["install-inventory"] = contracts.canonical_json_line({
+            **common,
+            "artifact_type": "package-install-inventory",
+            "files": files,
+            "schema_version": contracts.PACKAGE_INSTALL_INVENTORY_SCHEMA,
+        })
+        smoke_paths = [
+            f"{prefix}/lib/python3.12/site-packages/quarry_recon/__init__.py",
+            f"{prefix}/lib/python3.12/site-packages/quarry_recon/data/target.template.yaml",
+            f"{prefix}/bin/quarry",
+            f"{prefix}/lib/python3.12/site-packages/quarry_recon/__init__.py",
+        ]
+        bodies["smoke-results"] = contracts.canonical_json_line({
+            **common,
+            "artifact_type": "package-install-smoke-results",
+            "cases": [{
+                "details": {
+                    "path": path,
+                    "version": "0.3.10",
+                    **({"checkout_on_sys_path": False}
+                       if case_id == "checkout-isolation" else {}),
+                },
+                "exit_code": 0,
+                "id": case_id,
+                "output_bytes": 0,
+                "output_digest": _digest(format(index, "x")),
+            } for index, (case_id, path) in enumerate(zip(contracts._INSTALL_CASE_ROSTER, smoke_paths))],
+            "install_inventory_digest": contracts.raw_sha256(bodies["install-inventory"]),
+            "schema_version": contracts.PACKAGE_INSTALL_SMOKE_SCHEMA,
         })
     elif gate_id == "C-NETWORK-BOUNDARY":
         bodies["network-boundary-trace"] = _network_boundary_body(identity, support)
@@ -1525,10 +1593,12 @@ class TestCommittedContracts:
         )
         variant_names = [reference["$ref"].rsplit("/", 1)[-1] for reference in schema["oneOf"]]
         assert variant_names == [
-            "machine_report", "clean_build_log", "package_inventory", "benchmark_baseline",
-            "benchmark_trials", "benchmark_invalidations", "benchmark_report", "sbom",
-            "provenance", "publication_subjects", "synthetic_corpus_disclosure_attestation",
-            "aggregator_conformance_report", "h0_test_report", "h0_isolation_self_test",
+            "machine_report", "clean_build_log", "package_inventory",
+            "package_install_inventory", "package_install_smoke_results",
+            "benchmark_baseline", "benchmark_trials", "benchmark_invalidations",
+            "benchmark_report", "sbom", "provenance", "publication_subjects",
+            "synthetic_corpus_disclosure_attestation", "aggregator_conformance_report",
+            "h0_test_report", "h0_isolation_self_test",
         ]
         discriminators = []
         for name in variant_names:
@@ -1547,6 +1617,13 @@ class TestCommittedContracts:
         assert clean_build_log["properties"]["exit_code"] == {"const": 0}
         assert schema["$defs"]["build_output"]["maxLength"] == 87_391
         assert schema["$defs"]["build_output"]["minLength"] == 11
+        install_files = schema["$defs"]["package_install_inventory"]["properties"]["files"]
+        assert install_files["minItems"] == 1 and install_files["maxItems"] == 2_000
+        install_cases = schema["$defs"]["package_install_smoke_results"]["properties"]["cases"]
+        assert install_cases["minItems"] == install_cases["maxItems"] == 4
+        assert schema["$defs"]["install_checkout_isolation_details"]["properties"][
+            "checkout_on_sys_path"
+        ] == {"const": False}
         h0_runs = schema["$defs"]["h0_test_report"]["properties"]["runs"]
         assert h0_runs["minItems"] == h0_runs["maxItems"] == 2
         h0_fragments = schema["$defs"]["h0_run"]["properties"]["fragments"]
@@ -1749,7 +1826,8 @@ class TestIncompleteSemanticRegistry:
             | {
                 "A-IDENTITY", "A-EVIDENCE-SCHEMA", "A-TAXONOMY", "A-CORPUS", "A-THRESHOLDS", "A-SUPPORT",
                 "B-HERMETIC-ALL",
-                "C-NETWORK-BOUNDARY", "C-NET-DENY", *contracts.V310_05_SEMANTIC_GATES,
+                "C-PACKAGE-BUILD", "C-PACKAGE-INSTALL", "C-NETWORK-BOUNDARY", "C-NET-DENY",
+                *contracts.V310_05_SEMANTIC_GATES,
             }
         )
         assert "C-PERF-PHASE-FAIRNESS" not in contracts.SEMANTIC_VERIFIERS
@@ -1873,6 +1951,7 @@ class TestH0HermeticSemanticEvidence:
         with pytest.raises(evidence.EvidenceError, match="logical H0 collection counts"):
             contracts._semantic_h0_hermetic_all(gate, bodies, **context)
 
+
     def test_rebound_wrong_partition_and_runner_topology_fail_closed(self, tmp_path):
         gate, bodies, context = self._case(tmp_path)
         report = json.loads(bodies["test-report"])
@@ -1912,6 +1991,80 @@ class TestH0HermeticSemanticEvidence:
         bodies["isolation-self-test"] = contracts.canonical_json_line(isolation)
         with pytest.raises(evidence.EvidenceError, match=match):
             contracts._semantic_h0_hermetic_all(gate, bodies, **context)
+
+
+class TestPackageInstallSemanticEvidence:
+    @staticmethod
+    def _case(tmp_path):
+        arguments = _scenario(tmp_path)
+        gate = _gate(arguments, "C-PACKAGE-INSTALL")
+        bodies = {
+            row["name"]: (arguments["artifact_root"] / row["path"]).read_bytes()
+            for row in arguments["artifact_index"]["artifacts"]
+            if row["gate_id"] == "C-PACKAGE-INSTALL" and row["name"] != "gate-evidence"
+        }
+        report_index = next(
+            row for row in arguments["artifact_index"]["artifacts"]
+            if row["gate_id"] == "C-PACKAGE-INSTALL" and row["name"] == "gate-evidence"
+        )
+        report = contracts.read_evidence_report(
+            (arguments["artifact_root"] / report_index["path"]).read_bytes(),
+            identity=arguments["identity"], gate_id="C-PACKAGE-INSTALL",
+        )
+        return arguments, gate, bodies, report
+
+    @staticmethod
+    def _verify(arguments, gate, bodies, report):
+        with contracts.ArtifactResolver(
+            arguments["artifact_root"], arguments["artifact_index"], identity=arguments["identity"],
+        ) as resolver:
+            contracts._semantic_package_install(
+                gate, bodies, identity=arguments["identity"], report=report, resolver=resolver,
+            )
+
+    def test_exact_signed_p0_install_fixture_is_accepted(self, tmp_path):
+        arguments, gate, bodies, report = self._case(tmp_path)
+        self._verify(arguments, gate, bodies, report)
+
+    @pytest.mark.parametrize(
+        ("artifact", "mutate", "match"),
+        [
+            ("install-inventory", lambda doc: doc["source_wheel"].update(digest=_digest("9")),
+             "source wheel does not match"),
+            ("install-inventory", lambda doc: doc.update(files=[
+                row for row in doc["files"] if not row["path"].endswith("quarry_recon/__init__.py")
+            ]), "file set does not reconcile"),
+            ("install-inventory", lambda doc: doc.update(invocation_cwd=doc["install_prefix"] + "/work"),
+             "outside checkout/prefix"),
+            ("install-inventory", lambda doc: (
+                doc["files"].append({
+                    "digest": _digest("0"), "path": doc["install_prefix"] + "/injected.py", "size": 1,
+                }),
+                doc["files"].sort(key=lambda row: row["path"]),
+            ), "file set does not reconcile"),
+            ("smoke-results", lambda doc: doc["cases"].reverse(), "exact ordered roster"),
+            ("smoke-results", lambda doc: doc["cases"][-1]["details"].update(checkout_on_sys_path=True),
+             "checkout absence from sys.path"),
+            ("smoke-results", lambda doc: doc["cases"][0]["details"].update(
+                path=doc["install_prefix"] + "/lib/python3.12/site-packages/invented.py"),
+             "exact installed module, resource or CLI path"),
+            ("smoke-results", lambda doc: doc.update(install_inventory_digest=_digest("8")),
+             "exact inventory, wheel and P0 execution context"),
+        ],
+    )
+    def test_install_inventory_and_smoke_adversarial_fixtures_fail_closed(
+        self, tmp_path, artifact, mutate, match,
+    ):
+        arguments, gate, bodies, report = self._case(tmp_path)
+        document = json.loads(bodies[artifact])
+        mutate(document)
+        bodies[artifact] = contracts.canonical_json_line(document)
+        for instance in report["instances"]:
+            for record in instance["artifacts"]:
+                if record["name"] == artifact:
+                    record["digest"] = contracts.raw_sha256(bodies[artifact])
+        with pytest.raises(evidence.EvidenceError, match=match):
+            self._verify(arguments, gate, bodies, report)
 
 
 class TestArtifactsAndAggregation:

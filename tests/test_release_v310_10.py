@@ -99,6 +99,14 @@ def test_pull_request_ci_selects_every_public_nonlive_lane_separately():
         "${{ runner.temp }}/quarry-build-a.log",
         "${{ runner.temp }}/quarry-build-b.log",
     ]
+    install_smoke = next(
+        step for step in package_steps
+        if step.get("name") == "Install and smoke the candidate wheel in a disposable prefix"
+    )
+    assert 'wheels=("$RUNNER_TEMP"/quarry-build-a/dist/*.whl)' in install_smoke["run"]
+    assert 'zipfile.ZipFile(os.environ["WHEEL"])' in install_smoke["run"]
+    assert 'importlib.metadata' not in install_smoke["run"]
+    assert '"$wheel"' in install_smoke["run"]
 
 
 def test_offline_and_authorized_live_diagnostics_are_separate():

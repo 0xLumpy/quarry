@@ -43,6 +43,8 @@ CONFORMANCE_MANIFEST_SCHEMA = "quarry.aggregator-conformance-manifest.v1"
 GATE_ARTIFACT_SCHEMA = "quarry.gate-artifact.v1"
 SUPPORTING_ARTIFACT_SCHEMA = GATE_ARTIFACT_SCHEMA
 PACKAGE_INVENTORY_SCHEMA = GATE_ARTIFACT_SCHEMA
+PACKAGE_INSTALL_INVENTORY_SCHEMA = GATE_ARTIFACT_SCHEMA
+PACKAGE_INSTALL_SMOKE_SCHEMA = GATE_ARTIFACT_SCHEMA
 BENCHMARK_TRIALS_SCHEMA = GATE_ARTIFACT_SCHEMA
 BENCHMARK_INVALIDATIONS_SCHEMA = GATE_ARTIFACT_SCHEMA
 BENCHMARK_BASELINE_SCHEMA = GATE_ARTIFACT_SCHEMA
@@ -446,6 +448,12 @@ _GATE_ID_RE = evidence._GATE_ID_RE
 _MEDIA_TYPE_RE = evidence._MEDIA_TYPE_RE
 _DOCUMENT_BYTES = evidence.MAX_RECORD_BYTES
 _BUILD_LOG_OUTPUT_BYTES = 65_536
+_INSTALL_OUTPUT_BYTES = 65_536
+_INSTALL_FILE_COUNT = 2_000
+_INSTALL_FILE_BYTES = 64 * 1024 * 1024
+_INSTALL_CASE_ROSTER = (
+    "import", "packaged-data", "absolute-installed-cli", "checkout-isolation",
+)
 _CLEAN_BUILD_COMMAND = (
     "python", "-m", "build", "--sdist", "--wheel", "--outdir", "dist",
 )
@@ -522,6 +530,25 @@ def _path(value: object, name: str) -> str:
     if pure.is_absolute() or text != pure.as_posix() or any(part in {"", ".", ".."} for part in pure.parts):
         raise evidence.EvidenceError(f"{name} must be a normalized relative POSIX path")
     return text
+
+
+def _absolute_posix_path(value: object, name: str) -> str:
+    """Accept a lexical, canonical POSIX absolute path without touching disk."""
+    text = _string(value, name)
+    if "\\" in text or PureWindowsPath(text).is_absolute():
+        raise evidence.EvidenceError(f"{name} must be a canonical absolute POSIX path")
+    pure = PurePosixPath(text)
+    if (not pure.is_absolute() or text != pure.as_posix() or len(pure.parts) < 2 or
+            any(part in {"", ".", ".."} for part in pure.parts)):
+        raise evidence.EvidenceError(f"{name} must be a canonical absolute POSIX path")
+    return text
+
+
+def _is_within_path(path: str, parent: str) -> bool:
+    """Return lexical strict ancestry; validation deliberately never reads paths."""
+    path_parts = PurePosixPath(path).parts
+    parent_parts = PurePosixPath(parent).parts
+    return len(path_parts) > len(parent_parts) and path_parts[:len(parent_parts)] == parent_parts
 
 
 def _unique(records: Sequence[dict], key: str, name: str, *, ordered: bool = True) -> None:
@@ -2719,6 +2746,252 @@ def _validate_package_artifacts(bodies: Mapping[str, bytes], *, identity: dict) 
         raise evidence.EvidenceError("clean build log does not reconcile the sdist and wheel bytes")
 
 
+def _package_install_owner(
+    report: dict, *, artifact_name: str, digest: str, gate: dict,
+) -> dict:
+    """Resolve one install artifact to its sole signed P0 collector fact."""
+    owners = [
+        instance for instance in report["instances"]
+        if {"digest": digest, "name": artifact_name} in instance["artifacts"]
+    ]
+    if len(owners) != 1:
+        raise evidence.EvidenceError(
+            "package install artifact is not referenced by one exact signed gate evidence instance"
+        )
+    owner = owners[0]
+    if owner["lane"] != "P0-package-supply" or owner["environment"] != gate["environment"]:
+        raise evidence.EvidenceError(
+            "package install artifact is attributed to the wrong signed P0 environment"
+        )
+    return owner
+
+
+def _package_install_interval(
+    doc: dict, *, owner: dict, gate: dict, name: str,
+) -> None:
+    started = _timestamp(doc["started_at"], f"{name}.started_at")
+    finished = _timestamp(doc["finished_at"], f"{name}.finished_at")
+    if not (
+        _timestamp(gate["started_at"], "package install gate.started_at")
+        <= started <= finished
+        <= _timestamp(gate["finished_at"], "package install gate.finished_at")
+    ):
+        raise evidence.EvidenceError("package install artifact lies outside its signed gate interval")
+    if not (
+        _timestamp(owner["started_at"], "package install owner.started_at")
+        <= started <= finished
+        <= _timestamp(owner["finished_at"], "package install owner.finished_at")
+    ):
+        raise evidence.EvidenceError(
+            "package install artifact lies outside its signed evidence instance interval"
+        )
+
+
+def _package_install_common(
+    doc: dict, *, identity: dict, owner: dict, name: str,
+) -> tuple[str, str, str]:
+    if (doc["candidate_identity_digest"] != evidence.canonical_digest(identity) or
+            doc["gate_id"] != "C-PACKAGE-INSTALL" or doc["release"] != RELEASE or
+            doc["package"] != {"name": "quarry-recon", "version": RELEASE}):
+        raise evidence.EvidenceError(f"{name} is bound to the wrong candidate, gate, release or package")
+    if doc["evidence_instance_id"] != owner["id"] or doc["environment"] != owner["environment"]:
+        raise evidence.EvidenceError(
+            f"{name} does not bind its exact signed P0 evidence instance/environment"
+        )
+    checkout = _absolute_posix_path(doc["checkout_root"], f"{name}.checkout_root")
+    prefix = _absolute_posix_path(doc["install_prefix"], f"{name}.install_prefix")
+    cwd = _absolute_posix_path(doc["invocation_cwd"], f"{name}.invocation_cwd")
+    if (_is_within_path(prefix, checkout) or _is_within_path(checkout, prefix) or
+            _is_within_path(cwd, checkout) or _is_within_path(cwd, prefix) or
+            cwd == checkout or cwd == prefix or checkout == prefix):
+        raise evidence.EvidenceError(
+            f"{name} does not use a disposable install prefix and invocation cwd outside checkout/prefix"
+        )
+    return checkout, prefix, cwd
+
+
+def _validate_package_install_artifacts(
+    gate: dict, bodies: Mapping[str, bytes], *, identity: dict, report: dict,
+    resolver: ArtifactResolver,
+) -> None:
+    """Reconcile retained P0 install facts without probing the collector filesystem.
+
+    Install paths are treated solely as signed collector facts.  Aggregation uses
+    lexical path checks and the pinned artifact resolver; it never follows or
+    stats a collector path.  The external trusted P0 collector and signing step
+    remain required before a real release can be nominated.
+    """
+    wheel_record = resolver.record("C-PACKAGE-BUILD", "wheel")
+    wheel = resolver.read("C-PACKAGE-BUILD", "wheel")
+    if wheel_record["digest"] != raw_sha256(wheel) or wheel_record["size"] != len(wheel):
+        raise evidence.EvidenceError("retained C-PACKAGE-BUILD wheel bytes do not match their index")
+
+    inventory_body = bodies["install-inventory"]
+    inventory_digest = raw_sha256(inventory_body)
+    inventory = _object(
+        _artifact_document(inventory_body, "C-PACKAGE-INSTALL", "install-inventory"),
+        "package install inventory",
+        {
+            "artifact_type", "candidate_identity_digest", "checkout_root", "environment",
+            "evidence_instance_id", "files", "gate_id", "install_prefix", "invocation_cwd",
+            "package", "release", "schema_version", "source_wheel", "started_at",
+            "finished_at",
+        },
+    )
+    if (inventory["artifact_type"] != "package-install-inventory" or
+            inventory["schema_version"] != PACKAGE_INSTALL_INVENTORY_SCHEMA):
+        raise evidence.EvidenceError("package install inventory uses the wrong dedicated schema variant")
+    inventory_owner = _package_install_owner(
+        report, artifact_name="install-inventory", digest=inventory_digest, gate=gate,
+    )
+    checkout, prefix, cwd = _package_install_common(
+        inventory, identity=identity, owner=inventory_owner, name="package install inventory",
+    )
+    _package_install_interval(
+        inventory, owner=inventory_owner, gate=gate, name="package install inventory",
+    )
+    wheel_subject = _object(inventory["source_wheel"], "package install inventory.source_wheel", {
+        "digest", "size",
+    })
+    if wheel_subject != {"digest": wheel_record["digest"], "size": wheel_record["size"]}:
+        raise evidence.EvidenceError(
+            "package install inventory source wheel does not match retained C-PACKAGE-BUILD wheel bytes"
+        )
+    files = _array(inventory["files"], "package install inventory.files")
+    if not 1 <= len(files) <= _INSTALL_FILE_COUNT:
+        raise evidence.EvidenceError("package install inventory file count exceeds its bounded contract")
+    file_by_path: dict[str, dict] = {}
+    total_size = 0
+    for index, file in enumerate(files):
+        item = _object(file, f"package install inventory.files[{index}]", {"digest", "path", "size"})
+        path = _absolute_posix_path(item["path"], f"package install inventory.files[{index}].path")
+        _digest(item["digest"], f"package install inventory.files[{index}].digest")
+        size = _integer(item["size"], f"package install inventory.files[{index}].size")
+        if not _is_within_path(path, prefix):
+            raise evidence.EvidenceError("package install inventory file is outside the install prefix")
+        file_by_path[path] = {"digest": item["digest"], "size": size}
+        total_size += size
+    if [file["path"] for file in files] != sorted(file_by_path) or len(file_by_path) != len(files):
+        raise evidence.EvidenceError("package install inventory files must be sorted and unique by absolute path")
+    if total_size > _INSTALL_FILE_BYTES:
+        raise evidence.EvidenceError("package install inventory retained bytes exceed the bounded contract")
+    record_suffix = f"/quarry_recon-{RELEASE}.dist-info/RECORD"
+    record_paths = [path for path in file_by_path if path.endswith(record_suffix)]
+    if len(record_paths) != 1:
+        raise evidence.EvidenceError("package install inventory must retain one exact installed package RECORD")
+    record_path = record_paths[0]
+    site_root = record_path[:-len(record_suffix)]
+    if not _is_within_path(site_root, prefix):
+        raise evidence.EvidenceError("package install inventory site-packages root is outside the install prefix")
+    _validate_wheel(wheel)
+    try:
+        with zipfile.ZipFile(io.BytesIO(wheel)) as archive:
+            source_files = {}
+            for info in archive.infolist():
+                if info.is_dir():
+                    raise evidence.EvidenceError("source wheel contains a directory member")
+                member = _path(info.filename, "source wheel member")
+                if member in source_files:
+                    raise evidence.EvidenceError("source wheel contains duplicate file members")
+                if member == record_suffix[1:]:
+                    continue
+                body = archive.read(info)
+                source_files[member] = {"digest": raw_sha256(body), "size": len(body)}
+    except (OSError, zipfile.BadZipFile) as exc:
+        raise evidence.EvidenceError(f"source wheel cannot be reopened for install reconciliation: {exc}") from exc
+    expected_files = {
+        f"{site_root}/{member}": fact for member, fact in source_files.items()
+    }
+    allowed_generated = {
+        record_path,
+        f"{prefix}/bin/quarry",
+        f"{site_root}/quarry_recon-{RELEASE}.dist-info/INSTALLER",
+        f"{site_root}/quarry_recon-{RELEASE}.dist-info/REQUESTED",
+        f"{site_root}/quarry_recon-{RELEASE}.dist-info/direct_url.json",
+    }
+    if set(file_by_path) != set(expected_files) | allowed_generated:
+        raise evidence.EvidenceError(
+            "package install inventory file set does not reconcile retained wheel and exact pip outputs"
+        )
+    for path, fact in expected_files.items():
+        if file_by_path[path] != fact:
+            raise evidence.EvidenceError(
+                "package install inventory source-wheel file does not match retained wheel bytes"
+            )
+    smoke_body = bodies["smoke-results"]
+    smoke = _object(
+        _artifact_document(smoke_body, "C-PACKAGE-INSTALL", "smoke-results"),
+        "package install smoke results",
+        {
+            "artifact_type", "candidate_identity_digest", "cases", "checkout_root", "environment",
+            "evidence_instance_id", "finished_at", "gate_id", "install_inventory_digest",
+            "install_prefix", "invocation_cwd", "package", "release", "schema_version",
+            "source_wheel", "started_at",
+        },
+    )
+    if (smoke["artifact_type"] != "package-install-smoke-results" or
+            smoke["schema_version"] != PACKAGE_INSTALL_SMOKE_SCHEMA):
+        raise evidence.EvidenceError("package install smoke results use the wrong dedicated schema variant")
+    smoke_owner = _package_install_owner(
+        report, artifact_name="smoke-results", digest=raw_sha256(smoke_body), gate=gate,
+    )
+    smoke_checkout, smoke_prefix, smoke_cwd = _package_install_common(
+        smoke, identity=identity, owner=smoke_owner, name="package install smoke results",
+    )
+    _package_install_interval(
+        smoke, owner=smoke_owner, gate=gate, name="package install smoke results",
+    )
+    if (smoke_owner["id"] != inventory_owner["id"] or
+            (smoke_checkout, smoke_prefix, smoke_cwd) != (checkout, prefix, cwd) or
+            smoke["source_wheel"] != wheel_subject or
+            smoke["install_inventory_digest"] != inventory_digest):
+        raise evidence.EvidenceError(
+            "package install smoke results do not bind the exact inventory, wheel and P0 execution context"
+        )
+    cases = _array(smoke["cases"], "package install smoke results.cases")
+    if [case.get("id") if type(case) is dict else None for case in cases] != list(_INSTALL_CASE_ROSTER):
+        raise evidence.EvidenceError("package install smoke cases do not use the exact ordered roster")
+    for index, case in enumerate(cases):
+        item = _object(case, f"package install smoke results.cases[{index}]", {
+            "details", "exit_code", "id", "output_bytes", "output_digest",
+        })
+        if item["exit_code"] != 0 or type(item["exit_code"]) is not int:
+            raise evidence.EvidenceError("package install smoke case does not record a zero exit")
+        _digest(item["output_digest"], "package install smoke case output digest")
+        if _integer(item["output_bytes"], "package install smoke case output bytes") > _INSTALL_OUTPUT_BYTES:
+            raise evidence.EvidenceError("package install smoke case output exceeds the bounded contract")
+        expected_detail_members = (
+            {"checkout_on_sys_path", "path", "version"}
+            if item["id"] == "checkout-isolation" else {"path", "version"}
+        )
+        details = _object(
+            item["details"], "package install smoke case details", expected_detail_members,
+        )
+        path = _absolute_posix_path(details["path"], "package install smoke case detail path")
+        expected_path = {
+            "import": f"{site_root}/quarry_recon/__init__.py",
+            "packaged-data": f"{site_root}/quarry_recon/data/target.template.yaml",
+            "absolute-installed-cli": f"{prefix}/bin/quarry",
+            "checkout-isolation": f"{site_root}/quarry_recon/__init__.py",
+        }[item["id"]]
+        if path != expected_path:
+            raise evidence.EvidenceError(
+                "package install smoke case does not bind its exact installed module, resource or CLI path"
+            )
+        if not _is_within_path(path, prefix):
+            raise evidence.EvidenceError("package install smoke module/resource/CLI path is outside the install prefix")
+        if path not in file_by_path:
+            raise evidence.EvidenceError(
+                "package install smoke module/resource/CLI path is absent from the retained installed-file inventory"
+            )
+        if details["version"] != RELEASE:
+            raise evidence.EvidenceError("package install smoke case identifies the wrong package version")
+        if item["id"] == "checkout-isolation" and details["checkout_on_sys_path"] is not False:
+            raise evidence.EvidenceError(
+                "package install checkout-isolation case does not prove checkout absence from sys.path"
+            )
+
+
 def _statistic(values: Sequence[int], kind: str) -> int:
     ordered = sorted(values)
     if not ordered:
@@ -3151,6 +3424,18 @@ def _semantic_package_build(
     _validate_package_artifacts(bodies, identity=context["identity"])
 
 
+def _semantic_package_install(
+    gate: dict, bodies: Mapping[str, bytes], **context: object,
+) -> None:
+    _validate_package_install_artifacts(
+        gate,
+        bodies,
+        identity=context["identity"],
+        report=context["report"],
+        resolver=context["resolver"],
+    )
+
+
 def _semantic_benchmark(
     gate: dict, bodies: Mapping[str, bytes], **context: object,
 ) -> None:
@@ -3466,10 +3751,9 @@ def _semantic_publication_subjects(
 
 
 # These provisional parsers exercise the artifact-family substrate, but none is
-# sufficient to close its whole normative obligation yet (for example package
-# installability and transitive dependency closure belong to later owners).
+# sufficient to close its whole normative obligation yet (for example transitive
+# dependency closure belongs to later owners).
 PROVISIONAL_SEMANTIC_VERIFIERS = MappingProxyType({
-    "C-PACKAGE-BUILD": _semantic_package_build,
     "C-SBOM": _semantic_sbom,
     "C-PROVENANCE": _semantic_provenance,
     **{gate_id: _semantic_benchmark for gate_id in PERFORMANCE_OPERATIONS},
@@ -4063,8 +4347,10 @@ SEMANTIC_VERIFIERS = MappingProxyType({
     "A-THRESHOLDS": _semantic_thresholds,
     "A-SUPPORT": _semantic_support,
     "B-HERMETIC-ALL": _semantic_h0_hermetic_all,
+    "C-PACKAGE-BUILD": _semantic_package_build,
     "C-NETWORK-BOUNDARY": _semantic_network_boundary,
     "C-NET-DENY": _semantic_network_denial,
+    "C-PACKAGE-INSTALL": _semantic_package_install,
     "C-FAULT-DISK": _semantic_resource_fault,
     "C-FAULT-RESOLVER": _semantic_resource_fault,
     "C-PERF-INGEST": _semantic_resource_benchmark,

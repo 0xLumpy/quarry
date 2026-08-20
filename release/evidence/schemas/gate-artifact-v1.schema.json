@@ -6,6 +6,8 @@
     {"$ref": "#/$defs/machine_report"},
     {"$ref": "#/$defs/clean_build_log"},
     {"$ref": "#/$defs/package_inventory"},
+    {"$ref": "#/$defs/package_install_inventory"},
+    {"$ref": "#/$defs/package_install_smoke_results"},
     {"$ref": "#/$defs/benchmark_baseline"},
     {"$ref": "#/$defs/benchmark_trials"},
     {"$ref": "#/$defs/benchmark_invalidations"},
@@ -25,22 +27,30 @@
     "benchmark_digest": {"$ref": "#/$defs/digest"},
     "builder": {"$ref": "#/$defs/builder"},
     "candidate_identity_digest": {"$ref": "#/$defs/digest"},
+    "checkout_root": {"$ref": "#/$defs/absolute_path"},
     "clean_tree": {"type": "boolean"},
     "combined_output": {"$ref": "#/$defs/build_output"},
     "command": {"items": {"$ref": "#/$defs/text"}, "type": "array"},
-    "cases": {"items": {"$ref": "#/$defs/conformance_case"}, "type": "array"},
+    "cases": {"type": "array"},
     "components": {"items": {"$ref": "#/$defs/component"}, "type": "array"},
     "collection_manifest_digest": {"$ref": "#/$defs/digest"},
     "checks": {"$ref": "#/$defs/disclosure_checks"},
     "corpus_gate_id": {"const": "C-CORPUS-SYNTHETIC"},
     "derivation_tree_digests": {"items": {"$ref": "#/$defs/digest"}, "maxItems": 2, "minItems": 2, "type": "array"},
     "dependency_graph_digest": {"$ref": "#/$defs/digest"},
+    "environment": {"$ref": "#/$defs/environment"},
+    "evidence_instance_id": {"$ref": "#/$defs/token"},
     "exit_code": {"type": "integer"},
+    "files": {"items": {"$ref": "#/$defs/install_file"}, "type": "array"},
+    "finished_at": {"$ref": "#/$defs/text"},
     "fixture_digest": {"$ref": "#/$defs/digest"},
     "fixture_schema_digest": {"$ref": "#/$defs/digest"},
     "gate_id": {"$ref": "#/$defs/gate"},
     "gate_evidence_counts": {"$ref": "#/$defs/conformance_counts"},
     "invalidations": {"items": {"$ref": "#/$defs/invalidation"}, "type": "array"},
+    "install_inventory_digest": {"$ref": "#/$defs/digest"},
+    "install_prefix": {"$ref": "#/$defs/absolute_path"},
+    "invocation_cwd": {"$ref": "#/$defs/absolute_path"},
     "instances": {"items": {"type": "object"}, "type": "array"},
     "materials": {"items": {"$ref": "#/$defs/named_digest"}, "type": "array"},
     "measurements": {"items": {"$ref": "#/$defs/measurement"}, "type": "array"},
@@ -55,6 +65,8 @@
     "runs": {"items": {"$ref": "#/$defs/h0_run"}, "type": "array"},
     "schema_version": {"const": "quarry.gate-artifact.v1"},
     "subjects": {"items": {"type": "object"}, "type": "array"},
+    "source_wheel": {"$ref": "#/$defs/package_install_wheel"},
+    "started_at": {"$ref": "#/$defs/text"},
     "synthetic_value_inventory_digest": {"$ref": "#/$defs/digest"},
     "trial_invalidations_digest": {"$ref": "#/$defs/digest"},
     "test_nodeid": {"type": "string"},
@@ -243,6 +255,55 @@
       "required": ["name", "version"],
       "type": "object"
     },
+    "install_file": {
+      "additionalProperties": false,
+      "properties": {"digest": {"$ref": "#/$defs/digest"}, "path": {"$ref": "#/$defs/absolute_path"}, "size": {"$ref": "#/$defs/count"}},
+      "required": ["digest", "path", "size"],
+      "type": "object"
+    },
+    "install_smoke_case": {
+      "additionalProperties": false,
+      "properties": {"details": {"$ref": "#/$defs/install_smoke_details"}, "exit_code": {"const": 0}, "id": {"enum": ["import", "packaged-data", "absolute-installed-cli", "checkout-isolation"]}, "output_bytes": {"maximum": 65536, "minimum": 0, "type": "integer"}, "output_digest": {"$ref": "#/$defs/digest"}},
+      "required": ["details", "exit_code", "id", "output_bytes", "output_digest"],
+      "type": "object"
+    },
+    "install_smoke_details": {
+      "additionalProperties": false,
+      "properties": {"path": {"$ref": "#/$defs/absolute_path"}, "version": {"const": "0.3.10"}},
+      "required": ["path", "version"],
+      "type": "object"
+    },
+    "install_checkout_isolation_details": {
+      "additionalProperties": false,
+      "properties": {"checkout_on_sys_path": {"const": false}, "path": {"$ref": "#/$defs/absolute_path"}, "version": {"const": "0.3.10"}},
+      "required": ["checkout_on_sys_path", "path", "version"],
+      "type": "object"
+    },
+    "install_checkout_smoke_case": {
+      "additionalProperties": false,
+      "properties": {"details": {"$ref": "#/$defs/install_checkout_isolation_details"}, "exit_code": {"const": 0}, "id": {"const": "checkout-isolation"}, "output_bytes": {"maximum": 65536, "minimum": 0, "type": "integer"}, "output_digest": {"$ref": "#/$defs/digest"}},
+      "required": ["details", "exit_code", "id", "output_bytes", "output_digest"],
+      "type": "object"
+    },
+    "package_install_inventory": {
+      "additionalProperties": false,
+      "properties": {"artifact_type": {"const": "package-install-inventory"}, "candidate_identity_digest": {"$ref": "#/$defs/digest"}, "checkout_root": {"$ref": "#/$defs/absolute_path"}, "environment": {"$ref": "#/$defs/environment"}, "evidence_instance_id": {"$ref": "#/$defs/token"}, "files": {"items": {"$ref": "#/$defs/install_file"}, "maxItems": 2000, "minItems": 1, "type": "array", "uniqueItems": true}, "finished_at": {"$ref": "#/$defs/text"}, "gate_id": {"const": "C-PACKAGE-INSTALL"}, "install_prefix": {"$ref": "#/$defs/absolute_path"}, "invocation_cwd": {"$ref": "#/$defs/absolute_path"}, "package": {"$ref": "#/$defs/package"}, "release": {"const": "0.3.10"}, "schema_version": {"const": "quarry.gate-artifact.v1"}, "source_wheel": {"$ref": "#/$defs/package_install_wheel"}, "started_at": {"$ref": "#/$defs/text"}},
+      "required": ["artifact_type", "candidate_identity_digest", "checkout_root", "environment", "evidence_instance_id", "files", "finished_at", "gate_id", "install_prefix", "invocation_cwd", "package", "release", "schema_version", "source_wheel", "started_at"],
+      "type": "object"
+    },
+    "package_install_smoke_results": {
+      "additionalProperties": false,
+      "properties": {"artifact_type": {"const": "package-install-smoke-results"}, "candidate_identity_digest": {"$ref": "#/$defs/digest"}, "cases": {"items": false, "maxItems": 4, "minItems": 4, "prefixItems": [{"allOf": [{"$ref": "#/$defs/install_smoke_case"}, {"properties": {"id": {"const": "import"}}, "required": ["id"]}]}, {"allOf": [{"$ref": "#/$defs/install_smoke_case"}, {"properties": {"id": {"const": "packaged-data"}}, "required": ["id"]}]}, {"allOf": [{"$ref": "#/$defs/install_smoke_case"}, {"properties": {"id": {"const": "absolute-installed-cli"}}, "required": ["id"]}]}, {"$ref": "#/$defs/install_checkout_smoke_case"}], "type": "array"}, "checkout_root": {"$ref": "#/$defs/absolute_path"}, "environment": {"$ref": "#/$defs/environment"}, "evidence_instance_id": {"$ref": "#/$defs/token"}, "finished_at": {"$ref": "#/$defs/text"}, "gate_id": {"const": "C-PACKAGE-INSTALL"}, "install_inventory_digest": {"$ref": "#/$defs/digest"}, "install_prefix": {"$ref": "#/$defs/absolute_path"}, "invocation_cwd": {"$ref": "#/$defs/absolute_path"}, "package": {"$ref": "#/$defs/package"}, "release": {"const": "0.3.10"}, "schema_version": {"const": "quarry.gate-artifact.v1"}, "source_wheel": {"$ref": "#/$defs/package_install_wheel"}, "started_at": {"$ref": "#/$defs/text"}},
+      "required": ["artifact_type", "candidate_identity_digest", "cases", "checkout_root", "environment", "evidence_instance_id", "finished_at", "gate_id", "install_inventory_digest", "install_prefix", "invocation_cwd", "package", "release", "schema_version", "source_wheel", "started_at"],
+      "type": "object"
+    },
+    "package_install_wheel": {
+      "additionalProperties": false,
+      "properties": {"digest": {"$ref": "#/$defs/digest"}, "size": {"$ref": "#/$defs/count"}},
+      "required": ["digest", "size"],
+      "type": "object"
+    },
+    "absolute_path": {"pattern": "^/(?!.*(?:/\\.|/\\.\\.)(?:/|$))(?!.*\\\\)(?:[^\\u0000-\\u001f/]+/)*[^\\u0000-\\u001f/]+$", "type": "string"},
     "package_inventory": {
       "additionalProperties": false,
       "properties": {"artifact_type": {"const": "package-inventory"}, "candidate_identity_digest": {"$ref": "#/$defs/digest"}, "gate_id": {"const": "C-PACKAGE-BUILD"}, "package": {"$ref": "#/$defs/package"}, "release": {"const": "0.3.10"}, "schema_version": {"const": "quarry.gate-artifact.v1"}, "subjects": {"items": {"$ref": "#/$defs/package_subject"}, "maxItems": 2, "minItems": 2, "type": "array", "uniqueItems": true}},
