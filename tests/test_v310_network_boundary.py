@@ -157,16 +157,15 @@ def _filter_action(profile: str, syscall: int, args=()) -> int:
         instruction += 1
 
 
-@pytest.mark.parametrize("profile", ("standard", "browser"))
 @pytest.mark.parametrize("syscall,args,handler", (
     ("sendto", (0, 0, 0, 0, 1, 16), "_handle_sendto"),
     ("sendmsg", (0, 1, 0), "_handle_sendmsg"),
 ))
 def test_addressed_send_filters_route_to_the_implemented_broker_handler(
-        profile, syscall, args, handler):
+        syscall, args, handler):
     architecture = network_broker._ARCHITECTURES["x86_64"]
     assert network_broker.complete_backend() is True
-    assert _filter_action(profile, getattr(architecture, syscall), args) == (
+    assert _filter_action("standard", getattr(architecture, syscall), args) == (
         network_broker._SECCOMP_RET_USER_NOTIF
     )
     session = object.__new__(network_broker.NetworkBrokerSession)
@@ -178,9 +177,146 @@ def test_addressed_send_filters_route_to_the_implemented_broker_handler(
     notification.data.nr = getattr(architecture, syscall)
     session._handle(notification)
     assert routed == [handler]
-    assert _filter_action(profile, architecture.sendmmsg) == (
+    assert _filter_action("standard", architecture.sendmmsg) == (
         network_broker._SECCOMP_RET_ERRNO | errno.EPERM
     )
+
+
+def test_browser_native_sendmsg_is_closed_by_connection_oriented_socket_invariant():
+    architecture = network_broker._ARCHITECTURES["x86_64"]
+    allow = network_broker._SECCOMP_RET_ALLOW
+    refuse = network_broker._SECCOMP_RET_ERRNO | errno.EPERM
+    notify = network_broker._SECCOMP_RET_USER_NOTIF
+
+    assert _filter_action("browser", architecture.sendmsg, (0, 1, 0)) == allow
+    for flags in (
+        network_broker._MSG_FASTOPEN,
+        network_broker._MSG_ZEROCOPY,
+        0x80000000,
+        1 << 32,
+    ):
+        assert _filter_action(
+            "browser", architecture.sendmsg, (0, 1, flags),
+        ) == refuse
+    # Addressed sendto remains mediated; sendmmsg cannot bypass either gate.
+    assert _filter_action(
+        "browser", architecture.sendto, (0, 1, 0, 0, 1, 16),
+    ) == notify
+    assert _filter_action("browser", architecture.sendmmsg) == refuse
+
+    # The native sendmsg rule is safe only while every browser-created socket
+    # that can carry a message is connection-oriented.
+    for domain in (socket.AF_INET, socket.AF_INET6):
+        assert _filter_action(
+            "browser", architecture.socket,
+            (domain, socket.SOCK_DGRAM, socket.IPPROTO_UDP),
+        ) == refuse
+    assert _filter_action(
+        "browser", architecture.socket,
+        (socket.AF_UNIX, socket.SOCK_DGRAM, 0),
+    ) == refuse
+    assert _filter_action(
+        "browser", architecture.socketpair,
+        (socket.AF_UNIX, socket.SOCK_DGRAM, 0),
+    ) == refuse
+    assert _filter_action(
+        "browser", architecture.socket,
+        (socket.AF_NETLINK, socket.SOCK_RAW, 0),
+    ) == refuse
+    for domain in (
+        socket.AF_INET, socket.AF_INET6,
+        getattr(socket, "AF_PACKET", 17),
+    ):
+        assert _filter_action(
+            "browser", architecture.socket,
+            (domain, socket.SOCK_RAW, 0),
+        ) == refuse
+    for syscall in (
+        architecture.pidfd_getfd, architecture.bpf,
+        architecture.userfaultfd, architecture.sendmmsg,
+    ):
+        assert _filter_action("browser", syscall) == refuse
+    for syscall in (
+        architecture.connect, architecture.accept, architecture.accept4,
+    ):
+        assert _filter_action("browser", syscall) == notify
+
+
+def test_addressed_stream_sendmsg_cannot_change_connected_peer(tmp_path):
+    client, accepted = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    addressed = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        addressed.bind(str(tmp_path / "alternate.sock"))
+        addressed.listen()
+        with pytest.raises(OSError) as caught:
+            client.sendmsg(
+                [b"x"], [], getattr(socket, "MSG_NOSIGNAL", 0),
+                addressed.getsockname(),
+            )
+        assert caught.value.errno in {errno.EISCONN, errno.EINVAL}
+        addressed.setblocking(False)
+        with pytest.raises(BlockingIOError):
+            addressed.accept()
+    finally:
+        accepted.close()
+        client.close()
+        addressed.close()
+
+
+@pytest.mark.parametrize("kind", (socket.SOCK_STREAM, socket.SOCK_SEQPACKET))
+def test_unconnected_browser_sendmsg_cannot_use_msg_name_as_a_connect(
+        tmp_path, kind):
+    listener = socket.socket(socket.AF_UNIX, kind)
+    sender = socket.socket(socket.AF_UNIX, kind)
+    try:
+        listener.bind(str(tmp_path / "listener.sock"))
+        listener.listen()
+        with pytest.raises(OSError) as caught:
+            sender.sendmsg(
+                [b"x"], [], getattr(socket, "MSG_NOSIGNAL", 0),
+                listener.getsockname(),
+            )
+        assert caught.value.errno in {
+            errno.EPIPE, errno.ENOTCONN, errno.EOPNOTSUPP,
+        }
+        listener.setblocking(False)
+        with pytest.raises(BlockingIOError):
+            listener.accept()
+    finally:
+        sender.close()
+        listener.close()
+
+
+def test_duplicate_ofd_sendmsg_changes_unix_passcred_sender_identity():
+    sender, receiver = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    receiver.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
+    expected_tracee_pid = os.getpid()
+    child = os.fork()
+    if child == 0:  # pragma: no cover - assertions run in the parent.
+        receiver.close()
+        try:
+            sender.sendmsg([b"broker-replay"])
+        finally:
+            sender.close()
+        os._exit(0)
+    sender.close()
+    try:
+        body, control, _flags, _address = receiver.recvmsg(
+            64, socket.CMSG_SPACE(struct.calcsize("=3i")),
+        )
+        assert body == b"broker-replay"
+        credentials = [
+            struct.unpack("=3i", data)
+            for level, kind, data in control
+            if level == socket.SOL_SOCKET and kind == socket.SCM_CREDENTIALS
+        ]
+        assert len(credentials) == 1
+        assert credentials[0][0] == child
+        assert credentials[0][0] != expected_tracee_pid
+    finally:
+        receiver.close()
+        waited, status = os.waitpid(child, 0)
+    assert waited == child and os.waitstatus_to_exitcode(status) == 0
 
 
 def test_transport_registry_is_exactly_source_keyed_and_complete():

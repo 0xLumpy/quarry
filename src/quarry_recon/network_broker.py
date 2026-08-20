@@ -729,11 +729,27 @@ def _filter_program(architecture: _Architecture, *, profile: str = "standard"):
     if browser:
         jump(_BPF_JMP_JEQ_K, architecture.sendmsg, "sendmsg_flags", "sendto_gate")
         label("sendmsg_flags")
+        # sendmsg(2) takes an int, but retain the broker's exact scalar
+        # rejection of non-canonical high register bits before going native.
+        statement(_BPF_LD_W_ABS, 36)
+        jump(_BPF_JMP_JEQ_K, 0, "sendmsg_flags_low", "deny")
+        label("sendmsg_flags_low")
         statement(_BPF_LD_W_ABS, 32)
-        # A sendmsg() destination is behind the tracee-owned msghdr pointer,
-        # so cBPF cannot distinguish connected from addressed sends.  Preserve
-        # the scalar fast-open refusal and mediate every remaining shape.
-        jump(_BPF_JMP_JSET_K, _MSG_FASTOPEN, "deny", "notify")
+        # Browser-profile socket creation admits only connection-oriented
+        # INET streams and AF_UNIX streams/seqpackets.  Their peer is fixed by
+        # mediated connect/accept (or the attested inherited descriptor set):
+        # msg_name cannot retarget them, and an unconnected stream cannot send.
+        # Execute on the tracee's OFD so Unix peer credentials and SCM_RIGHTS
+        # retain their real sender identity.  Browser Unix peers are confined
+        # descendants under this same inherited filter; named/abstract outside
+        # peers and inherited transports are refused.  SCM_RIGHTS therefore
+        # only redistributes that confined descriptor set.  The standard
+        # profile, which can create datagrams, still mediates every sendmsg.
+        jump(
+            _BPF_JMP_JSET_K,
+            _MSG_FASTOPEN | _MSG_ZEROCOPY | 0x80000000,
+            "deny", "allow",
+        )
 
         # Chromium's sandbox and Mojo IPC use destination-less sendto() at high
         # volume.  The only IP stream peers a browser-profile process can
