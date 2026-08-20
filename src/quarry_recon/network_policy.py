@@ -145,7 +145,12 @@ _register(("dns.dnsx_records", "enrich.dnsx_cname", "enrich.dnsx_resolve",
 _register(("vertical.puredns_brute", "vertical.puredns_resolve",
            "enrich.a1d_brute"), "external-dns", "target", "target-dns",
           argv0=("puredns",), descendants=("massdns",))
-_register(("horizontal.tlsx_san", "probe.tlsx_certs"), "external-tls", "target",
+# ``horizontal.tlsx_san`` receives literal IPs expanded from the engagement
+# profile CIDRs.  The certificate probe receives hostnames and must carry the
+# exact, caller-supplied answers for those hosts instead.
+_register(("horizontal.tlsx_san",), "external-tls", "target",
+          "target-cidr-tls", argv0=("tlsx",), required_argv=("-duc",))
+_register(("probe.tlsx_certs",), "external-tls", "target",
           "target-tls", argv0=("tlsx",), required_argv=("-duc",))
 _register(("probe.naabu_web", "probe.naabu_infra"), "external-ip", "target",
           "target-connect-scan", argv0=("naabu",),
@@ -733,7 +738,7 @@ class NetworkPolicyScope:
             raise NetworkPolicyError("network policy trace has no repository authority")
         try:
             self._repository._append_base_artifact(
-                ("network-policy.jsonl",), _canonical_bytes(document),
+                ("raw", "network", "policy.jsonl"), _canonical_bytes(document),
             )
         except BaseException as exc:
             raise NetworkPolicyError("network policy trace could not be persisted") from exc
@@ -985,7 +990,7 @@ class NetworkPolicyScope:
 
     def prepare_invocation(self, *, request_id: str, source_id: str, tool: str,
                            argv, environment, timeout=None, runtime_identity=None,
-                           private_unix_roots=(), approved_peers=None) -> NetworkInvocation:
+                           private_unix_roots=(), approved_peers=()) -> NetworkInvocation:
         del timeout
         door = transport_door(source_id, argv=argv)
         if door is None or not door.broker_required:
@@ -1002,9 +1007,15 @@ class NetworkPolicyScope:
         for value in argv:
             if value.split("=", 1)[0] in _proxy_flags:
                 raise NetworkPolicyError("tool proxy flags are forbidden")
-        if approved_peers is None:
+        semantics = broker_transport_semantics(source_id, Path(tool).name)
+        if semantics["peer_mode"] == "approved":
+            if not approved_peers:
+                raise NetworkPolicyError(
+                    "approved transport lacks an exact peer set",
+                )
+        elif approved_peers:
             raise NetworkPolicyError(
-                "network invocation lacks a pre-resolved approved peer set",
+                "transport profile does not consume caller-approved peers",
             )
         invocation = NetworkInvocation(
             self, request_id=request_id, source_id=source_id,
@@ -1021,6 +1032,7 @@ class NetworkPolicyScope:
             "decision": "allow",
             "reason": "seccomp broker authority required before target exec",
             "authority": {"backend": "seccomp-user-notification-v1"},
+            "policy": invocation.policy,
         })
         return invocation
 

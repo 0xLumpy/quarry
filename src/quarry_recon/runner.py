@@ -1596,6 +1596,7 @@ def _run_with_repository(
     ok_codes,
     env,
     max_output_bytes,
+    approved_peers,
 ) -> RunResult:
     """Normalize once, then delegate all execution publication authority."""
     from . import network_policy, runner_native, runner_protocol, runner_repository, store
@@ -1723,7 +1724,7 @@ def _run_with_repository(
                 argv=safe_cmd,
                 environment=prepared.environment,
                 runtime_identity=prepared.record,
-                approved_peers=(),
+                approved_peers=approved_peers,
             )
         identity_ref = (
             runtime_identity.publish_launch_identity(repository, request_id, prepared.record)
@@ -1988,6 +1989,7 @@ def run(
     env: dict | None = None,
     stderr_path: Path | None = None,
     max_output_bytes: int | None = None,
+    approved_peers=(),
 ) -> RunResult:
     """Execute with explicit repository ownership and output dispositions.
 
@@ -2038,6 +2040,7 @@ def run(
             ok_codes=ok_codes,
             env=env,
             max_output_bytes=max_output_bytes,
+            approved_peers=approved_peers,
         )
 
     return _legacy_run(

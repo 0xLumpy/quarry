@@ -54,6 +54,28 @@ _JWT_RX = _re.compile(r"eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+"
 _SHODAN_PAGE = 100                              # Shodan host/search returns up to 100 matches/page
 
 
+def _tlsx_approved_peers(resolved_rows, thosts) -> tuple[str, ...]:
+    """Canonical A/AAAA peers for precisely the submitted TLS hostname set."""
+    hosts = set(thosts)
+    peers = []
+    resolved_hosts = set()
+    for row in resolved_rows:
+        if type(row) is not dict or row.get("host") not in hosts:
+            continue
+        row_answers = []
+        for field in ("a", "aaaa"):
+            answers = row.get(field) or ()
+            if type(answers) not in (list, tuple):
+                raise ValueError(f"resolved {field.upper()} answers are not finite")
+            row_answers.extend(answers)
+        if row_answers:
+            resolved_hosts.add(row["host"])
+            peers.extend(row_answers)
+    if resolved_hosts != hosts:
+        raise ValueError("TLS target set lacks exact resolved peers")
+    return netguard.canonical_ip_set(peers)
+
+
 def _gowitness_records(ctx, shot_dir: Path | None = None) -> list[dict]:
     """Return screenshot rows joined to Gowitness' exact target/result evidence.
 
@@ -2552,36 +2574,48 @@ def run(ctx) -> None:
         thosts = sorted(h for h in set(ctx.run.values("resolved"))
                         if h and scope.in_scope(h) and not scope.is_oos(h))
         if thosts:
-            tf = ctx.write_list("tls_targets.txt", thosts)
-            tr = ctx.run.raw_path("probe", "tlsx", "certs.jsonl")
-            # C10b resume: work_unit = the resolved-host set + probed ports. A changed host set is a new unit.
-            tls_wu = events.work_unit("probe.tlsx_certs", inputs={"hosts": thosts},
-                                      config={"ports": "443,8443,4443"})
-            r = run_contract("probe.tlsx_certs", ["tlsx", "-duc", "-l", str(tf), "-p", "443,8443,4443",
-                                   "-json", "-silent"],
-                             repository=ctx.run,
-                             stdout=RepositoryOutput.publish(*tr.relative_to(ctx.run.dir).parts),
-                             stderr=RepositoryOutput.discard(),
-                             work_unit=tls_wu, timeout=ctx.http_timeout)
-            ctx.run.record("probe", r)
-            san_new = 0
-            if r.raw_path and r.raw_path.exists():
-                for c in normalize.tlsx_certs(r.raw_path.read_text(), "tlsx", str(tr)):
-                    all_san = c.get("san") or []
-                    # scope-safe normalized entity: keep only in-scope SANs (shared/CDN/vendor certs
-                    # carry unrelated names). Full SAN list stays in raw via raw_ref. Context counts.
-                    in_scope_san = [s for s in all_san if scope.in_scope(s) and not scope.is_oos(s)]
-                    c["san"] = in_scope_san
-                    c["san_count"] = len(all_san)
-                    c["oos_san_count"] = len(all_san) - len(in_scope_san)
-                    c["has_oos_sans"] = c["oos_san_count"] > 0
-                    ctx.run.add("certificate", c)
-                    for s in in_scope_san:                     # in-scope SANs → new hosts (coverage)
-                        if not s.startswith("*.") and ctx.run.add(
-                                "subdomain", {"host": s, "sources": ["tlsx-san"]}):
-                            san_new += 1
-            if san_new:
-                ctx.echo(f"  tlsx: +{san_new} sibling host(s) from cert SANs")
+            try:
+                approved_peers = _tlsx_approved_peers(
+                    ctx.run.read("resolved"), thosts,
+                )
+            except (TypeError, ValueError):
+                approved_peers = ()
+            if not approved_peers:
+                ctx.run.record("probe", skipped(
+                    "tlsx", "no valid exact resolved peers for TLS targets",
+                ))
+            else:
+                tf = ctx.write_list("tls_targets.txt", thosts)
+                tr = ctx.run.raw_path("probe", "tlsx", "certs.jsonl")
+                # C10b resume: work_unit = the resolved-host set + probed ports. A changed host set is a new unit.
+                tls_wu = events.work_unit("probe.tlsx_certs", inputs={"hosts": thosts},
+                                          config={"ports": "443,8443,4443"})
+                r = run_contract("probe.tlsx_certs", ["tlsx", "-duc", "-l", str(tf), "-p", "443,8443,4443",
+                                       "-json", "-silent"],
+                                 repository=ctx.run,
+                                 stdout=RepositoryOutput.publish(*tr.relative_to(ctx.run.dir).parts),
+                                 stderr=RepositoryOutput.discard(),
+                                 work_unit=tls_wu, timeout=ctx.http_timeout,
+                                 approved_peers=approved_peers)
+                ctx.run.record("probe", r)
+                san_new = 0
+                if r.raw_path and r.raw_path.exists():
+                    for c in normalize.tlsx_certs(r.raw_path.read_text(), "tlsx", str(tr)):
+                        all_san = c.get("san") or []
+                        # scope-safe normalized entity: keep only in-scope SANs (shared/CDN/vendor certs
+                        # carry unrelated names). Full SAN list stays in raw via raw_ref. Context counts.
+                        in_scope_san = [s for s in all_san if scope.in_scope(s) and not scope.is_oos(s)]
+                        c["san"] = in_scope_san
+                        c["san_count"] = len(all_san)
+                        c["oos_san_count"] = len(all_san) - len(in_scope_san)
+                        c["has_oos_sans"] = c["oos_san_count"] > 0
+                        ctx.run.add("certificate", c)
+                        for s in in_scope_san:                 # in-scope SANs → new hosts (coverage)
+                            if not s.startswith("*.") and ctx.run.add(
+                                    "subdomain", {"host": s, "sources": ["tlsx-san"]}):
+                                san_new += 1
+                if san_new:
+                    ctx.echo(f"  tlsx: +{san_new} sibling host(s) from cert SANs")
 
     # ── Shodan pivots (key-gated, silent): same favicon + same TLS cert fingerprint → related hosts ──
     _shodan_pivots(ctx)          # all Shodan lanes, one collection, one credit budget

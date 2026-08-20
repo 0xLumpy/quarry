@@ -2182,6 +2182,14 @@ class BrokerPolicy:
                 mediated: bool) -> tuple[str, str]:
         from . import netguard
 
+        # A small, source-derived set of tracees owns DNS transport directly.
+        # Delegate its complete destination check to the DNS authority before
+        # the ordinary peer path: explicit ambient resolvers can legitimately
+        # be loopback/private, and decide_dns owns those exact exceptions.
+        if not mediated and port == 53:
+            if (self.authority_class == "public-provider"
+                    or self.transport_profile in {"target-dns", "target-tls"}):
+                return self.decide_dns(peer, port, kind, protocol)
         try:
             current_own = netguard.own_ips()
         except (OSError, ValueError) as exc:
@@ -2221,7 +2229,7 @@ class BrokerPolicy:
                 return "allow", "declared operator endpoint peer admitted"
             return "deny", "authority class has no mediated peer permission"
         if port == 53:
-            return "deny", "DNS transport is reserved to the validating mediator"
+            return "deny", "DNS transport is outside this tracee profile"
         if (self.authority_class == "public-provider"
                 and (base_kind != socket.SOCK_STREAM
                      or protocol not in {0, socket.IPPROTO_TCP})):

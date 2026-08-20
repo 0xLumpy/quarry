@@ -320,6 +320,86 @@ def test_serialized_broker_semantics_are_source_derived_and_dns_is_mediator_only
     )[0] == "allow"
 
 
+def test_target_tls_peer_authority_is_source_profile_scoped():
+    scope = _native_scope()
+    probe = scope.broker_policy(
+        request_id="e" * 32, source_id="probe.tlsx_certs", tool="tlsx",
+        approved_peers=("8.8.8.8", "2001:4860:4860::8888"),
+    )
+    assert (probe["transport_profile"], probe["peer_mode"]) == (
+        "target-tls", "approved",
+    )
+    horizontal = scope.broker_policy(
+        request_id="f" * 32, source_id="horizontal.tlsx_san", tool="tlsx",
+    )
+    assert (horizontal["transport_profile"], horizontal["peer_mode"]) == (
+        "target-cidr-tls", "effective-cidr",
+    )
+    cidr_claim = scope.broker_policy(
+        request_id="0" * 32, source_id="horizontal.tlsx_san", tool="tlsx",
+        approved_peers=("8.8.8.8",),
+    )
+    offline_claim = scope.broker_policy(
+        request_id="1" * 32, source_id="vertical.openintel", tool="openintel-subs",
+        approved_peers=("8.8.8.8",),
+    )
+    for document in (cidr_claim, offline_claim):
+        parsed = BrokerPolicy.from_json(json.dumps(
+            document, ensure_ascii=True, sort_keys=True, separators=(",", ":"),
+        ))
+        assert parsed.decide(
+            "8.8.8.8", 443, socket.SOCK_STREAM, socket.IPPROTO_TCP,
+        )[0] == "deny"
+    with pytest.raises(network_policy.NetworkPolicyError, match="not canonical"):
+        scope.broker_policy(
+            request_id="2" * 32, source_id="probe.tlsx_certs", tool="tlsx",
+            approved_peers=("2001:4860:4860::8888", "8.8.8.8"),
+        )
+
+
+def test_invocation_peer_sets_are_required_and_consumed_only_by_approved_profiles(
+        tmp_path):
+    scope = _native_scope()
+    run = store.Run.create(tmp_path, "example.test")
+    scope.bind(run)
+    common = {
+        "argv": ["tlsx", "-duc"],
+        "environment": {},
+        "tool": "tlsx",
+    }
+    with pytest.raises(
+            network_policy.NetworkPolicyError,
+            match="lacks an exact peer set"):
+        scope.prepare_invocation(
+            request_id="3" * 32,
+            source_id="probe.tlsx_certs",
+            **common,
+        )
+    with pytest.raises(
+            network_policy.NetworkPolicyError,
+            match="does not consume"):
+        scope.prepare_invocation(
+            request_id="4" * 32,
+            source_id="horizontal.tlsx_san",
+            approved_peers=("8.8.8.8",),
+            **common,
+        )
+    invocation = scope.prepare_invocation(
+        request_id="5" * 32,
+        source_id="probe.tlsx_certs",
+        approved_peers=("8.8.8.8",),
+        **common,
+    )
+    assert invocation.policy["approved_peers"] == ["8.8.8.8"]
+    trace = [
+        json.loads(line)
+        for line in (run.dir / "raw" / "network" / "policy.jsonl")
+        .read_text().splitlines()
+    ]
+    assert trace[-1]["record_type"] == "planned"
+    assert trace[-1]["policy"] == invocation.policy
+
+
 @pytest.mark.parametrize("field,value", [
     ("authority_class", "public-provider"),
     ("transport_profile", "public-provider"),
@@ -338,7 +418,7 @@ def test_serialized_broker_semantics_cannot_be_rewritten_by_the_child(field, val
         ))
 
 
-def test_public_provider_direct_policy_is_global_tcp_only_and_never_dns(
+def test_public_provider_direct_policy_is_global_tcp_only_except_exact_dns(
         monkeypatch):
     document = _native_scope().broker_policy(
         request_id="d" * 32, source_id="horizontal.asnmap", tool="asnmap",
@@ -358,7 +438,108 @@ def test_public_provider_direct_policy_is_global_tcp_only_and_never_dns(
         "8.8.8.8", 443, socket.SOCK_DGRAM, socket.IPPROTO_UDP,
     )[0] == "deny"
     assert parsed.decide(
-        "1.1.1.1", 53, socket.SOCK_STREAM, socket.IPPROTO_TCP,
+        "1.1.1.1", 53, socket.SOCK_DGRAM, socket.IPPROTO_UDP,
+    )[0] == "allow"
+    assert parsed.decide(
+        "8.8.8.8", 53, socket.SOCK_DGRAM, socket.IPPROTO_UDP,
+    )[0] == "deny"
+
+
+@pytest.mark.parametrize("source_id,tool,resolver", [
+    ("dns.dnsx_records", "dnsx", "127.0.0.53"),
+    ("probe.tlsx_certs", "tlsx", "10.203.0.53"),
+    ("horizontal.asnmap", "asnmap", "127.0.0.53"),
+])
+def test_eligible_tracee_profiles_delegate_exact_ambient_dns_authority(
+        monkeypatch, source_id, tool, resolver):
+    monkeypatch.setattr(network_policy, "_resolver_snapshot", lambda: (resolver,))
+    scope = network_policy.NetworkPolicyScope(
+        block_private_targets=False,
+        apex_domains=("example.test",), own_ips=("10.203.0.2",),
+    )
+    parsed = BrokerPolicy.from_json(json.dumps(
+        scope.broker_policy(
+            request_id="d" * 32, source_id=source_id, tool=tool,
+        ),
+        ensure_ascii=True, sort_keys=True, separators=(",", ":"),
+    ))
+    monkeypatch.setattr(
+        netguard, "interface_snapshot",
+        lambda: _interface_snapshot(("10.203.0.2",), ("255.255.255.255",)),
+    )
+    assert parsed.decide(
+        resolver, 53, socket.SOCK_DGRAM, socket.IPPROTO_UDP,
+    )[0] == "allow"
+
+
+def test_tracee_dns_delegation_retains_exact_resolver_guards(monkeypatch):
+    policy_value = BrokerPolicy(
+        "a" * 32, "dns.dnsx_records", "dnsx", False, (),
+        ("10.203.0.2",), ("10.203.0.53",), ("example.test",), (), (), (),
+        authority_class="target", transport_profile="target-dns",
+        peer_mode="deny-all", resolver_mode="mediated-explicit",
+    )
+    monkeypatch.setattr(
+        netguard, "interface_snapshot",
+        lambda: _interface_snapshot(
+            ("10.203.0.2",), ("255.255.255.255", "10.203.0.255"),
+        ),
+    )
+    assert policy_value.decide(
+        "10.203.0.54", 53, socket.SOCK_DGRAM, socket.IPPROTO_UDP,
+    )[0] == "deny"
+    assert replace(policy_value, resolver_ips=("169.254.169.254",)).decide(
+        "169.254.169.254", 53, socket.SOCK_DGRAM, socket.IPPROTO_UDP,
+    )[0] == "deny"
+    assert replace(policy_value, resolver_ips=("10.203.0.255",)).decide(
+        "10.203.0.255", 53, socket.SOCK_DGRAM, socket.IPPROTO_UDP,
+    )[0] == "deny"
+    assert policy_value.decide(
+        "10.203.0.53", 52, socket.SOCK_DGRAM, socket.IPPROTO_UDP,
+    )[0] == "deny"
+    assert policy_value.decide(
+        "10.203.0.53", 53, socket.SOCK_RAW, socket.IPPROTO_UDP,
+    )[0] == "deny"
+
+
+@pytest.mark.parametrize("source_id,tool", [
+    ("vertical.openintel", "openintel-subs"),
+    ("horizontal.tlsx_san", "tlsx"),
+    ("probe.httpx", "httpx"),
+    ("crawl.katana_headless", "katana"),
+    ("params.nuclei_scan", "nuclei"),
+    ("params.oob_control", "interactsh-client"),
+])
+def test_ineligible_tracee_profiles_cannot_use_direct_dns(
+        monkeypatch, source_id, tool):
+    parsed = BrokerPolicy.from_json(json.dumps(
+        _native_scope().broker_policy(
+            request_id="e" * 32, source_id=source_id, tool=tool,
+        ),
+        ensure_ascii=True, sort_keys=True, separators=(",", ":"),
+    ))
+    monkeypatch.setattr(netguard, "interface_snapshot", _interface_snapshot)
+    assert parsed.decide(
+        "1.1.1.1", 53, socket.SOCK_DGRAM, socket.IPPROTO_UDP,
+    )[0] == "deny"
+
+
+def test_ineligible_profile_cannot_relabel_an_otherwise_allowed_peer_as_dns(
+        monkeypatch):
+    parsed = BrokerPolicy.from_json(json.dumps(
+        _native_scope().broker_policy(
+            request_id="2" * 32,
+            source_id="horizontal.tlsx_san",
+            tool="tlsx",
+        ),
+        ensure_ascii=True, sort_keys=True, separators=(",", ":"),
+    ))
+    monkeypatch.setattr(netguard, "own_ips", lambda: ("192.0.2.10",))
+    assert parsed.decide(
+        "10.0.0.8", 443, socket.SOCK_STREAM, socket.IPPROTO_TCP,
+    )[0] == "allow"
+    assert parsed.decide(
+        "10.0.0.8", 53, socket.SOCK_STREAM, socket.IPPROTO_TCP,
     )[0] == "deny"
 
 

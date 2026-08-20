@@ -641,6 +641,17 @@ def _jxscout_chunks(ctx, ledger) -> int:
     if not fresh:
         return 0
     stats["eligible"] += len(fresh)
+    if getattr(ctx.run, "_network_policy_scope", None) is not None:
+        reason = (
+            "v0.3.10 network-policy boundary refuses the unsupported nested bwrap launcher "
+            "for a bound Run; no analyzer subprocess was started"
+        )
+        ctx.run.record("crawl", skipped(JXSCOUT_SHIM, reason))
+        dispositions["policy-refused"] = dispositions.get("policy-refused", 0) + len(fresh)
+        seen_art.update(str(a) for _u, a in fresh)
+        _jxscout_coverage(stats)
+        ctx.echo(f"  jxscout chunks: refused by bound network policy — {len(fresh)} bundle(s) not analysed")
+        return 0
     if not have(JXSCOUT_SHIM):
         # not the zero of a clean convergence: these bundles went unread, so the remainder is counted in
         # bundles — a supervisor reading only "0 added" would call an unrun lane a fixed point.
@@ -986,6 +997,17 @@ def _ast_bundles(ctx, ledger) -> int:
     if not eligible:
         return 0
     stats["eligible"] += len(eligible)
+    if getattr(ctx.run, "_network_policy_scope", None) is not None:
+        reason = (
+            "v0.3.10 network-policy boundary refuses the unsupported systemd-run launcher "
+            "for a bound Run; no analyzer subprocess was started"
+        )
+        ctx.run.record("crawl", skipped(AST_SHIM, reason))
+        disp["policy-refused"] = disp.get("policy-refused", 0) + len(eligible)
+        seen.update(str(a) for _u, a in eligible)
+        _ast_coverage(ctx, stats)
+        ctx.echo(f"  ast analysis: refused by bound network policy — {len(eligible)} bundle(s) not analysed")
+        return 0
     if not have(AST_SHIM):
         ctx.run.record("crawl", skipped(AST_SHIM, "not installed (optional)"))
         disp["missing-tool"] = disp.get("missing-tool", 0) + len(eligible)
@@ -1126,7 +1148,7 @@ def _jxscout_traverse(ctx, ledger, raw_dir):
         _terminal: dict = {}
         _retriable = 0
         for _d, _n in _disp.items():
-            if _d in ("missing-tool", "no-sandbox"):
+            if _d in ("missing-tool", "no-sandbox", "policy-refused"):
                 _terminal["dependency"] = _terminal.get("dependency", 0) + _n
             elif _d in ("engine-error", "truncated"):
                 _terminal["unschedulable"] = _terminal.get("unschedulable", 0) + _n
@@ -1871,11 +1893,10 @@ def run(ctx) -> None:
     if scan_dirs and have("trufflehog"):
         # `filesystem` accepts multiple paths — hand it both dirs in one pass.
         th = ctx.run.raw_path("crawl", "trufflehog", "out.jsonl")
-        # trufflehog verifies by default (active credential use), so verification is gated behind
-        # MODES.SECRET_VERIFICATION; discovery is unaffected — every secret is still found, as unverified
-        th_cmd = ["trufflehog", "filesystem", *[str(d) for d in scan_dirs], "--json", "--no-update"]
-        if not prof.verify_secrets:
-            th_cmd.append("--no-verification")
+        # TruffleHog verification is an active credential use.  The v0.3.10 boundary keeps this lane
+        # offline regardless of MODES.SECRET_VERIFICATION; discovery is unaffected.
+        th_cmd = ["trufflehog", "filesystem", *[str(d) for d in scan_dirs], "--json",
+                  "--no-update", "--no-verification"]
         r = exec_tool(
             "trufflehog", th_cmd,
             repository=ctx.run,
@@ -1883,6 +1904,11 @@ def run(ctx) -> None:
             stderr=RepositoryOutput.discard(), timeout=ctx.http_timeout,
             source_id="crawl.trufflehog",
         )
+        if prof.verify_secrets:
+            r.note = (r.note + "; " if r.note else "") + (
+                "v0.3.10 network-policy boundary refused online credential verification; "
+                "discovery ran offline with --no-verification"
+            )
         ctx.run.record("crawl", r)
         if r.raw_path:
             for line in r.raw_path.read_text().splitlines():
@@ -1896,14 +1922,11 @@ def run(ctx) -> None:
                 # fingerprint from Raw; if Raw is empty, fall back to detector + redacted + source
                 # context so distinct findings do not collapse onto fingerprint("").
                 basis = raw_s or f"{det}|{red}|{o.get('SourceMetadata') or ''}"
-                # verification is tri-state: True/False mean attempted (valid/invalid) and None means not attempted,
-                # so a not-checked secret never reads as "checked and invalid". `verification` says the same.
-                if prof.verify_secrets:
-                    verified = bool(o.get("Verified", False))
-                    verification = "verified" if verified else "unverified"
-                else:
-                    verified = None
-                    verification = "not_checked"
+                # Every launch is offline under the v0.3.10 boundary, so a profile request for online
+                # verification is recorded as not attempted rather than laundering the detector's
+                # `Verified` field into a claim that credentials were checked.
+                verified = None
+                verification = "not_checked"
                 ctx.run.add("secret", {"id": f"trufflehog:{det}:{secrets.fingerprint(basis)}",
                                        "kind": det, "value": raw_s,
                                        "preview": red or secrets.mask(raw_s),

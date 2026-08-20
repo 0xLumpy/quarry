@@ -1934,6 +1934,7 @@ def run_contract(source_id, cmd, *, repository=None, stdout=None, stderr=None,
                  native_outputs=(),
                  input_total=None, env=None, reclassify=None, work_unit=None,
                  parent_id=None, scope_distance=None, discovery_context=None,
+                 approved_peers=(),
                  **run_kwargs):
     """Run a source under its registry contract -> the (reclassified) RunResult.
 
@@ -1979,6 +1980,7 @@ def run_contract(source_id, cmd, *, repository=None, stdout=None, stderr=None,
             }
         res = _run(
             tool, cmd, source_id=source_id, native_outputs=native_outputs, env=env,
+            approved_peers=approved_peers,
             **repository_policies, **run_kwargs,
         )
         if reclassify is not None:

@@ -280,11 +280,15 @@ def test_run_contract_passes_literal_source_id(monkeypatch, tmp_path):
 
     monkeypatch.setattr(contract, "_run", fake_run)
     try:
-        contract.run_contract("vertical.subfinder", ["subfinder", "-duc"])
+        contract.run_contract(
+            "vertical.subfinder", ["subfinder", "-duc"],
+            approved_peers=("8.8.8.8",),
+        )
     finally:
         events.reset()
 
     assert captured["source_id"] == "vertical.subfinder"
+    assert captured["approved_peers"] == ("8.8.8.8",)
 
 
 def test_unbound_repository_keeps_optional_source_id_compatibility(tmp_path, monkeypatch):
@@ -327,6 +331,27 @@ def test_bound_policy_payload_is_attached_before_supervise_and_settles_allow(tmp
         "reason": "repository supervisor returned an authenticated outcome",
         "summary": {"runner": "repository"},
     }]
+
+
+def test_bound_policy_forwards_caller_owned_approved_peers(tmp_path, monkeypatch):
+    run = _running_run(tmp_path)
+    scope = _PolicyScope()
+    _install_bound_policy(monkeypatch, run, scope)
+    monkeypatch.setattr(
+        runner_repository, "supervise_repository_execution",
+        lambda _repository, invocation, **_kwargs: _authenticated_outcome(
+            invocation.worker.request_id, clean=True,
+        ),
+    )
+
+    _managed_call(
+        run, ["fixture", "--exact"], source_id="fixture.source",
+        approved_peers=("8.8.8.8", "2001:4860:4860::8888"),
+    )
+
+    assert scope.prepared["approved_peers"] == (
+        "8.8.8.8", "2001:4860:4860::8888",
+    )
 
 
 @pytest.mark.parametrize("failure", ("normalize", "supervisor"))

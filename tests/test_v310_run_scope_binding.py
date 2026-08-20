@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -120,3 +121,22 @@ def test_native_fetch_sees_run_bound_network_scope(monkeypatch, tmp_path):
                                 _payload_scope=payload)
     assert seen == [scope]
     assert fetch._network_scope(SimpleNamespace(run=run)) is scope
+
+
+def test_real_run_scope_persists_inside_the_raw_network_namespace(tmp_path):
+    run = store.Run.create(tmp_path, "example.test")
+    scope = network_policy.NetworkPolicyScope(
+        block_private_targets=False,
+        apex_domains=("example.test",),
+        own_ips=("192.0.2.10",),
+        resolver_ips=("1.1.1.1",),
+    )
+
+    scope.bind(run)
+
+    path = run.dir / "raw" / "network" / "policy.jsonl"
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    assert len(rows) == 1
+    assert rows[0]["record_type"] == "scope"
+    assert rows[0]["policy"]["apex_domains"] == ["example.test"]
+    assert network_policy.scope_for(run) is scope
