@@ -794,10 +794,10 @@ def _libc():
 def acquire_worker_subreaper() -> None:
     """Make the single-purpose runner worker the proved descendant reaper.
 
-    This must run before the launcher fork.  Without it, a double-forked tool
-    child is reparented outside the worker and Yama can revoke the broker's
-    ``pidfd_getfd``/``process_vm_readv`` authority while the child still owns
-    the inherited notification filter.
+    This must run before the parked launcher can exec or fork descendants.
+    Without it, a double-forked tool child is reparented outside the worker and
+    Yama can revoke the broker's ``pidfd_getfd``/``process_vm_readv`` authority
+    while the child still owns the inherited notification filter.
     """
     library = _libc()
     ctypes.set_errno(0)
@@ -1336,10 +1336,12 @@ class ListenerHandoff:
 
 def duplicate_reported_listener(
         child_pid: int, report_fd: int, *, expected_profile: str,
-        deadline_monotonic: float, cancellation=None) -> ListenerHandoff:
+        deadline_monotonic: float, cancellation=None,
+        abort_child_on_failure: bool = True) -> ListenerHandoff:
     """Pin one direct child and duplicate its reported listener authority."""
     if (type(child_pid) is not int or child_pid <= 0
-            or type(report_fd) is not int or report_fd < 3):
+            or type(report_fd) is not int or report_fd < 3
+            or type(abort_child_on_failure) is not bool):
         raise NetworkBrokerRefused("network_broker_handoff_identity_invalid")
     if (expected_profile not in _PROFILE_IDS
             or type(deadline_monotonic) not in {int, float}
@@ -1371,10 +1373,11 @@ def duplicate_reported_listener(
         if listener >= 0:
             os.close(listener)
         try:
-            _abort_direct_child(
-                child_pid, pidfd,
-                deadline_monotonic=time.monotonic() + 2.0,
-            )
+            if abort_child_on_failure:
+                _abort_direct_child(
+                    child_pid, pidfd,
+                    deadline_monotonic=time.monotonic() + 2.0,
+                )
         finally:
             os.close(pidfd)
         raise
@@ -1382,9 +1385,11 @@ def duplicate_reported_listener(
 
 def verify_listener_bootstrap(
         handoff: ListenerHandoff, report_fd: int, *,
-        deadline_monotonic: float, cancellation=None) -> None:
+        deadline_monotonic: float, cancellation=None,
+        abort_child_on_failure: bool = True) -> None:
     """Authenticate the sentinel notification and the child's original close."""
     if (type(handoff) is not ListenerHandoff
+            or type(abort_child_on_failure) is not bool
             or type(deadline_monotonic) not in {int, float}
             or not math.isfinite(deadline_monotonic)
             or deadline_monotonic <= time.monotonic()):
@@ -1484,10 +1489,11 @@ def verify_listener_bootstrap(
             raise NetworkBrokerRefused("network_broker_handoff_fd_reused")
     except BaseException:
         try:
-            _abort_direct_child(
-                handoff.child_pid, handoff.child_pidfd,
-                deadline_monotonic=time.monotonic() + 2.0,
-            )
+            if abort_child_on_failure:
+                _abort_direct_child(
+                    handoff.child_pid, handoff.child_pidfd,
+                    deadline_monotonic=time.monotonic() + 2.0,
+                )
         finally:
             try:
                 os.close(handoff.listener_fd)

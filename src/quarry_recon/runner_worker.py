@@ -49,6 +49,19 @@ from .runner_containment import (
     capture_process_identity,
 )
 from .runner_streams import _run_stream_engine
+from .network_broker import (
+    BrokerPolicy,
+    ListenerHandoff,
+    NetworkBrokerRefused,
+    NetworkBrokerSession,
+    acquire_worker_subreaper,
+    acknowledge_listener,
+    child_install_and_report,
+    duplicate_reported_listener,
+    seal_worker_identity,
+    verify_listener_bootstrap,
+)
+from .network_policy import PRIVATE_POLICY_ENV
 
 
 EXPECTED_PARENT_PID_ENV = "QUARRY_RUNNER_EXPECTED_PARENT_PID"
@@ -61,6 +74,7 @@ PRIVATE_REDACTIONS_ENV = "QUARRY_RUNNER_PRIVATE_REDACTIONS"
 _PR_SET_PDEATHSIG = 1
 _EXIT_BOOTSTRAP_INVALID = 64
 _EXIT_CONTROL_FAILED = 65
+_BROKER_BOOTSTRAP_SECONDS = 5.0
 
 
 def _expected_parent_pid() -> int:
@@ -311,6 +325,10 @@ def _execution_launcher_child(
     stderr_write: int,
     exec_status_read: int,
     exec_status_write: int,
+    broker_report_read: int,
+    broker_report_write: int,
+    broker_ack_read: int,
+    broker_ack_write: int,
     inherited_fds: tuple[int, ...],
 ) -> None:
     """Park without target material, then exec one exact private request.
@@ -323,7 +341,7 @@ def _execution_launcher_child(
     """
     try:
         for fd in (release_write, stdin_write, stdout_read, stderr_read,
-                   exec_status_read):
+                   exec_status_read, broker_report_read, broker_ack_write):
             _close_quietly(fd)
         _arm_parent_death(worker_pid)
         os.setsid()
@@ -332,7 +350,7 @@ def _execution_launcher_child(
 
         keep = {
             release_read, stdin_read, stdout_write, stderr_write,
-            exec_status_write,
+            exec_status_write, broker_report_write, broker_ack_read,
         }
         _close_child_fds_except(keep)
         os.kill(os.getpid(), signal.SIGSTOP)
@@ -353,9 +371,22 @@ def _execution_launcher_child(
         for fd in (stdin_read, stdout_write, stderr_write):
             if fd not in (0, 1, 2):
                 _close_quietly(fd)
+        environment = {key: value for key, value in request.environment}
+        policy_raw = environment.pop(PRIVATE_POLICY_ENV, None)
+        if policy_raw is None:
+            _close_quietly(broker_report_write)
+            _close_quietly(broker_ack_read)
+        else:
+            # The only profile admitted by this first runner integration is the
+            # fixed standard filter.  The trusted worker authenticates the
+            # listener and starts its broker before it releases this ACK.
+            child_install_and_report(
+                broker_report_write, broker_ack_read, profile="standard",
+                control_fds=(exec_status_write,),
+                deadline_monotonic=time.monotonic() + _BROKER_BOOTSTRAP_SECONDS,
+            )
         if request.cwd is not None:
             os.chdir(request.cwd)
-        environment = {key: value for key, value in request.environment}
         environment.pop(PRIVATE_REDACTIONS_ENV, None)
         os.execvpe(request.argv[0], list(request.argv), environment)
     except BaseException:
@@ -378,6 +409,8 @@ class _ParkedLauncher:
         stdout_read: int = -1,
         stderr_read: int = -1,
         exec_status_read: int = -1,
+        broker_report_read: int = -1,
+        broker_ack_write: int = -1,
     ) -> None:
         self.pid = pid
         self.pgid = pid
@@ -389,6 +422,10 @@ class _ParkedLauncher:
         self.stdout_read_fd = stdout_read
         self.stderr_read_fd = stderr_read
         self._exec_status_read = exec_status_read
+        self._broker_report_read = broker_report_read
+        self._broker_ack_write = broker_ack_write
+        self._release_callback = None
+        self._network_broker_session = None
         self._released = False
         self._reaped = False
         self._stop_wait_state = "not_started"
@@ -500,6 +537,11 @@ class _ParkedLauncher:
             os.close(self._release_write)
             self._release_write = -1
             self._release_close_attempted = True
+            callback = self._release_callback
+            if callback is not None:
+                callback(deadline=deadline, clock=clock)
+            else:
+                self._close_broker_bootstrap_fds()
             while True:
                 timeout = None
                 if deadline is not None:
@@ -522,10 +564,18 @@ class _ParkedLauncher:
             if self._exec_status_read >= 0:
                 _close_quietly(self._exec_status_read)
                 self._exec_status_read = -1
+            self._close_broker_bootstrap_fds()
         if status:
             return False
         self._released = True
         return True
+
+    def _close_broker_bootstrap_fds(self) -> None:
+        for attribute in ("_broker_report_read", "_broker_ack_write"):
+            fd = getattr(self, attribute, -1)
+            if fd >= 0:
+                _close_quietly(fd)
+                setattr(self, attribute, -1)
 
     def abort_and_reap(self) -> int:
         if self._reaped:
@@ -555,6 +605,7 @@ class _ParkedLauncher:
         for attribute in (
             "stdin_write_fd", "stdout_read_fd", "stderr_read_fd",
             "_exec_status_read",
+            "_broker_report_read", "_broker_ack_write",
         ):
             fd = getattr(self, attribute, -1)
             if fd >= 0:
@@ -626,6 +677,10 @@ class _ExecutionLauncherOwner:
         self.stderr_write = -1
         self.exec_status_read = -1
         self.exec_status_write = -1
+        self.broker_report_read = -1
+        self.broker_report_write = -1
+        self.broker_ack_read = -1
+        self.broker_ack_write = -1
         self.pid = -1
         self.launcher = None
 
@@ -633,7 +688,7 @@ class _ExecutionLauncherOwner:
 def _close_execution_child_ends(owner: _ExecutionLauncherOwner) -> None:
     for attribute in (
         "release_read", "stdin_read", "stdout_write", "stderr_write",
-        "exec_status_write",
+        "exec_status_write", "broker_report_write", "broker_ack_read",
     ):
         fd = getattr(owner, attribute)
         if fd >= 0:
@@ -650,6 +705,8 @@ def _adopt_execution_launcher(owner: _ExecutionLauncherOwner) -> _ParkedLauncher
             stdout_read=owner.stdout_read,
             stderr_read=owner.stderr_read,
             exec_status_read=owner.exec_status_read,
+            broker_report_read=owner.broker_report_read,
+            broker_ack_write=owner.broker_ack_write,
         )
     launcher = owner.launcher
     if launcher is not None:
@@ -658,6 +715,8 @@ def _adopt_execution_launcher(owner: _ExecutionLauncherOwner) -> _ParkedLauncher
         owner.stdout_read = -1
         owner.stderr_read = -1
         owner.exec_status_read = -1
+        owner.broker_report_read = -1
+        owner.broker_ack_write = -1
     _close_execution_child_ends(owner)
     return launcher
 
@@ -667,6 +726,8 @@ def _close_execution_owner_fds(owner: _ExecutionLauncherOwner) -> None:
         "release_read", "release_write", "stdin_read", "stdin_write",
         "stdout_read", "stdout_write", "stderr_read", "stderr_write",
         "exec_status_read", "exec_status_write",
+        "broker_report_read", "broker_report_write",
+        "broker_ack_read", "broker_ack_write",
     ):
         fd = getattr(owner, attribute)
         if fd >= 0:
@@ -814,6 +875,8 @@ def _spawn_execution_launcher(
             owner.stdout_read, owner.stdout_write = os.pipe()
             owner.stderr_read, owner.stderr_write = os.pipe()
             owner.exec_status_read, owner.exec_status_write = os.pipe()
+            owner.broker_report_read, owner.broker_report_write = os.pipe()
+            owner.broker_ack_read, owner.broker_ack_write = os.pipe()
             os.set_inheritable(owner.exec_status_write, False)
             worker_pid = os.getpid()
             owner.pid = os.fork()
@@ -830,6 +893,10 @@ def _spawn_execution_launcher(
                     stderr_write=owner.stderr_write,
                     exec_status_read=owner.exec_status_read,
                     exec_status_write=owner.exec_status_write,
+                    broker_report_read=owner.broker_report_read,
+                    broker_report_write=owner.broker_report_write,
+                    broker_ack_read=owner.broker_ack_read,
+                    broker_ack_write=owner.broker_ack_write,
                     inherited_fds=inherited_fds,
                 )
             launcher = _adopt_execution_launcher(owner)
@@ -921,6 +988,112 @@ def _settle_after_boundary(launcher, primary: BaseException) -> bool:
     if not isinstance(primary, Exception):
         raise primary
     return settled
+
+
+def _close_listener_handoff(handoff: ListenerHandoff | None) -> None:
+    if handoff is None:
+        return
+    for fd in (handoff.listener_fd, handoff.child_pidfd):
+        _close_quietly(fd)
+
+
+def _configure_network_broker(request: WorkerRequest, launcher) -> None:
+    """Bind an optional request policy to the post-EOF launcher seam.
+
+    The callback is deliberately installed only after the request is decoded and
+    the parent has sent GO.  ``release_for_exec`` invokes it after writing that
+    exact request and closing the release writer, while the child is blocked in
+    its private listener-report/ACK handshake.
+    """
+    policy_raw = dict(request.environment).get(PRIVATE_POLICY_ENV)
+    if policy_raw is None:
+        return
+
+    def bootstrap(*, deadline, clock) -> None:
+        now = float(clock())
+        handoff = None
+        session = None
+        try:
+            if (type(deadline) not in {int, float}
+                    or float(deadline) <= now):
+                raise RuntimeError("network_broker_bootstrap_deadline_invalid")
+            # These process-wide facts must be fixed before any untrusted
+            # descendant can exec.  The launcher is already parked and cannot
+            # fork a grandchild before this callback ACKs its listener.
+            acquire_worker_subreaper()
+            seal_worker_identity()
+            handoff = duplicate_reported_listener(
+                launcher.pid, launcher._broker_report_read,
+                expected_profile="standard", deadline_monotonic=float(deadline),
+                abort_child_on_failure=False,
+            )
+            try:
+                verify_listener_bootstrap(
+                    handoff, launcher._broker_report_read,
+                    deadline_monotonic=float(deadline),
+                    abort_child_on_failure=False,
+                )
+            except BaseException:
+                # verify_listener_bootstrap consumes/settles both handoff FDs
+                # on failure; do not retry their numeric values in finally.
+                handoff = None
+                raise
+            policy = BrokerPolicy.from_json(policy_raw)
+            if (policy.request_id != request.request_id
+                    or policy.tool != request.tool):
+                raise RuntimeError("network_broker_policy_request_mismatch")
+            session_deadline = (
+                now + float(request.timeout) + _BROKER_BOOTSTRAP_SECONDS
+                if request.timeout else float((1 << 53) - 1)
+            )
+            session = NetworkBrokerSession(
+                handoff, policy, expected_profile="standard",
+                deadline_monotonic=session_deadline,
+            )
+            session.start()
+            child_pidfd = handoff.child_pidfd
+            launcher._network_broker_session = session
+            handoff = None
+            acknowledge_listener(
+                launcher._broker_ack_write,
+                child_pidfd=child_pidfd,
+                deadline_monotonic=float(deadline),
+            )
+            launcher._broker_ack_write = -1
+            session = None  # launcher now owns listener and pidfd settlement.
+        finally:
+            # The report pipe is no longer useful after its exact EOF proof;
+            # acknowledge_listener owns and closes the ACK writer on success.
+            if launcher._broker_report_read >= 0:
+                _close_quietly(launcher._broker_report_read)
+                launcher._broker_report_read = -1
+            if session is not None:
+                session.stop()
+                if launcher._network_broker_session is session:
+                    launcher._network_broker_session = None
+            if handoff is not None:
+                _close_listener_handoff(handoff)
+
+    launcher._release_callback = bootstrap
+
+
+def _settle_network_broker(launcher) -> dict | None:
+    """Settle the listener only after the direct launcher is terminal."""
+    session = getattr(launcher, "_network_broker_session", None)
+    if session is None:
+        return None
+    launcher._network_broker_session = None
+    try:
+        session.settle_after_tasks(
+            deadline_monotonic=time.monotonic() + _BROKER_BOOTSTRAP_SECONDS,
+        )
+        summary = session.summary()
+        if type(summary) is not dict or summary.get("complete") is not True:
+            raise NetworkBrokerRefused("network_broker_settlement_incomplete")
+        return summary
+    except BaseException:
+        session.stop()
+        raise
 
 
 def _command_matches_prepared(command, request, prepared: PreparedFrame) -> bool:
@@ -1297,6 +1470,7 @@ def _run_execution_transaction(
         None if execution_deadline is None else execution_deadline + 5.0
     )
     try:
+        _configure_network_broker(request, launcher)
         settlement = _run_stream_engine(
             request,
             launcher,
@@ -1309,10 +1483,12 @@ def _run_execution_transaction(
             clock=time.monotonic,
             on_started=_write_started,
         )
+        _settle_network_broker(launcher)
         _write_settlement(control_fd, settlement)
     except BaseException as primary:
         if not _launcher_terminal(launcher):
             _settle_after_boundary(launcher, primary)
+        _settle_network_broker(launcher)
         if not isinstance(primary, Exception):
             raise
         return _EXIT_CONTROL_FAILED

@@ -1683,6 +1683,49 @@ def test_wrong_bootstrap_profile_kills_and_reaps_the_pinned_child():
         os.close(report_read)
 
 
+@pytest.mark.skipif(not hasattr(os, "pidfd_open"), reason="pidfd required")
+def test_runner_owned_bootstrap_failure_leaves_reaping_to_the_runner():
+    report_read, report_write = os.pipe2(os.O_CLOEXEC)
+    child = os.fork()
+    if child == 0:
+        try:
+            os.close(report_read)
+            frame = network_broker._HANDOFF.pack(
+                network_broker._HANDOFF_MAGIC,
+                network_broker._HANDOFF_VERSION,
+                network_broker._PROFILE_IDS["browser"],
+                9,
+            )
+            os.write(report_write, frame)
+            signal.pause()
+        finally:
+            os._exit(99)
+    os.close(report_write)
+    reaped = False
+    try:
+        with pytest.raises(NetworkBrokerRefused, match="handoff_frame_invalid"):
+            network_broker.duplicate_reported_listener(
+                child, report_read, expected_profile="standard",
+                deadline_monotonic=time.monotonic() + 1,
+                abort_child_on_failure=False,
+            )
+        assert os.waitpid(child, os.WNOHANG) == (0, 0)
+        os.kill(child, signal.SIGKILL)
+        assert os.waitpid(child, 0)[0] == child
+        reaped = True
+    finally:
+        if not reaped:
+            try:
+                os.kill(child, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                os.waitpid(child, 0)
+            except ChildProcessError:
+                pass
+        os.close(report_read)
+
+
 def test_listener_validation_rejects_an_arbitrary_cloexec_fd():
     fd = os.open("/dev/null", os.O_RDONLY | os.O_CLOEXEC)
     try:
