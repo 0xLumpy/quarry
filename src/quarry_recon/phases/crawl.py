@@ -541,7 +541,7 @@ def _jxscout_analyze(ctx, artifact, limit: int, timeout: int = 60) -> tuple:
     stem = Path(artifact).stem[:32]
     # a private scratch per invocation: with a shared output directory one bundle's evaluated code could
     # rewrite or delete another's artifacts, inside the evidence trail the sandbox exists to protect.
-    with tempfile.TemporaryDirectory(prefix="quarry-jxscout-") as _scratch:
+    with tempfile.TemporaryDirectory(prefix="quarry-jxscout-", dir=ctx.run.dir) as _scratch:
         out, err = Path(_scratch) / "out.txt", Path(_scratch) / "err.txt"
         cmd = _jxscout_sandbox([JXSCOUT_SHIM, str(artifact), str(max(0, limit))], out, err)
         if not cmd:
@@ -641,17 +641,6 @@ def _jxscout_chunks(ctx, ledger) -> int:
     if not fresh:
         return 0
     stats["eligible"] += len(fresh)
-    if getattr(ctx.run, "_network_policy_scope", None) is not None:
-        reason = (
-            "v0.3.10 network-policy boundary refuses the unsupported nested bwrap launcher "
-            "for a bound Run; no analyzer subprocess was started"
-        )
-        ctx.run.record("crawl", skipped(JXSCOUT_SHIM, reason))
-        dispositions["policy-refused"] = dispositions.get("policy-refused", 0) + len(fresh)
-        seen_art.update(str(a) for _u, a in fresh)
-        _jxscout_coverage(stats)
-        ctx.echo(f"  jxscout chunks: refused by bound network policy — {len(fresh)} bundle(s) not analysed")
-        return 0
     if not have(JXSCOUT_SHIM):
         # not the zero of a clean convergence: these bundles went unread, so the remainder is counted in
         # bundles — a supervisor reading only "0 added" would call an unrun lane a fixed point.

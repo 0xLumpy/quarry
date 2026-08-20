@@ -2,6 +2,7 @@
 
 import ast
 import hashlib
+import shlex
 import socket
 import sys
 from pathlib import Path
@@ -17,6 +18,7 @@ import quarry_recon.network_policy as network_policy
 from quarry_recon.runner import Status
 from quarry_recon.runner_native import RepositoryNativeOutput
 from quarry_recon.runner_repository import RepositoryOutput
+from quarry_recon.phases import crawl as crawl_phase
 
 
 pytestmark = pytest.mark.offline
@@ -26,6 +28,28 @@ _PRODUCTION_DIRECT_ROOTS = (
     Path(__file__).parents[1] / "src" / "quarry_recon" / "osint.py",
     Path(__file__).parents[1] / "src" / "quarry_recon" / "phases",
 )
+
+
+def _chunks_bwrap_command(tmp_path, monkeypatch, *, artifact_root=None):
+    shim = tmp_path / "jxscout-chunks"
+    shim.write_text("#!/bin/sh\nexit 0\n")
+    shim.chmod(0o755)
+    bundle = Path(artifact_root or tmp_path) / "bundle.js"
+    bundle.write_text("x")
+    scratch = Path(artifact_root or tmp_path) / "quarry-jxscout-test"
+    scratch.mkdir(mode=0o700)
+    real_which = crawl_phase.shutil.which
+    monkeypatch.setattr(
+        crawl_phase.shutil, "which",
+        lambda name, *args, **kwargs: (
+            str(shim) if name == "jxscout-chunks"
+            else "/usr/bin/bwrap" if name == "bwrap"
+            else real_which(name, *args, **kwargs)
+        ),
+    )
+    return crawl_phase._jxscout_sandbox(
+        ["jxscout-chunks", str(bundle), "0"], scratch / "out.txt", scratch / "err.txt",
+    )
 
 
 def _direct_exec_calls():
@@ -276,6 +300,119 @@ def test_bound_repository_refuses_mismatched_transport_door_before_launch(tmp_pa
     assert result.status is Status.FAILED
     assert result.started is False
     assert observed == {"source_id": "vertical.subfinder", "argv": ["subfinder", "-duc"]}
+
+
+def test_bound_chunks_bwrap_is_prepared_and_supervised_without_outer_broker(tmp_path, monkeypatch):
+    run = _running_run(tmp_path)
+
+    class NoBrokerScope:
+        def prepare_invocation(self, **_kwargs):
+            pytest.fail("self-contained bwrap launcher installed an outer broker")
+
+    scope = NoBrokerScope()
+    command = _chunks_bwrap_command(tmp_path, monkeypatch, artifact_root=run.dir)
+    prepared = _PreparedLaunch(tuple(command))
+    monkeypatch.setattr(network_policy, "scope_for", lambda repository: scope if repository is run else None)
+    monkeypatch.setattr(runner, "have", lambda _name: True)
+    monkeypatch.setattr(runtime_identity, "prepare_launch", lambda *_args, **_kwargs: prepared)
+    monkeypatch.setattr(runtime_identity, "revalidate_launch", lambda _prepared: None)
+    monkeypatch.setattr(runtime_identity, "publish_launch_identity", lambda *_args: "identity")
+    observed = {}
+    monkeypatch.setattr(
+        runner_repository, "supervise_repository_execution",
+        lambda _repository, invocation, **_kwargs: (
+            observed.update(environment=invocation.worker.environment)
+            or _authenticated_outcome(invocation.worker.request_id, clean=True)
+        ),
+    )
+
+    result = _managed_call(
+        run, command,
+        source_id="crawl.jxscout_chunks",
+    )
+
+    assert result.started is True
+    assert prepared.closed
+    assert network_policy.PRIVATE_POLICY_ENV not in observed["environment"]
+
+
+@pytest.mark.parametrize("mutation", [
+    "missing-unshare", "valued-unshare", "valued-clearenv", "share-net",
+    "host-root-bind", "secret-bind", "cap-add", "options-after-command",
+    "foreign-bundle", "foreign-engine", "nonprivate-scratch",
+])
+def test_bound_chunks_refuses_missing_or_forged_bwrap_network_deny_flags_before_launch(
+        tmp_path, monkeypatch, mutation):
+    run = _running_run(tmp_path)
+    monkeypatch.setattr(network_policy, "scope_for", lambda repository: object() if repository is run else None)
+    _forbid_launch(monkeypatch)
+
+    command = _chunks_bwrap_command(tmp_path, monkeypatch, artifact_root=run.dir)
+    if mutation == "missing-unshare":
+        command.remove("--unshare-all")
+    elif mutation == "valued-unshare":
+        command[command.index("--unshare-all")] = "--unshare-all=1"
+    elif mutation == "valued-clearenv":
+        command[command.index("--clearenv")] = "--clearenv=1"
+    elif mutation == "share-net":
+        command.insert(command.index("sh"), "--share-net")
+    elif mutation == "host-root-bind":
+        command[command.index("sh"):command.index("sh")] = ["--bind", "/", "/"]
+    elif mutation == "secret-bind":
+        command[command.index("sh"):command.index("sh")] = ["--ro-bind", "/home/operator/.ssh", "/secret"]
+    elif mutation == "cap-add":
+        command[command.index("sh"):command.index("sh")] = ["--cap-add", "ALL"]
+    elif mutation == "options-after-command":
+        for option in ("--unshare-all", "--die-with-parent", "--clearenv"):
+            command.remove(option)
+            command.append(option)
+    elif mutation == "foreign-bundle":
+        foreign = tmp_path / "outside.js"
+        foreign.write_text("secret")
+        command[46] = command[47] = str(foreign)
+        inner = shlex.split(command[62])
+        inner[8] = str(foreign)
+        command[62] = shlex.join(inner)
+    elif mutation == "foreign-engine":
+        (tmp_path / "attacker").mkdir()
+        foreign = tmp_path / "attacker" / "jxscout-chunks"
+        foreign.write_text("#!/bin/sh\nexit 0\n")
+        foreign.chmod(0o755)
+        command[40] = command[41] = str(foreign)
+        inner = shlex.split(command[62])
+        inner[7] = str(foreign)
+        command[62] = shlex.join(inner)
+    else:
+        foreign = tmp_path / "quarry-jxscout-foreign"
+        foreign.mkdir(mode=0o700)
+        command[49] = command[50] = str(foreign)
+        inner = shlex.split(command[62])
+        inner[11] = str(foreign / "out.txt")
+        inner[13] = str(foreign / "err.txt")
+        command[62] = shlex.join(inner)
+
+    result = _managed_call(run, command, source_id="crawl.jxscout_chunks")
+
+    assert result.status is Status.FAILED
+    assert result.started is False
+    assert "exact transport door" in result.note
+
+
+@pytest.mark.parametrize("source_id, command", [
+    ("horizontal.csp", ("bwrap", "--unshare-all", "--die-with-parent", "--clearenv")),
+    ("crawl.jxscout_ast", ("systemd-run", "--user", "--scope")),
+])
+def test_bound_broker_free_or_unsupported_doors_do_not_gain_chunks_exception(
+        tmp_path, monkeypatch, source_id, command):
+    run = _running_run(tmp_path)
+    monkeypatch.setattr(network_policy, "scope_for", lambda repository: object() if repository is run else None)
+    _forbid_launch(monkeypatch)
+
+    result = _managed_call(run, list(command), source_id=source_id)
+
+    assert result.status is Status.FAILED
+    assert result.started is False
+    assert "exact transport door" in result.note
 
 
 def test_run_contract_passes_literal_source_id(monkeypatch, tmp_path):

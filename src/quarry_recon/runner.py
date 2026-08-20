@@ -1896,7 +1896,11 @@ def _run_with_repository(
         return preflight_failure("network_hosts require a bound network policy scope")
     if policy_scope is not None:
         door = network_policy.transport_door(source_id, argv=safe_cmd)
-        if door is None or not door.supported or not door.broker_required:
+        broker_free_bwrap = network_policy.binds_broker_free_launch_to_repository(
+            door, safe_cmd, repository.dir,
+        )
+        if (door is None or not door.supported
+                or (not door.broker_required and not broker_free_bwrap)):
             return preflight_failure(
                 "bound network policy requires a supported broker source_id and exact transport door",
             )
@@ -1971,7 +1975,7 @@ def _run_with_repository(
             payload_scope=getattr(repository, "_runtime_payload_scope", None),
         )
         runtime_identity.revalidate_launch(prepared)
-        if policy_scope is not None:
+        if policy_scope is not None and door.broker_required:
             resolved_peers = _resolve_network_hosts(
                 policy_scope, request_id=request_id, source_id=source_id,
                 network_hosts=network_hosts,

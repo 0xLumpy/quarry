@@ -377,8 +377,10 @@ class TestTheWritablePathIsPRIVATEToEachInvocation:
             pytest.skip("bwrap not installed on this host")
         shared = run.raw_path("crawl", "jxscout", "x.txt").parent
         assert seen[0]["binds"] and str(shared) not in seen[0]["binds"], seen[0]["binds"]
-        assert str(run.dir) not in seen[0]["argv"], \
-            "the run's evidence tree must not be in the namespace at all"
+        scratch = pathlib.Path(seen[0]["binds"][0])
+        assert scratch.parent == run.dir and scratch.name.startswith("quarry-jxscout-")
+        assert str(run.dir) not in seen[0]["binds"] and str(shared) not in seen[0]["binds"], \
+            "only the empty per-invocation child may be writable, never the evidence tree"
 
     def test_a_LATER_bundle_cannot_see_an_EARLIER_ones_artifacts(self, tmp_path, monkeypatch):
         """The measurable claim: what the second invocation could reach when it started."""

@@ -14,7 +14,10 @@ import json
 import os
 import re
 import secrets
+import shlex
+import shutil
 import socket
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -70,6 +73,11 @@ def _door(source_id: str, kind: str, authority_class: str, profile: str, *,
 # Production integration must present both the source id and the exact argv0 or
 # native helper to ``transport_door``; an unknown/mismatched pair refuses.
 _registered_doors: dict[str, TransportDoor] = {}
+
+_JXSCOUT_BWRAP_RUNTIME_PATHS = (
+    "/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc/ld.so.cache",
+    "/etc/ld.so.conf", "/etc/ld.so.conf.d", "/etc/alternatives",
+)
 
 
 def _register(source_ids, kind, authority_class, profile, **kwargs) -> None:
@@ -219,9 +227,14 @@ _register(("crawl.jxscout_ast",), "offline-transform", "offline",
           supported=False,
           unsupported_reason="systemd-run escapes the runner cgroup/filter inheritance")
 _register(("crawl.jxscout_chunks",), "offline-transform", "offline",
-          "unsupported-nested-sandbox", argv0=("bwrap",),
-          descendants=("sh", "node"), connect_time_peer=False, supported=False,
-          unsupported_reason="nested namespace setup is not yet in the trusted pre-filter launcher")
+          "offline-bwrap-network-deny", argv0=("bwrap",),
+          descendants=("sh", "node"),
+          # ``--unshare-all`` includes the network namespace.  These must be
+          # separate exact argv elements: bwrap accepts no value for them, and
+          # a later ``--share-net`` would undo the network-deny contract.
+          required_argv=("--unshare-all", "--die-with-parent", "--clearenv"),
+          forbidden_argv=("--share-net",), connect_time_peer=False,
+          broker_required=False)
 
 REGISTERED_TRANSPORT_DOORS = MappingProxyType(dict(_registered_doors))
 
@@ -382,6 +395,87 @@ _MAX_NETWORK_HOSTS = 1024
 _RUNNER_NATIVE_DNS_AUTHORITY = object()
 
 
+def _exact_jxscout_chunks_argv(argv: tuple[str, ...] | list[str]) -> bool:
+    """Accept only the bwrap command emitted by ``crawl._jxscout_sandbox``.
+
+    This door has no outer broker, so token presence is not enough: options after
+    the command would be inert, and an extra bind or capability option would
+    change the containment boundary.  Keep this parser deliberately literal;
+    a builder change must update the admission test before it can run.
+    """
+    if len(argv) != 63 or tuple(argv[:12]) != (
+        "bwrap", "--unshare-all", "--die-with-parent", "--clearenv",
+        "--chdir", "/", "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
+    ):
+        return False
+    offset = 12
+    for path in _JXSCOUT_BWRAP_RUNTIME_PATHS:
+        if tuple(argv[offset:offset + 3]) != ("--ro-bind-try", path, path):
+            return False
+        offset += 3
+    if offset != 39:
+        return False
+    engine = argv[40]
+    engine_payload = argv[43]
+    bundle = argv[46]
+    scratch = argv[49]
+    home = str(Path.home())
+
+    def canonical_absolute(value: str) -> bool:
+        path = Path(value)
+        return path.is_absolute() and str(path) == value and ".." not in path.parts
+
+    if tuple(argv[39:42]) != ("--ro-bind", engine, engine):
+        return False
+    if (not canonical_absolute(engine) or Path(engine).name != "jxscout-chunks"
+            or engine != shutil.which("jxscout-chunks")):
+        return False
+    expected_payload = str(Path.home() / ".local/share/quarry/jxscout-chunk-discoverer.cjs")
+    if (tuple(argv[42:45]) != ("--ro-bind-try", engine_payload, engine_payload)
+            or engine_payload != expected_payload):
+        return False
+    if (tuple(argv[45:48]) != ("--ro-bind", bundle, bundle)
+            or not canonical_absolute(bundle)):
+        return False
+    if (tuple(argv[48:51]) != ("--bind", scratch, scratch)
+            or not canonical_absolute(scratch)):
+        return False
+    try:
+        engine_stat = os.lstat(engine)
+        bundle_stat = os.lstat(bundle)
+        scratch_stat = os.lstat(scratch)
+    except OSError:
+        return False
+    if (not stat.S_ISREG(engine_stat.st_mode) or engine_stat.st_uid != os.geteuid()
+            or engine_stat.st_nlink != 1 or engine_stat.st_mode & 0o022
+            or not engine_stat.st_mode & stat.S_IXUSR):
+        return False
+    if (not stat.S_ISREG(bundle_stat.st_mode) or bundle_stat.st_uid != os.geteuid()
+            or bundle_stat.st_nlink != 1 or bundle_stat.st_mode & 0o022):
+        return False
+    if (not stat.S_ISDIR(scratch_stat.st_mode) or scratch_stat.st_uid != os.geteuid()
+            or stat.S_IMODE(scratch_stat.st_mode) != 0o700
+            or not Path(scratch).name.startswith("quarry-jxscout-")):
+        return False
+    if tuple(argv[51:60]) != (
+        "--setenv", "NODE_OPTIONS", "--max-old-space-size=2048",
+        "--setenv", "PATH", "/usr/bin:/bin", "--setenv", "HOME", home,
+    ) or tuple(argv[60:62]) != ("sh", "-c"):
+        return False
+    try:
+        inner = shlex.split(argv[62], posix=True)
+    except ValueError:
+        return False
+    if len(inner) != 14 or inner[:9] != [
+        "ulimit", "-v", "4194304;", "ulimit", "-f", "131072;", "exec", engine, bundle,
+    ] or inner[10:] != [
+        ">", str(Path(scratch) / "out.txt"), "2>", str(Path(scratch) / "err.txt"),
+    ]:
+        return False
+    limit = inner[9]
+    return limit.isascii() and limit.isdigit() and str(int(limit)) == limit and 0 <= int(limit) <= 3000
+
+
 def transport_door(source_id: str, *, argv=None, helper: str | None = None) -> TransportDoor | None:
     """Return an exact source-bound door, or ``None`` for any mismatch.
 
@@ -404,11 +498,54 @@ def transport_door(source_id: str, *, argv=None, helper: str | None = None) -> T
         return None
     if Path(argv[0]).name not in door.argv0:
         return None
+    if source_id == "crawl.jxscout_chunks" and not _exact_jxscout_chunks_argv(argv):
+        return None
     if any(required not in argv for required in door.required_argv):
         return None
     if any(value.split("=", 1)[0] in door.forbidden_argv for value in argv):
         return None
     return door
+
+
+def admits_bound_broker_free_launch(door: TransportDoor | None) -> bool:
+    """Whether this one self-contained offline launcher may run in a bound Run.
+
+    Broker-free is not itself an admission category.  The chunks launcher is
+    the sole exception: its exact bwrap argv creates a fresh network namespace
+    before the untrusted analyzer starts, so an inherited outer seccomp broker
+    is neither needed nor installable across that namespace boundary.
+    """
+    return bool(
+        type(door) is TransportDoor
+        and door.source_id == "crawl.jxscout_chunks"
+        and door.kind == "offline-transform"
+        and door.authority_class == "offline"
+        and door.profile == "offline-bwrap-network-deny"
+        and door.argv0 == ("bwrap",)
+        and door.required_argv == ("--unshare-all", "--die-with-parent", "--clearenv")
+        and door.forbidden_argv == ("--share-net",)
+        and not door.broker_required
+        and door.supported
+    )
+
+
+def binds_broker_free_launch_to_repository(door: TransportDoor | None, argv,
+                                           repository_root: Path) -> bool:
+    """Bind the broker-free input and empty scratch mounts to this Run."""
+    if not admits_bound_broker_free_launch(door) or not _exact_jxscout_chunks_argv(argv):
+        return False
+    try:
+        root = Path(repository_root).resolve(strict=True)
+        bundle = Path(argv[46]).resolve(strict=True)
+        scratch = Path(argv[49]).resolve(strict=True)
+        bundle.relative_to(root)
+        scratch.relative_to(root)
+        with os.scandir(scratch) as entries:
+            if next(entries, None) is not None:
+                return False
+    except (OSError, ValueError, IndexError, TypeError):
+        return False
+    return bundle != root and scratch != root
 
 
 def _canonical_network(value, *, require_canonical: bool = True):

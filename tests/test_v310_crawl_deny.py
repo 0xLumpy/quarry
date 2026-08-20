@@ -23,7 +23,7 @@ def _ledger(artifact):
     return SimpleNamespace(items=lambda: iter([("https://acme.com/app.js", artifact)]))
 
 
-def test_bound_jxscout_chunks_records_refusal_without_subprocess(tmp_path, monkeypatch):
+def test_bound_jxscout_chunks_reaches_the_self_contained_analyzer(tmp_path, monkeypatch):
     run = _run(tmp_path)
     artifact = tmp_path / "app.js"
     artifact.write_text("x")
@@ -31,13 +31,19 @@ def test_bound_jxscout_chunks_records_refusal_without_subprocess(tmp_path, monke
         run=run, profile=SimpleNamespace(js_chunk_brute=0),
         scope=SimpleNamespace(in_scope=lambda _host: True), echo=lambda *_args: None,
     )
-    monkeypatch.setattr(crawl, "have", lambda _tool: pytest.fail("capability check reached launch path"))
-    monkeypatch.setattr(crawl, "run_contract", lambda *a, **k: pytest.fail("subprocess launched"))
+    monkeypatch.setattr(crawl, "have", lambda _tool: True)
+    seen = []
+    monkeypatch.setattr(
+        crawl, "_jxscout_analyze",
+        lambda *_args: (seen.append(True) or ([], "empty", RunResult(
+            crawl.JXSCOUT_SHIM, (), Status.SUCCESS, 0, 0.0, None, 0,
+        ))),
+    )
 
     assert crawl._jxscout_chunks(ctx, _ledger(artifact)) == 0
+    assert seen == [True]
     record = run._tool_runs[-1]
-    assert record.tool == crawl.JXSCOUT_SHIM and record.status == Status.SKIPPED.value
-    assert "v0.3.10" in record.note and "no analyzer subprocess" in record.note
+    assert record.tool == crawl.JXSCOUT_SHIM and record.status == Status.SUCCESS.value
 
 
 def test_bound_jxscout_ast_records_refusal_before_cgroup_cleanup(tmp_path, monkeypatch):

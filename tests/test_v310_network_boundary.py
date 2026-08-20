@@ -39,6 +39,7 @@ from quarry_recon.network_broker import (
     NetworkEffectFence,
 )
 from quarry_recon.phases import params as params_phase
+from quarry_recon.phases import crawl as crawl_phase
 
 
 pytestmark = pytest.mark.offline
@@ -136,7 +137,10 @@ def test_transport_registry_is_exactly_source_keyed_and_complete():
         assert door.authority_class in network_policy.AUTHORITY_CLASSES
         assert bool(door.argv0) != bool(door.helpers) or source_id == "params.oob_probe"
         assert door.argv0 or door.helpers
-        assert door.broker_required is bool(door.argv0)
+        assert door.broker_required is bool(door.argv0) or (
+            source_id == "crawl.jxscout_chunks"
+            and network_policy.admits_bound_broker_free_launch(door)
+        )
 
 
 def test_source_registry_backing_identity_matches_transport_authority():
@@ -160,7 +164,8 @@ def test_source_registry_backing_identity_matches_transport_authority():
         elif source_id == "crawl.jxscout_ast":
             assert door.argv0 == ("systemd-run",) and not door.supported
         elif source_id == "crawl.jxscout_chunks":
-            assert door.argv0 == ("bwrap",) and not door.supported
+            assert door.argv0 == ("bwrap",) and door.supported
+            assert not door.broker_required
         else:
             assert spec["tool"] in door.argv0, (source_id, spec["tool"], door.argv0)
 
@@ -1182,17 +1187,58 @@ def test_oob_target_probe_binds_native_source_separately_from_control(
     assert seen == ["params.oob_probe"]
 
 
-def test_existing_jxscout_wrapper_escapes_are_declared_but_never_admitted():
+def test_only_chunks_has_the_self_contained_bwrap_network_deny_door(tmp_path, monkeypatch):
     ast = network_policy.REGISTERED_TRANSPORT_DOORS["crawl.jxscout_ast"]
     chunks = network_policy.REGISTERED_TRANSPORT_DOORS["crawl.jxscout_chunks"]
     assert not ast.supported and "systemd-run" in ast.unsupported_reason
-    assert not chunks.supported and "pre-filter launcher" in chunks.unsupported_reason
+    assert network_policy.admits_bound_broker_free_launch(chunks)
     assert network_policy.transport_door(
         "crawl.jxscout_ast", argv=("systemd-run", "--user", "--scope"),
     ) is None
-    assert network_policy.transport_door(
-        "crawl.jxscout_chunks", argv=("bwrap", "--unshare-all"),
-    ) is None
+    shim = tmp_path / "jxscout-chunks"
+    shim.write_text("#!/bin/sh\nexit 0\n")
+    shim.chmod(0o755)
+    bundle = tmp_path / "bundle.js"
+    bundle.write_text("x")
+    scratch = tmp_path / "quarry-jxscout-test"
+    scratch.mkdir(mode=0o700)
+    real_which = crawl_phase.shutil.which
+    monkeypatch.setattr(
+        crawl_phase.shutil, "which",
+        lambda name, *args, **kwargs: (
+            str(shim) if name == "jxscout-chunks"
+            else "/usr/bin/bwrap" if name == "bwrap"
+            else real_which(name, *args, **kwargs)
+        ),
+    )
+    canonical = tuple(crawl_phase._jxscout_sandbox(
+        ["jxscout-chunks", str(bundle), "0"], scratch / "out.txt", scratch / "err.txt",
+    ))
+    assert network_policy.transport_door("crawl.jxscout_chunks", argv=canonical) is chunks
+    assert network_policy.binds_broker_free_launch_to_repository(chunks, canonical, tmp_path)
+    assert not network_policy.binds_broker_free_launch_to_repository(
+        chunks, canonical, tmp_path / "unrelated",
+    )
+    forged = []
+    for addition in (
+        ("--share-net",), ("--bind", "/", "/"),
+        ("--ro-bind", "/home/operator/.ssh", "/secret"), ("--cap-add", "ALL"),
+    ):
+        candidate = list(canonical)
+        candidate[candidate.index("sh"):candidate.index("sh")] = addition
+        forged.append(tuple(candidate))
+    moved = [item for item in canonical if item not in {
+        "--unshare-all", "--die-with-parent", "--clearenv",
+    }]
+    moved.extend(("--unshare-all", "--die-with-parent", "--clearenv"))
+    forged.append(tuple(moved))
+    forged.extend((
+        tuple(item for item in canonical if item != "--unshare-all"),
+        tuple("--unshare-all=1" if item == "--unshare-all" else item for item in canonical),
+        tuple("--clearenv=yes" if item == "--clearenv" else item for item in canonical),
+    ))
+    for candidate in forged:
+        assert network_policy.transport_door("crawl.jxscout_chunks", argv=candidate) is None
 
 
 def test_evidence_acquisition_binds_semantic_source_before_transport(monkeypatch, tmp_path):
