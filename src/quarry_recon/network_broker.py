@@ -2595,12 +2595,30 @@ class ControlEndpointRegistry:
                             ))):
                         continue
                     try:
-                        if (_socket_identity(grant.client_fd)
-                                != grant.client_identity
-                                or self._connection_endpoints(grant.client_fd, family)
-                                != (grant.client_endpoint, grant.server_endpoint)):
-                            continue
+                        identity = _socket_identity(grant.client_fd)
+                    except OSError as exc:
+                        try:
+                            closed = self._grant_fd_closed(grant)
+                        except NetworkBrokerRefused as probe_exc:
+                            raise NetworkBrokerRefused(
+                                "network_broker_control_grant_close_failed",
+                            ) from probe_exc
+                        if not closed:
+                            raise NetworkBrokerRefused(
+                                "network_broker_control_grant_changed",
+                            ) from exc
+                        self._grants.pop(index)
+                        self._condition.notify_all()
+                        continue
+                    if identity != grant.client_identity:
+                        self._grants.pop(index)
+                        self._condition.notify_all()
+                        continue
+                    try:
+                        endpoints = self._connection_endpoints(grant.client_fd, family)
                     except (OSError, NetworkBrokerError):
+                        continue
+                    if endpoints != (grant.client_endpoint, grant.server_endpoint):
                         continue
                     selected = grant
                     try:

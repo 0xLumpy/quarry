@@ -516,33 +516,33 @@ class TestVerdictFoldsProviderTerminals:
 class TestCloudCheckTriState:
     def _mock(self, monkeypatch, behavior):
         from quarry_recon import cloud
-        monkeypatch.setattr(cloud.urllib.request, "urlopen", behavior)
-        return cloud
+        monkeypatch.setattr(cloud.fetch, "redirect_location", behavior)
+        return lambda url: cloud._check(object(), url)
 
     def test_transport_error_is_indeterminate_not_absent(self, monkeypatch):
-        def boom(req, timeout=8):
+        def boom(*_args, **_kwargs):
             raise urllib.error.URLError("dns fail")
-        assert self._mock(monkeypatch, boom)._check("https://x.s3.amazonaws.com/") == (None, None)
+        assert self._mock(monkeypatch, boom)("https://x.s3.amazonaws.com/") == (None, None)
 
     def test_timeout_is_indeterminate(self, monkeypatch):
-        def slow(req, timeout=8):
+        def slow(*_args, **_kwargs):
             raise socket.timeout("slow")
-        assert self._mock(monkeypatch, slow)._check("https://x.s3.amazonaws.com/")[0] is None
+        assert self._mock(monkeypatch, slow)("https://x.s3.amazonaws.com/")[0] is None
 
     def test_404_is_definitive_absence(self, monkeypatch):
-        def nf(req, timeout=8):
-            raise urllib.error.HTTPError("u", 404, "no", {}, None)
-        assert self._mock(monkeypatch, nf)._check("https://x.s3.amazonaws.com/") == (False, None)
+        def nf(*_args, **_kwargs):
+            return None, 404
+        assert self._mock(monkeypatch, nf)("https://x.s3.amazonaws.com/") == (False, None)
 
     def test_403_is_private_existing(self, monkeypatch):
-        def priv(req, timeout=8):
-            raise urllib.error.HTTPError("u", 403, "forbidden", {}, None)
-        assert self._mock(monkeypatch, priv)._check("https://x.s3.amazonaws.com/") == (True, "private")
+        def priv(*_args, **_kwargs):
+            return None, 403
+        assert self._mock(monkeypatch, priv)("https://x.s3.amazonaws.com/") == (True, "private")
 
     def test_5xx_is_indeterminate_not_absent(self, monkeypatch):
-        def err(req, timeout=8):
-            raise urllib.error.HTTPError("u", 503, "unavailable", {}, None)
-        assert self._mock(monkeypatch, err)._check("https://x.s3.amazonaws.com/") == (None, None)
+        def err(*_args, **_kwargs):
+            return None, 503
+        assert self._mock(monkeypatch, err)("https://x.s3.amazonaws.com/") == (None, None)
 
 
 class TestCloudDiscoverCoverage:

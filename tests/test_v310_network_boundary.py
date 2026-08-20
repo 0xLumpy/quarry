@@ -30,6 +30,7 @@ from quarry_recon import (
     oos_regex,
     policy,
     sources,
+    store,
 )
 from quarry_recon import cli as cli_mod
 from quarry_recon.network_broker import (
@@ -908,7 +909,7 @@ def test_oob_control_and_target_probe_have_disjoint_effect_authorities():
     ) is None
 
 
-def test_redirect_confirm_binds_its_exact_native_transport_source(monkeypatch):
+def test_redirect_confirm_binds_its_exact_native_transport_source(monkeypatch, tmp_path):
     seen = []
     monkeypatch.setattr(
         params_phase.fetch, "redirect_location",
@@ -918,7 +919,7 @@ def test_redirect_confirm_binds_its_exact_native_transport_source(monkeypatch):
         monkeypatch.setattr(params_phase.events, name, lambda *_args, **_kwargs: None)
     ctx = SimpleNamespace(
         scope=SimpleNamespace(active_allowed=lambda _host: True),
-        run=SimpleNamespace(add=lambda *_args, **_kwargs: True),
+        run=store.Run.create(tmp_path, "example.test"),
     )
     params_phase._redirect_confirm(
         ctx, ["https://example.test/?redirect=https%3A%2F%2Fold.test"],
@@ -2209,6 +2210,85 @@ def test_control_grant_close_fault_retains_exact_retry_authority(
             os.fstat(held)
         assert closed.value.errno == errno.EBADF
         assert injected == [held]
+    finally:
+        try:
+            real_close(held)
+        except OSError:
+            pass
+        client.close()
+        accepted.close()
+
+
+def test_consume_reaps_a_grant_closed_by_an_uncertain_prior_close(monkeypatch):
+    registry = network_broker.ControlEndpointRegistry()
+    client, accepted = socket.socketpair()
+    held = os.dup(client.fileno())
+    listener_identity = (123, 456)
+    request_id = "a" * 32
+    client_endpoint = ("127.0.0.1", 40000)
+    server_endpoint = ("127.0.0.1", 50000)
+    control = network_broker._ControlListener(
+        -1, "", 0, listener_identity, request_id, os.getpid(), -1,
+        object(), (), (), "pinned-browser-proxy",
+    )
+    grant = network_broker._ControlGrant(
+        listener_identity, control.owner_token, request_id, object(),
+        held, network_broker._socket_identity(client.fileno()), os.getpid(),
+        ("b" * 64, 1), socket.AF_INET, client_endpoint, server_endpoint,
+        committed=True,
+    )
+    registry._grants.append(grant)
+    monkeypatch.setattr(
+        network_broker, "_socket_metadata",
+        lambda _fd: (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP),
+    )
+    monkeypatch.setattr(
+        registry, "_connection_endpoints",
+        lambda fd, _family: (
+            (server_endpoint, client_endpoint)
+            if fd == accepted.fileno() else (client_endpoint, server_endpoint)
+        ),
+    )
+    real_close = network_broker.os.close
+    real_fstat = network_broker.os.fstat
+    close_effect = []
+    probe_fault = []
+
+    def close_then_raise(fd):
+        if fd == held and not close_effect:
+            real_close(fd)
+            close_effect.append(fd)
+            raise OSError(errno.EIO, "close completed with an uncertain result")
+        return real_close(fd)
+
+    def fstat_once_uninspectable(fd):
+        if fd == held and close_effect and not probe_fault:
+            probe_fault.append(fd)
+            raise OSError(errno.EIO, "injected post-close probe fault")
+        return real_fstat(fd)
+
+    monkeypatch.setattr(network_broker.os, "close", close_then_raise)
+    monkeypatch.setattr(network_broker.os, "fstat", fstat_once_uninspectable)
+    try:
+        with pytest.raises(
+                NetworkBrokerRefused,
+                match="network_broker_control_grant_close_failed"):
+            registry.consume_connection(
+                control, accepted_fd=accepted.fileno(),
+                deadline_monotonic=time.monotonic() + 1.0,
+                stop_event=threading.Event(),
+            )
+        assert registry._grants == [grant]
+
+        assert registry.consume_connection(
+            control, accepted_fd=accepted.fileno(),
+            deadline_monotonic=time.monotonic() + 0.02,
+            stop_event=threading.Event(),
+        ) is None
+        assert registry._grants == []
+        with pytest.raises(OSError) as closed:
+            real_fstat(held)
+        assert closed.value.errno == errno.EBADF
     finally:
         try:
             real_close(held)
