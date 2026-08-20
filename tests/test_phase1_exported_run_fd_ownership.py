@@ -125,7 +125,7 @@ def test_exported_run_fd_static_inventory_is_fully_owned():
     expected_sites = {
         Path(oob.__file__).resolve(): 1,
         Path(runner_repository.__file__).resolve(): 1,
-        Path(runner_native.__file__).resolve(): 7,
+        Path(runner_native.__file__).resolve(): 8,
     }
     for path, expected in expected_sites.items():
         tree = ast.parse(path.read_text(), filename=str(path))

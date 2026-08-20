@@ -43,11 +43,11 @@ def harness(monkeypatch, tmp_path):
     spec.loader.exec_module(m)
     state = {"pages": 0, "bal": 50, "raise_after": None}
 
-    def balance(key, timeout=15, cooldown=None):
+    def balance(key, timeout=15, cooldown=None, *, ctx=None, source_id="probe.favicon"):
         return probe.ShodanBalance(remaining=state["bal"], allowance=100, reserve=0,
                                    spendable=state["bal"], may_spend=True, reason="ok")
 
-    def page(key, facet, value, pg, *, sink=None):
+    def page(key, facet, value, pg, *, sink=None, ctx=None, source_id="probe.favicon"):
         state["pages"] += 1
         state["bal"] -= 1                                  # a search page costs ONE query credit
         if state["raise_after"] and state["pages"] >= state["raise_after"]:
@@ -62,7 +62,10 @@ def harness(monkeypatch, tmp_path):
         return (rows, 3, None)
 
     monkeypatch.setattr(probe, "_read_shodan_balance", balance)
-    monkeypatch.setattr(probe, "_shodan_count", lambda k, f, v: (3, b'{"total": 3}', None))
+    monkeypatch.setattr(
+        probe, "_shodan_count",
+        lambda k, f, v, *, ctx=None, source_id="probe.favicon": (3, b'{"total": 3}', None),
+    )
     monkeypatch.setattr(probe, "_shodan_page", page)
     monkeypatch.setattr(m.secrets, "shodan", lambda: "STUB")
     m.state = state
@@ -138,12 +141,12 @@ class TestItCannotPassWithoutProof:
         real = probe._read_shodan_balance
         seen = {"n": 0}
 
-        def blind(key, timeout=15, cooldown=None):
+        def blind(key, timeout=15, cooldown=None, *, ctx=None, source_id="probe.favicon"):
             seen["n"] += 1
             if seen["n"] > 4:                              # preflight + A's two reads, then go blind
                 return probe.ShodanBalance(remaining=None, allowance=None, reserve=0, spendable=None,
                                            may_spend=True, reason="unreadable", read_error="transport")
-            return real(key, timeout, cooldown)
+            return real(key, timeout, cooldown, ctx=ctx, source_id=source_id)
         monkeypatch.setattr(probe, "_read_shodan_balance", blind)
         assert harness.run_in(tmp_path / "p", "--run") != 0
 
@@ -189,8 +192,8 @@ class TestItCannotPassWithoutProof:
         catch. It must stop at A, not average the two numbers into a verdict."""
         real = probe._shodan_page
 
-        def double_charge(key, facet, value, pg, *, sink=None):
-            out = real(key, facet, value, pg, sink=sink)
+        def double_charge(key, facet, value, pg, *, sink=None, ctx=None, source_id="probe.favicon"):
+            out = real(key, facet, value, pg, sink=sink, ctx=ctx, source_id=source_id)
             harness.state["bal"] -= 1                       # a second credit Quarry never recorded
             return out
         monkeypatch.setattr(probe, "_shodan_page", double_charge)
@@ -267,12 +270,12 @@ class TestAMustBeExactlyTheExperimentBeforeBRuns:
         real = probe._shodan_page
         seen = {"n": 0}
 
-        def flaky(key, facet, value, pg, *, sink=None):
+        def flaky(key, facet, value, pg, *, sink=None, ctx=None, source_id="probe.favicon"):
             seen["n"] += 1
             if seen["n"] == 2:
                 err = RuntimeError("second pivot refused"); err.error_class = "server"
                 return ([], None, err)
-            return real(key, facet, value, pg, sink=sink)
+            return real(key, facet, value, pg, sink=sink, ctx=ctx, source_id=source_id)
         monkeypatch.setattr(probe, "_shodan_page", flaky)
         assert harness.run_in(tmp_path / "p", "--run") == 1
         rep = _report(tmp_path / "p")
@@ -313,10 +316,10 @@ class TestAPaidFailureStillLeavesARecord:
             armed["yes"] = True
             return out
 
-        def maybe_explode(key, timeout=15, cooldown=None):
+        def maybe_explode(key, timeout=15, cooldown=None, *, ctx=None, source_id="probe.favicon"):
             if armed["yes"]:
                 raise OSError("the balance endpoint went away")
-            return real_bal(key, timeout, cooldown)
+            return real_bal(key, timeout, cooldown, ctx=ctx, source_id=source_id)
         monkeypatch.setattr(probe, "_shodan_result", arm)
         monkeypatch.setattr(probe, "_read_shodan_balance", maybe_explode)
         assert harness.run_in(tmp_path / "p", "--run") == 1
