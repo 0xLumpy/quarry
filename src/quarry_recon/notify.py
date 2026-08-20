@@ -14,9 +14,10 @@ channel are configured. Best-effort: a failed notification never breaks a run, a
 from __future__ import annotations
 
 import json
-import urllib.request
+from types import SimpleNamespace
+from urllib.parse import urlunsplit
 
-from . import secrets
+from . import fetch, secrets
 
 EVENTS = ("complete", "error", "lead")     # run finished · phase/tool error · promising lead
 
@@ -27,6 +28,10 @@ VERDICT_WORDS = {"complete": "run completed",
 #: at most this many bullets per section, then a pointer at the manifest.
 _MAX_BULLETS = 5
 CHANNELS = ("slack", "discord", "telegram", "webhook")
+
+
+class NotificationTransportError(RuntimeError):
+    """A notification was refused before any unbound network effect."""
 
 
 def _cfg() -> dict:
@@ -51,39 +56,75 @@ def configured() -> bool:
     return bool(enabled_events() and channels())
 
 
-def _post(url: str, payload: dict, timeout: int = 10) -> None:
-    req = urllib.request.Request(url, data=json.dumps(payload).encode(), method="POST",
-                                 headers={"Content-Type": "application/json"})
-    urllib.request.urlopen(req, timeout=timeout).close()
+def _canonical_endpoint(url: str, name: str) -> str:
+    """Accept one canonical HTTPS endpoint, without ever rendering its secret path."""
+    try:
+        parts = fetch._validated_http_url(url)
+        host = fetch._canonical_http_host(parts.hostname)
+        rendered_host = f"[{host}]" if ":" in host else host
+        netloc = rendered_host + (f":{parts.port}" if parts.port is not None else "")
+        canonical = urlunsplit((parts.scheme, netloc, parts.path, parts.query, ""))
+    except (TypeError, ValueError):
+        raise NotificationTransportError("notification endpoint is not a canonical HTTPS URL") from None
+    if parts.scheme != "https" or parts.fragment or url != canonical:
+        raise NotificationTransportError("notification endpoint is not a canonical HTTPS URL")
+    if name == "slack" and (host != "hooks.slack.com" or parts.port not in (None, 443)):
+        raise NotificationTransportError("Slack endpoint is outside its fixed HTTPS authority")
+    if name == "discord" and (host != "discord.com" or parts.port not in (None, 443)):
+        raise NotificationTransportError("Discord endpoint is outside its fixed HTTPS authority")
+    if name == "telegram" and (host != "api.telegram.org" or parts.port not in (None, 443)):
+        raise NotificationTransportError("Telegram endpoint is outside its fixed HTTPS authority")
+    return canonical
 
 
-def _send_channel(name: str, target, title: str, body: str) -> None:
+def _context(run):
+    if fetch._network_scope(SimpleNamespace(run=run)) is None:
+        raise NotificationTransportError("notifications require a bound run network policy")
+    # Notification transport deliberately has no target scope or target pacing.
+    return SimpleNamespace(run=run, profile=SimpleNamespace(block_private_targets=False),
+                           scope=SimpleNamespace(active_allowed=lambda _host: False))
+
+
+def _post(run, name: str, url: str, payload: dict, timeout: int = 10) -> None:
+    endpoint = _canonical_endpoint(url, name)
+    status = fetch.scoped_operator_post(
+        _context(run), endpoint,
+        json.dumps(payload, separators=(",", ":")).encode("utf-8"), timeout=timeout,
+        source_id=f"notify.{name}",
+    )
+    if not 200 <= status < 300:
+        raise NotificationTransportError("notification transport was refused")
+
+
+def _send_channel(run, name: str, target, title: str, body: str) -> None:
     text = f"*{title}*\n{body}" if body else f"*{title}*"
     if name == "slack":
-        _post(target, {"text": text})
+        _post(run, name, target, {"text": text})
     elif name == "discord":
-        _post(target, {"content": text[:1900]})       # discord hard-caps message length
+        _post(run, name, target, {"content": text[:1900]})       # discord hard-caps message length
     elif name == "telegram":
         tok = (target or {}).get("token")
         chat = (target or {}).get("chat_id")
         if tok and chat:
-            _post(f"https://api.telegram.org/bot{tok}/sendMessage",
+            _post(run, name, f"https://api.telegram.org/bot{tok}/sendMessage",
                   {"chat_id": chat, "text": text})
     elif name == "webhook":
-        _post(target, {"title": title, "body": body})
+        _post(run, name, target, {"title": title, "body": body})
 
 
-def send(event: str, title: str, body: str = "") -> int:
+def send(event: str, title: str, body: str = "", *, run=None) -> int:
     """Send `event` to every configured channel that enabled it, redacted. Returns the count of channels
     notified. Best-effort — never raises."""
     if event not in enabled_events():
+        return 0
+    if run is None:
         return 0
     title = secrets.redact(title) or ""
     body = secrets.redact(body) or ""
     sent = 0
     for name, target in channels().items():
         try:
-            _send_channel(name, target, title, body)
+            _send_channel(run, name, target, title, body)
             sent += 1
         except Exception:
             continue
@@ -135,7 +176,8 @@ def completion_message(*, target: str, run_id: str, summary: dict, totals: str =
     return title, "\n".join(lines)
 
 
-def send_completion(*, target: str, run_id: str, summary: dict, totals: str = "", leads: int = 0) -> int:
+def send_completion(*, target: str, run_id: str, summary: dict, totals: str = "", leads: int = 0,
+                    run=None) -> int:
     """Send one consolidated run-completion message, whichever of `complete`/`lead` is enabled.
 
     `complete` sends always and carries any lead headline; `lead` alone sends only when there are leads.
@@ -149,17 +191,13 @@ def send_completion(*, target: str, run_id: str, summary: dict, totals: str = ""
         return 0
     title, body = completion_message(target=target, run_id=run_id, summary=summary,
                                      totals=totals, leads=leads)
-    return send(event, title, body)
+    # Keep the pure rendering/test seam positional; production run callers pass
+    # the explicit authority-bearing repository.
+    return send(event, title, body) if run is None else send(event, title, body, run=run)
 
 
 def send_test() -> int:
-    """Send a test message to every configured channel, bypassing event-gating. Returns channels reached."""
-    sent = 0
-    for name, target in channels().items():
-        try:
-            _send_channel(name, target, "Quarry notify test",
-                          "If you see this, the channel works.")
-            sent += 1
-        except Exception:
-            continue
-    return sent
+    """Refuse tests: this command has no run-bound network authority."""
+    raise NotificationTransportError(
+        "notify --test is unavailable: notification sends require a bound run network policy",
+    )

@@ -47,6 +47,19 @@ class TransportDoor:
     unsupported_reason: str
 
 
+_OPERATOR_ENDPOINT_TOKEN = object()
+
+
+@dataclass(frozen=True)
+class _OperatorEndpointAuthority:
+    """One process-local notification origin; paths and credentials stay out."""
+
+    token: object
+    source_id: str
+    host: str
+    port: int
+
+
 AUTHORITY_CLASSES = (
     "target",
     "public-provider",
@@ -318,6 +331,15 @@ AUXILIARY_TRANSPORT_DOORS = MappingProxyType(dict(_auxiliary_doors))
 TRANSPORT_DOORS = MappingProxyType({**_registered_doors, **_auxiliary_doors})
 del _sid, _helper
 
+_NOTIFY_PUBLIC_SOURCES = frozenset({
+    "notify.slack", "notify.discord", "notify.telegram",
+})
+_NOTIFY_PUBLIC_HOSTS = MappingProxyType({
+    "notify.slack": ("hooks.slack.com",),
+    "notify.discord": ("discord.com",),
+    "notify.telegram": ("api.telegram.org",),
+})
+
 _PROXY_BOUND_PROFILES = frozenset({
     "browser-pipe-proxy", "target-http-proxy", "nuclei-authorized-http",
     "oob-control-proxy",
@@ -376,7 +398,8 @@ def broker_transport_semantics(source_id: str, tool: str) -> dict[str, str]:
     resolver_mode = (
         "mediated-public"
         if (door.authority_class in {"target", "public-provider"}
-            or door.profile in _PROXY_BOUND_PROFILES)
+            or door.profile in _PROXY_BOUND_PROFILES
+            or door.profile == "operator-channel")
         and door.authority_class != "offline"
         else "none"
     )
@@ -1288,9 +1311,47 @@ class NetworkPolicyScope:
             raise NetworkPolicyError("network broker policy exceeds its trace envelope")
         return document
 
+    def operator_endpoint_authority(self, *, source_id: str, host: str,
+                                    port: int) -> _OperatorEndpointAuthority:
+        """Bind one configured notification origin without retaining its URL."""
+        from . import normalize
+
+        door = TRANSPORT_DOORS.get(source_id)
+        if (door is None or not door.supported or door.profile != "operator-channel"
+                or type(host) is not str or type(port) is not int
+                or isinstance(port, bool) or not 1 <= port <= 65535):
+            raise NetworkPolicyError("notification endpoint authority is invalid")
+        try:
+            canonical = str(ipaddress.ip_address(host))
+        except ValueError:
+            canonical = normalize.canon_host_strict(host)
+        if canonical is None or canonical != host:
+            raise NetworkPolicyError("notification endpoint authority is invalid")
+        if source_id in _NOTIFY_PUBLIC_SOURCES:
+            if canonical not in _NOTIFY_PUBLIC_HOSTS[source_id] or port != 443:
+                raise NetworkPolicyError("notification endpoint is outside fixed authority")
+        elif source_id != "notify.webhook":
+            raise NetworkPolicyError("notification endpoint source is invalid")
+        return _OperatorEndpointAuthority(
+            _OPERATOR_ENDPOINT_TOKEN, source_id, canonical, port,
+        )
+
+    @staticmethod
+    def _operator_endpoint_matches(authority, *, source_id: str,
+                                   host: str | None = None,
+                                   port: int | None = None) -> bool:
+        return (
+            type(authority) is _OperatorEndpointAuthority
+            and authority.token is _OPERATOR_ENDPOINT_TOKEN
+            and authority.source_id == source_id
+            and (host is None or authority.host == host)
+            and (port is None or authority.port == port)
+        )
+
     def decide_peer(self, peer: str, port: int, socket_type: int,
                     protocol: int, *, source_id: str,
-                    _runner_authority=None) -> PeerDecision:
+                    _runner_authority=None,
+                    _operator_authority=None) -> PeerDecision:
         """Re-snapshot interfaces and decide one exact kernel peer."""
         from . import netguard
 
@@ -1304,6 +1365,10 @@ class NetworkPolicyScope:
         door = TRANSPORT_DOORS.get(source_id)
         if door is None or not door.supported:
             raise NetworkPolicyError("native peer source has no exact transport door")
+        operator_endpoint = door.profile == "operator-channel"
+        if operator_endpoint and not self._operator_endpoint_matches(
+                _operator_authority, source_id=source_id, port=port):
+            raise NetworkPolicyError("notification peer lacks exact endpoint authority")
         if not door.helpers:
             # External tools never call this native classifier.  The sole
             # exception is the runner's pre-launch literal DNS bridge, which
@@ -1341,12 +1406,17 @@ class NetworkPolicyScope:
             decision, reason = "deny", "unspecified/multicast/broadcast peer"
         elif netguard.is_non_unicast_ip(value):
             decision, reason = "deny", "peer is not a unicast target address"
+        elif operator_endpoint and source_id in _NOTIFY_PUBLIC_SOURCES \
+                and netguard.is_private_ip(value):
+            decision, reason = "deny", "public notification resolved to private infrastructure"
         elif (door.authority_class == "public-provider"
               and netguard.is_private_ip(value)):
             decision, reason = "deny", "public provider resolved to private infrastructure"
-        elif door.authority_class not in {"target", "public-provider"}:
+        elif (door.authority_class not in {"target", "public-provider"}
+              and not operator_endpoint):
             decision, reason = "deny", "native peer authority class is not admitted"
-        elif self.block_private_targets and netguard.is_private_ip(value):
+        elif (self.block_private_targets and netguard.is_private_ip(value)
+              and not operator_endpoint):
             decision, reason = "deny", "private-target opt-out"
         else:
             decision, reason = "allow", "peer admitted by engagement policy"
@@ -1356,7 +1426,8 @@ class NetworkPolicyScope:
         )
 
     def host_allowed(self, host: str, *, source_id: str,
-                     _runner_authority=None) -> tuple[str, str]:
+                     _runner_authority=None,
+                     _operator_authority=None) -> tuple[str, str]:
         """Authorize a native transport authority before any DNS request."""
         from . import normalize
 
@@ -1366,6 +1437,7 @@ class NetworkPolicyScope:
         door = TRANSPORT_DOORS.get(source_id)
         if door is None or not door.supported:
             return "deny", "native HTTP source has no exact transport door"
+        operator_endpoint = door.profile == "operator-channel"
         if not door.helpers and not (
                 _runner_authority is _RUNNER_NATIVE_DNS_AUTHORITY
                 and door.broker_required and door.authority_class == "target"):
@@ -1376,6 +1448,11 @@ class NetworkPolicyScope:
             canonical = normalize.canon_host_strict(host)
             if canonical is None or canonical != host:
                 return "deny", "native HTTP authority is not canonical"
+            if operator_endpoint:
+                if self._operator_endpoint_matches(
+                        _operator_authority, source_id=source_id, host=canonical):
+                    return "allow", "exact configured notification authority"
+                return "deny", "notification authority does not match its endpoint"
             if source_id == "horizontal.cloud_buckets":
                 if (canonical == "storage.googleapis.com"
                         or _s3_bucket_authority_re.fullmatch(canonical) is not None):
@@ -1396,6 +1473,11 @@ class NetworkPolicyScope:
             return "allow", "native HTTP authority is inside active apex scope"
         if source_id == "horizontal.cloud_buckets":
             return "deny", "literal authority is outside cloud provider policy"
+        if operator_endpoint:
+            if self._operator_endpoint_matches(
+                    _operator_authority, source_id=source_id, host=str(address)):
+                return "allow", "exact configured literal notification authority"
+            return "deny", "notification authority does not match its endpoint"
         if door.authority_class != "target":
             return "deny", "literal authority is outside provider/control policy"
         if any(address.version == network.version and address in network

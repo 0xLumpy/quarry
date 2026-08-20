@@ -57,7 +57,8 @@ notify:
   webhook:  https://your.endpoint/quarry     # plain JSON POST, for anything else
 ```
 
-Check the configured channels with `quarry notify`, which shows and validates them without sending a run.
+`quarry notify` shows configured channels. `quarry notify --test` intentionally refuses: outbound
+notification transport is only authorized inside a run with its bound network policy.
 Notification content applies Quarry's configured-secret masking. In `v0.3.9` that is exact-value defense
 in depth, not proof against encoded, transformed, or split representations. Do not send target evidence to
 a notification channel unless that channel is approved for it; the release contract requires

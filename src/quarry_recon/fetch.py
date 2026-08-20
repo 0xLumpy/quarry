@@ -671,12 +671,16 @@ def _explicit_contact(scope, host, *, source_id, block_private):
     )
 
 
-def _contact(ctx, host, *, port, source_id="native-http"):
+def _contact(ctx, host, *, port, source_id="native-http",
+             operator_authority=None):
     if type(port) is not int or isinstance(port, bool) or not 1 <= port <= 65535:
         raise ValueError("native contact port is invalid")
     scope = _network_scope(ctx)
     if scope is not None:
-        decision, reason = scope.host_allowed(host, source_id=source_id)
+        decision, reason = scope.host_allowed(
+            host, source_id=source_id,
+            _operator_authority=operator_authority,
+        )
         if decision != "allow":
             request_id = _secrets.token_hex(16)
             scope.trace_native(
@@ -703,6 +707,7 @@ def _contact(ctx, host, *, port, source_id="native-http"):
             decision = scope.decide_peer(
                 peer, port, socket.SOCK_STREAM, socket.IPPROTO_TCP,
                 source_id=source_id,
+                _operator_authority=operator_authority,
             )
             if not decision.allowed:
                 denied.append(peer)
@@ -724,7 +729,7 @@ def _contact(ctx, host, *, port, source_id="native-http"):
 
 
 def _open_contact(ctx, host, contact, req, timeout, *, insecure=False,
-                  source_id="native-http"):
+                  source_id="native-http", operator_authority=None):
     """Persist admission, then open through one revalidated literal peer."""
     _validated_request_authority(req, host)
     scope = _network_scope(ctx)
@@ -765,6 +770,7 @@ def _open_contact(ctx, host, contact, req, timeout, *, insecure=False,
         peer_authority=(
             (lambda peer, port, socket_type, protocol: scope.decide_peer(
                 peer, port, socket_type, protocol, source_id=source_id,
+                _operator_authority=operator_authority,
             )) if scope is not None else None
         ),
         on_attempt=trace_attempt,
@@ -877,11 +883,19 @@ def _validated_http_url(url: str):
     if (parts.scheme not in {"http", "https"} or not parts.netloc or not host
             or parts.username is not None or parts.password is not None
             or "@" in parts.netloc or "\\" in parts.netloc
-            or "%" in host or normalize.canon_host_strict(host) is None):
+            or "%" in host or _canonical_http_host(host) is None):
         raise ValueError("request URL must be an absolute HTTP(S) URL without userinfo")
     if port is not None and not 1 <= port <= 65535:
         raise ValueError("request URL port is invalid")
     return parts
+
+
+def _canonical_http_host(host: str) -> str | None:
+    """Return one exact DNS or literal-IP HTTP authority, never a zone name."""
+    try:
+        return str(ipaddress.ip_address(host))
+    except ValueError:
+        return normalize.canon_host_strict(host)
 
 
 def _effective_http_port(parts) -> int:
@@ -895,7 +909,7 @@ def _validated_request_authority(req, expected_host: str):
         raise TypeError("native transport requires an exact urllib Request")
     parts = _validated_http_url(req.full_url)
     if (type(expected_host) is not str
-            or normalize.canon_host_strict(expected_host) != expected_host
+            or _canonical_http_host(expected_host) != expected_host
             or parts.hostname != expected_host
             or req.type != parts.scheme
             or req.host != parts.netloc
@@ -958,7 +972,7 @@ def _preflight_managed_request(
             frozen_headers[name] = value
     if origin_host is not None:
         if (type(origin_host) is not str
-                or normalize.canon_host_strict(origin_host) is None
+                or _canonical_http_host(origin_host) is None
                 or origin_host != parts.hostname):
             raise ValueError("managed acquisition origin host is invalid")
     if (type(timeout) not in {int, float} or isinstance(timeout, bool)
@@ -1015,7 +1029,8 @@ def redirect_location(ctx, url, origin_host=None, *, timeout=20,
 @contextlib.contextmanager
 def _walk(ctx, url, origin_host=None, *, timeout=20, data=None, method="GET", headers=None,
           max_redirects=DEFAULT_MAX_REDIRECTS, contact_attempt=None,
-          response_cleanup=None, source_id="native-http"):
+          response_cleanup=None, source_id="native-http",
+          operator_authority=None):
     """Walk the redirect chain with every guard and yield the terminal hop as `(resp, final, status,
     contacted)`; the response is still open, so the caller decides how the body is consumed. Shared by
     both body policies (bounded read and stream-to-disk) so one copy of the guards serves both.
@@ -1044,7 +1059,7 @@ def _walk(ctx, url, origin_host=None, *, timeout=20, data=None, method="GET", he
         # metadata; record a private/self lead (private space is contacted unless block_private_targets).
         _contact_result = _contact(
             ctx, cur_parts.hostname, port=_effective_http_port(cur_parts),
-            source_id=source_id,
+            source_id=source_id, operator_authority=operator_authority,
         )
         _st, _deny, _intel = _contact_result
         if _intel:
@@ -1058,7 +1073,7 @@ def _walk(ctx, url, origin_host=None, *, timeout=20, data=None, method="GET", he
             contact_attempt()
         status, rhdrs, resp = _open_contact(
             ctx, cur_parts.hostname, _contact_result, req, timeout,
-            source_id=source_id,
+            source_id=source_id, operator_authority=operator_authority,
         )
         with _response_lifetime(resp, response_cleanup):
             _validate_opened_response(status, rhdrs, resp)
@@ -1145,6 +1160,34 @@ def scoped_public_provider_get(ctx, url, origin_host=None, *, max_body=DEFAULT_M
         method=method, headers=headers, max_redirects=max_redirects,
         source_id=source_id, response_headers=response_headers,
     )
+
+
+def scoped_operator_post(ctx, url, payload: bytes, *, timeout=10,
+                         source_id: str) -> int:
+    """POST once to one configured notification origin under run authority.
+
+    Only the canonical host and port enter policy.  The URL path/query and body
+    can contain channel credentials, so neither is returned, traced, or included
+    in an exception.  Redirects are surfaced and therefore refused by callers.
+    """
+    if type(payload) is not bytes or len(payload) > 64 * 1024:
+        raise ValueError("notification payload is invalid")
+    scope = _network_scope(ctx)
+    if scope is None:
+        raise PermissionError("notification HTTP requires a bound NetworkPolicyScope")
+    parts = _validated_http_url(url)
+    if parts.scheme != "https":
+        raise ValueError("notification endpoint must use HTTPS")
+    authority = scope.operator_endpoint_authority(
+        source_id=source_id, host=parts.hostname,
+        port=_effective_http_port(parts),
+    )
+    with _walk(
+        ctx, url, timeout=timeout, data=payload, method="POST",
+        headers={"Content-Type": "application/json"}, max_redirects=0,
+        source_id=source_id, operator_authority=authority,
+    ) as (_response, _final, status, contacted):
+        return status if contacted else 0
 
 
 class Acquisition:

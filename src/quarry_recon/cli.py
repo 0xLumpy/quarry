@@ -472,10 +472,11 @@ def notify_cmd(test):
         return
     click.echo(f"channels: {', '.join(ch)} · events: {', '.join(sorted(ev)) or '(none set)'}")
     if test:
-        n = notify.send_test()
-        click.echo(_c(f"sent test to {n}/{len(ch)} channel(s)", "green" if n == len(ch) else "yellow"))
+        raise click.ClickException(
+            "notify --test is unavailable: notification sends require a bound run network policy",
+        )
     else:
-        click.echo("run `quarry notify --test` to send a test message.")
+        click.echo("notification sends are tested by a configured run under its bound network policy.")
 
 
 @cli.command("set")
@@ -1398,7 +1399,8 @@ def _run_phases_scoped(profile_path, phases, passive, timeout, prepare=None, fin
                 run_obj.notes.append(f"{name}: EXCEPTION {err}")
                 click.echo(_c(f"   ! {name} raised {err}", "red"))
                 from . import notify
-                notify.send("error", f"Quarry {run_obj.run_id} · {profile.target}: {name} phase raised", err)
+                notify.send("error", f"Quarry {run_obj.run_id} · {profile.target}: {name} phase raised", err,
+                            run=run_obj)
             p_wall = round(_time.perf_counter() - p_t0, 1)
             phase_metrics.append({"phase": name, "wall_s": p_wall,
                                   "cpu_s": round(metrics.rusage()[0] - p_cpu0, 2),
@@ -1564,7 +1566,7 @@ def _run_phases_scoped(profile_path, phases, passive, timeout, prepare=None, fin
         leads = n_sec + sum(1 for f in _fnds if f.get("severity") in ("critical", "high"))
         # one consolidated message, rendered from the manifest's structured fields
         notify.send_completion(target=profile.target, run_id=run_obj.run_id, summary=summ,
-                               totals=totals, leads=leads)
+                               totals=totals, leads=leads, run=run_obj)
     return run_obj      # the finished run; a campaign supervisor absorbs its evidence
 
 
