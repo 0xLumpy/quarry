@@ -3295,11 +3295,92 @@ def _semantic_identity(
         )
 
 
+def _semantic_taxonomy(
+    gate: dict, bodies: Mapping[str, bytes], **context: object,
+) -> None:
+    """Reconcile the one A-TAXONOMY artifact with its signed H0 collection."""
+    if gate["gate_id"] != "A-TAXONOMY":  # pragma: no cover - registry invariant
+        raise evidence.EvidenceError("taxonomy semantic verifier received the wrong gate")
+    taxonomy = evidence.read_pytest_taxonomy(bodies["classification-manifest"])
+    inputs = context["input_bodies"]
+    if not isinstance(inputs, Mapping):  # pragma: no cover - aggregate invariant
+        raise evidence.EvidenceError("taxonomy verifier requires verified scope input bodies")
+    try:
+        taxonomy_schema = evidence.load_json_bytes(inputs["pytest-taxonomy-schema"])
+        job_map_schema = evidence.load_json_bytes(inputs["verification-job-map-schema"])
+        workflow_body = inputs["verification-workflow-ci"]
+        job_map_body = inputs["verification-job-map"]
+    except KeyError as exc:  # pragma: no cover - frozen scope inventory invariant
+        raise evidence.EvidenceError("taxonomy verifier is missing a frozen taxonomy input") from exc
+    evidence._validate_registered_schema(
+        taxonomy_schema,
+        name="pytest-taxonomy",
+        record_version=evidence.PYTEST_TAXONOMY_SCHEMA,
+    )
+    evidence._validate_registered_schema(
+        job_map_schema,
+        name="verification-job-map",
+        record_version=evidence.VERIFICATION_JOB_MAP_SCHEMA,
+    )
+    evidence.read_verification_job_map(
+        job_map_body,
+        workflow_bodies={".github/workflows/ci.yml": workflow_body},
+    )
+
+    instances = context["report"]["instances"]
+    if len(instances) != 1 or instances[0]["lane"] != "H0-hermetic":
+        raise evidence.EvidenceError(
+            "A-TAXONOMY requires exactly one H0 classification evidence instance"
+        )
+    instance = instances[0]
+    if instance["environment"] != gate["environment"]:
+        raise evidence.EvidenceError(
+            "taxonomy evidence instance does not match the signed H0 environment"
+        )
+    selection = taxonomy["selection"]
+    if selection["mark_expression"] != "offline" or selection["keyword_expression"] != "":
+        raise evidence.EvidenceError(
+            "A-TAXONOMY must collect the exact offline marker with no keyword filter"
+        )
+    selected_by_lane = {
+        record["lane"]: record["selected"] for record in selection["selected_by_lane"]
+    }
+    if selection["selected"] == 0 or selected_by_lane["H0-hermetic"] != selection["selected"] or \
+            any(count for lane, count in selected_by_lane.items() if lane != "H0-hermetic"):
+        raise evidence.EvidenceError(
+            "A-TAXONOMY selection must contain only a positive H0 collection"
+        )
+    expected_counts = {
+        "collected": selection["collected"],
+        "deselected": selection["deselected"],
+        "failed": 0,
+        "passed": selection["selected"],
+        "selected": selection["selected"],
+        "skipped": 0,
+        "xfailed": 0,
+        "xpassed": 0,
+    }
+    if instance["selection"] != expected_counts or gate["selection"] != expected_counts:
+        raise evidence.EvidenceError(
+            "taxonomy collected/selected/deselected counts do not match signed evidence"
+        )
+    pytest_tools = [tool for tool in gate["toolchain"] if tool["name"] == "pytest"]
+    if len(pytest_tools) != 1 or taxonomy["collector"]["version"] != pytest_tools[0]["version"]:
+        raise evidence.EvidenceError(
+            "taxonomy collector does not match the attested pytest toolchain"
+        )
+    if taxonomy["collector"]["python_version"] != instance["environment"]["python"]:
+        raise evidence.EvidenceError(
+            "taxonomy collector Python does not match the signed H0 environment"
+        )
+
+
 # Only obligation-owned parsers whose complete supporting graph is recomputed
 # are promoted.  In particular C-PERF-PHASE-FAIRNESS stays fail-closed until a
 # typed per-obligation roster can be reconciled with C-POLICY-TRACE.
 SEMANTIC_VERIFIERS = MappingProxyType({
     "A-IDENTITY": _semantic_identity,
+    "A-TAXONOMY": _semantic_taxonomy,
     "C-NETWORK-BOUNDARY": _semantic_network_boundary,
     "C-NET-DENY": _semantic_network_denial,
     "C-FAULT-DISK": _semantic_resource_fault,
@@ -3313,7 +3394,7 @@ SEMANTIC_VERIFIERS = MappingProxyType({
 def _validate_supporting_artifacts(
     gate: dict, bodies: Mapping[str, bytes], *, identity: dict, report: dict,
     resolver: ArtifactResolver, scope: dict, support: dict, thresholds: dict,
-    policy: dict,
+    policy: dict, input_bodies: Mapping[str, bytes],
 ) -> None:
     gate_id = gate["gate_id"]
     verifier = SEMANTIC_VERIFIERS.get(gate_id)
@@ -3331,6 +3412,7 @@ def _validate_supporting_artifacts(
         support=support,
         thresholds=thresholds,
         policy=policy,
+        input_bodies=input_bodies,
     )
 
 
@@ -3716,6 +3798,7 @@ def aggregate_records(
                     support=support,
                     thresholds=thresholds,
                     policy=policy,
+                    input_bodies=input_bodies,
                 )
             summaries.append({
                 "artifacts": gate["artifacts"],

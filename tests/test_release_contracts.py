@@ -274,6 +274,46 @@ def _network_boundary_body(identity: dict, support: dict) -> bytes:
     })
 
 
+def _taxonomy_body(environment: dict, toolchain: list[dict]) -> bytes:
+    pytest_tools = [tool for tool in toolchain if tool["name"] == "pytest"]
+    assert len(pytest_tools) == 1
+    lanes = [
+        ("offline", "H0-hermetic", ["tests/taxonomy.py::test_offline"]),
+        ("integration", "H1-tool-integration", ["tests/taxonomy.py::test_integration"]),
+        ("corpus", "C0-private-corpus", ["tests/taxonomy.py::test_corpus"]),
+        ("packaging", "P0-package-supply", ["tests/taxonomy.py::test_packaging"]),
+        ("live", "L0-authorized-live", ["tests/taxonomy.py::test_live"]),
+    ]
+    return evidence.canonical_json_bytes({
+        "capabilities": [{
+            "name": "pytest", "nodes": ["tests/taxonomy.py::test_integration"],
+        }],
+        "collector": {
+            "name": "pytest",
+            "python_implementation": "CPython",
+            "python_version": environment["python"],
+            "version": pytest_tools[0]["version"],
+        },
+        "lanes": [
+            {"lane": lane, "marker": marker, "nodes": nodes}
+            for marker, lane, nodes in lanes
+        ],
+        "schema_version": evidence.PYTEST_TAXONOMY_SCHEMA,
+        "selection": {
+            "collected": 5,
+            "deselected": 4,
+            "keyword_expression": "",
+            "mark_expression": "offline",
+            "selected": 1,
+            "selected_by_lane": [
+                {"lane": lane, "selected": 1 if lane == "H0-hermetic" else 0}
+                for _marker, lane, _nodes in lanes
+            ],
+        },
+        "synthetic_process_nodes": [],
+    })
+
+
 def _supporting_bodies(
     gate_id: str, *, identity: dict, scope: dict, support: dict, thresholds: dict,
     benchmark: dict | None, measurements: list[dict], environment: dict,
@@ -283,6 +323,8 @@ def _supporting_bodies(
     bodies: dict[str, bytes] = {}
     if gate_id == "A-IDENTITY":
         bodies["identity-verification"] = contracts.canonical_json_line(identity)
+    elif gate_id == "A-TAXONOMY":
+        bodies["classification-manifest"] = _taxonomy_body(environment, toolchain)
     elif gate_id == "C-PACKAGE-BUILD":
         bodies["sdist"] = _synthetic_sdist()
         bodies["wheel"] = _synthetic_wheel()
@@ -600,7 +642,7 @@ def _ready_contracts(
     )
     corpus = _read("release/evidence/corpus-selection-v1.json", contracts.read_corpus_manifest)
     no_live = _read("release/evidence/no-live-rule-v1.json", contracts.read_no_live_rule)
-    support["tools"] = [{"digest": _digest("a"), "name": "synthetic-tool", "version": "1"}]
+    support["tools"] = [{"digest": _digest("a"), "name": "pytest", "version": "8.3.5"}]
     support["template_sets"] = [
         {"digest": _digest("b"), "name": "synthetic-templates", "version": "1"},
     ]
@@ -791,6 +833,15 @@ def _scenario(tmp_path: Path, *, approved_at: str = "2026-08-01T00:00:00Z"):
                     "reason": None,
                     "status": "pass",
                 }
+                selection = {
+                    "collected": 1, "deselected": 0, "failed": 0, "passed": 1,
+                    "selected": 1, "skipped": 0, "xfailed": 0, "xpassed": 0,
+                }
+                if gate_id == "A-TAXONOMY":
+                    selection = {
+                        "collected": 5, "deselected": 4, "failed": 0, "passed": 1,
+                        "selected": 1, "skipped": 0, "xfailed": 0, "xpassed": 0,
+                    }
                 instances.append({
                     "artifacts": [],
                     "assertions": [assertion],
@@ -798,10 +849,7 @@ def _scenario(tmp_path: Path, *, approved_at: str = "2026-08-01T00:00:00Z"):
                     "finished_at": instance_finished_at,
                     "id": f"instance-{instance_index:02d}",
                     "lane": environment["lane"],
-                    "selection": {
-                        "collected": 1, "deselected": 0, "failed": 0, "passed": 1,
-                        "selected": 1, "skipped": 0, "xfailed": 0, "xpassed": 0,
-                    },
+                    "selection": selection,
                     "started_at": gate_started_at,
                     "toolchain": supported_toolchain,
                 })
@@ -925,6 +973,8 @@ def _scenario(tmp_path: Path, *, approved_at: str = "2026-08-01T00:00:00Z"):
             "xfailed": 0,
             "xpassed": 0,
         }
+        if gate_id == "A-TAXONOMY":
+            selection = copy.deepcopy(instances[0]["selection"])
         rule = None
         reason = None
         status = "pass"
@@ -1419,13 +1469,13 @@ class TestIncompleteSemanticRegistry:
     def test_production_aggregation_refuses_unimplemented_obligation_semantics(self, tmp_path):
         assert set(contracts.SEMANTIC_VERIFIERS) == (
             set(contracts.RESOURCE_SEMANTIC_GATES)
-            | {"A-IDENTITY", "C-NETWORK-BOUNDARY", "C-NET-DENY"}
+            | {"A-IDENTITY", "A-TAXONOMY", "C-NETWORK-BOUNDARY", "C-NET-DENY"}
         )
         assert "C-PERF-PHASE-FAIRNESS" not in contracts.SEMANTIC_VERIFIERS
         arguments = _scenario(tmp_path)
         with pytest.raises(
             evidence.EvidenceError,
-            match="A-TAXONOMY has no registered obligation-specific semantic verifier",
+            match="A-EVIDENCE-SCHEMA has no registered obligation-specific semantic verifier",
         ):
             contracts.aggregate_records(**arguments)
 
@@ -1774,6 +1824,61 @@ class TestArtifactsAndAggregation:
         gate["selection"].update({"passed": 0, "skipped": 1})
         with pytest.raises(evidence.EvidenceError, match="passing gate"):
             evidence.validate_gate_record(gate, identity=arguments["identity"])
+
+    @pytest.mark.parametrize(
+        ("mutate", "expected"),
+        [
+            (
+                lambda taxonomy: taxonomy["collector"].update({"version": "forged"}),
+                "attested pytest toolchain",
+            ),
+            (
+                lambda taxonomy: taxonomy["selection"].update({"mark_expression": "packaging"}),
+                "exact offline marker",
+            ),
+        ],
+    )
+    def test_taxonomy_artifact_must_match_its_signed_h0_collector(self, tmp_path, mutate, expected):
+        arguments = _scenario(tmp_path)
+        indexed = next(
+            row for row in arguments["artifact_index"]["artifacts"]
+            if row["gate_id"] == "A-TAXONOMY" and row["name"] == "classification-manifest"
+        )
+        taxonomy = json.loads((arguments["artifact_root"] / indexed["path"]).read_bytes())
+        mutate(taxonomy)
+        _rewrite_supporting_artifact(
+            arguments,
+            "A-TAXONOMY",
+            "classification-manifest",
+            evidence.canonical_json_bytes(taxonomy),
+        )
+        with pytest.raises(evidence.EvidenceError, match=expected):
+            contracts.aggregate_records(**arguments)
+
+    def test_taxonomy_counts_must_match_the_signed_gate_and_evidence_report(self, tmp_path):
+        arguments = _scenario(tmp_path)
+
+        def mutate(report, gate):
+            counts = {
+                "collected": 5, "deselected": 0, "failed": 0, "passed": 5,
+                "selected": 5, "skipped": 0, "xfailed": 0, "xpassed": 0,
+            }
+            report["instances"][0]["selection"] = counts
+            gate["selection"] = counts
+
+        _rewrite_report(arguments, "A-TAXONOMY", mutate)
+        with pytest.raises(evidence.EvidenceError, match="collected/selected/deselected"):
+            contracts.aggregate_records(**arguments)
+
+    def test_taxonomy_reopens_the_bound_job_map_and_workflow(self, tmp_path):
+        arguments = _scenario(tmp_path)
+        job_map = json.loads(arguments["input_bodies"]["verification-job-map"])
+        job_map["jobs"][0]["selection"]["mark_expression"] = "offline"
+        arguments["input_bodies"]["verification-job-map"] = \
+            evidence.canonical_json_bytes(job_map) + b"\n"
+        _rebind_scenario(arguments)
+        with pytest.raises(evidence.EvidenceError, match="primary lane marker"):
+            contracts.aggregate_records(**arguments)
 
     @pytest.mark.parametrize("manifest", ["support", "threshold", "corpus"])
     def test_changed_accepted_manifest_rejects_unchanged_substantive_evidence(
