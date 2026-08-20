@@ -43,13 +43,15 @@ def _corpus(root: Path) -> tuple[Path, Path]:
         "# digest: signed-marker\n"
     )
     (templates / "intrusive.yaml").write_text(
-        "id: intrusive\ninfo:\n  severity: critical\n  tags: [intrusive]\nhttp: []\n"
+        "id: intrusive\ninfo:\n  severity: critical\n  tags: [intrusive]\n"
+        "http:\n- method: GET\n"
     )
     (templates / "takeover.yaml").write_text(
-        "id: takeover\ninfo:\n  severity: low\n  tags: [takeover]\ndns: []\n"
+        "id: takeover\ninfo:\n  severity: low\n  tags: [takeover]\n"
+        "dns:\n- name: '{{FQDN}}'\n  type: A\n"
     )
     (templates / "waf.yaml").write_text(
-        "id: waf\ninfo:\n  severity: info\n  tags: waf\nhttp: []\n"
+        "id: waf\ninfo:\n  severity: info\n  tags: waf\nhttp:\n- method: GET\n"
     )
     (cfg / ".templates-config.json").write_text('{"nuclei-templates-version":"v10"}\n')
     (cfg / ".nuclei-ignore").write_text("tags: []\nfiles: []\n")
@@ -83,6 +85,11 @@ def test_offline_inventory_selects_each_owner_and_binds_helpers(tmp_path, fixed_
     assert [row["path"] for row in document["helpers"]] == ["helpers/payload.txt"]
     assert next(row for row in owners["params.nuclei_scan"]["selected_templates"]
                 if row["id"] == "broad")["signature_state"] == "digest-marker-present-unverified"
+    assert next(row for row in owners["params.nuclei_scan"]["selected_templates"]
+                if row["id"] == "broad")["request_protocols"] == ["http"]
+    assert owners["params.nuclei_takeover"]["selected_templates"][0]["primary_protocol"] == "dns"
+    assert [row["protocol"] for row in owners["params.nuclei_scan"]["protocol_partitions"]] \
+        == ["http", "dns", "tcp"]
     assert document["engine"]["declared_pin"] == "v3.11.0"
     nuclei_policy.validate_document(json.loads(json.dumps(document)))
 
@@ -176,6 +183,9 @@ def test_validator_rejects_redigested_coverage_or_flag_policy_forgery(
             owner["selected_templates"][0]["tags"].sort()
             owner["selection_digest"] = nuclei_policy._sha256(
                 nuclei_policy._canonical(owner["selected_templates"]),
+            )
+            owner["protocol_partitions"] = nuclei_policy._protocol_partitions(
+                owner["selected_templates"],
             )
         changed["policy_digest"] = None
         changed["policy_digest"] = nuclei_policy._sha256(nuclei_policy._canonical(changed))
@@ -362,10 +372,10 @@ def test_ignore_file_is_applied_to_exact_owner_selection(tmp_path, fixed_setting
     monkeypatch.setattr(nuclei_policy.secrets, "oob", lambda: {})
     templates, cfg = _corpus(tmp_path)
     (templates / "ignored-tag.yaml").write_text(
-        "id: ignored-tag\ninfo:\n  severity: high\n  tags: [local]\nhttp: []\n"
+        "id: ignored-tag\ninfo:\n  severity: high\n  tags: [local]\nhttp:\n- method: GET\n"
     )
     (templates / "ignored-file.yaml").write_text(
-        "id: ignored-file\ninfo:\n  severity: high\n  tags: [cve]\nhttp: []\n"
+        "id: ignored-file\ninfo:\n  severity: high\n  tags: [cve]\nhttp:\n- method: GET\n"
     )
     (cfg / ".nuclei-ignore").write_text(
         "tags: [local]\nfiles: [ignored-file.yaml]\n"
@@ -388,9 +398,6 @@ def test_semantic_risk_is_versioned_reconciled_telemetry_not_a_filter(
         "id: state-change\ninfo:\n  severity: high\n  tags: [cve]\n"
         "http:\n- method: POST\n  body: enabled=true\n"
     )
-    (templates / "unknown.yaml").write_text(
-        "id: unknown-shape\ninfo:\n  severity: high\n  tags: [cve]\ncustom-protocol: true\n"
-    )
     document = nuclei_policy.build_document(
         run_id="semantic", profile=_profile(), template_root=templates, config_root=cfg,
         engine_identity=_engine(),
@@ -398,13 +405,81 @@ def test_semantic_risk_is_versioned_reconciled_telemetry_not_a_filter(
     main = next(row for row in document["owners"] if row["owner"] == "params.nuclei_scan")
     selected = {row["id"]: row for row in main["selected_templates"]}
     assert selected["state-change"]["semantic_class"] == "potentially_state_changing"
-    assert selected["unknown-shape"]["semantic_class"] == "unknown"
-    assert {"broad", "state-change", "unknown-shape"} == set(selected)
+    assert {"broad", "state-change"} == set(selected)
     assert main["semantic_inventory"]["counts"] == {
-        "not_detected": 1, "potentially_state_changing": 1, "unknown": 1,
+        "not_detected": 1, "potentially_state_changing": 1, "unknown": 0,
     }
     assert document["semantic_classifier"]["effect"] == "telemetry-only-never-filters-selection"
     nuclei_policy.validate_document(document)
+
+
+def test_mixed_dns_http_template_has_engine_primary_dns_and_one_partition(
+        tmp_path, fixed_settings, monkeypatch):
+    monkeypatch.setattr(nuclei_policy.secrets, "oob", lambda: {})
+    templates, cfg = _corpus(tmp_path)
+    (templates / "mixed.yaml").write_text(
+        "id: mixed-dns-http\ninfo: {severity: high, tags: [cve]}\n"
+        "dns:\n- name: '{{FQDN}}'\n  type: A\n"
+        "http:\n- method: GET\n"
+    )
+    (templates / "tcp.yaml").write_text(
+        "id: tcp-only\ninfo: {severity: high, tags: [cve]}\n"
+        "tcp:\n- host: ['{{Hostname}}']\n"
+    )
+    document = nuclei_policy.build_document(
+        run_id="mixed-protocol", profile=_profile(oob=False), template_root=templates,
+        config_root=cfg, engine_identity=_engine(), engine_pin="v3.11.0",
+    )
+    owner = next(row for row in document["owners"] if row["owner"] == "params.nuclei_scan")
+    selected = next(row for row in owner["selected_templates"] if row["id"] == "mixed-dns-http")
+    assert selected["primary_protocol"] == "dns"
+    assert selected["request_protocols"] == ["dns", "http"]
+    partitions = {row["protocol"]: row for row in owner["protocol_partitions"]}
+    assert "mixed.yaml" in partitions["dns"]["selected_paths"]
+    assert "mixed.yaml" not in partitions["http"]["selected_paths"]
+    assert partitions["tcp"]["selected_paths"] == ["tcp.yaml"]
+    assert sum(row["selected_count"] for row in partitions.values()) == owner["selected_count"]
+
+
+@pytest.mark.parametrize(("request_body", "message"), [
+    ("custom-protocol: true\n", "no canonical request protocol"),
+    ("http: {method: GET}\n", "malformed request sections"),
+    ("http:\n- method: GET\nrequests:\n- method: GET\n", "mutually exclusive request aliases"),
+    ("tcp:\n- host: ['{{Hostname}}']\nnetwork:\n- host: ['{{Hostname}}']\n",
+     "mutually exclusive request aliases"),
+    ("http:\n- method: GET\nssl:\n- address: '{{Host}}:443'\n", "unsupported request protocols"),
+])
+def test_selected_protocol_metadata_fails_closed_on_unknown_malformed_or_unsupported(
+        tmp_path, fixed_settings, monkeypatch, request_body, message):
+    monkeypatch.setattr(nuclei_policy.secrets, "oob", lambda: {})
+    templates, cfg = _corpus(tmp_path)
+    (templates / "invalid-protocol.yaml").write_text(
+        "id: invalid-protocol\ninfo: {severity: high, tags: [cve]}\n" + request_body
+    )
+    with pytest.raises(nuclei_policy.NucleiPolicyError, match=message):
+        nuclei_policy.build_document(
+            run_id="invalid-protocol", profile=_profile(oob=False), template_root=templates,
+            config_root=cfg, engine_identity=_engine(), engine_pin="v3.11.0",
+        )
+
+
+def test_validator_rejects_redigested_non_disjoint_protocol_partition(
+        tmp_path, fixed_settings, monkeypatch):
+    monkeypatch.setattr(nuclei_policy.secrets, "oob", lambda: {})
+    templates, cfg = _corpus(tmp_path)
+    document = nuclei_policy.build_document(
+        run_id="partition-forgery", profile=_profile(oob=False), template_root=templates,
+        config_root=cfg, engine_identity=_engine(), engine_pin="v3.11.0",
+    )
+    changed = json.loads(json.dumps(document))
+    owner = next(row for row in changed["owners"] if row["owner"] == "params.nuclei_scan")
+    http, dns, _tcp = owner["protocol_partitions"]
+    dns["selected_paths"].append(http["selected_paths"][0])
+    dns["selected_count"] += 1
+    changed["policy_digest"] = None
+    changed["policy_digest"] = nuclei_policy._sha256(nuclei_policy._canonical(changed))
+    with pytest.raises(nuclei_policy.NucleiPolicyError, match="disjoint complete"):
+        nuclei_policy.validate_document(changed)
 
 
 def test_active_nuclei_flags_config_is_refused(tmp_path, fixed_settings, monkeypatch):
@@ -493,7 +568,8 @@ def test_mutation_between_inventory_and_parse_is_refused(
         rows = original(root)
         if Path(root) == templates:
             (templates / "broad.yaml").write_text(
-                "id: replacement\ninfo:\n  severity: high\n  tags: [cve]\nhttp: []\n"
+                "id: replacement\ninfo:\n  severity: high\n  tags: [cve]\n"
+                "http:\n- method: GET\n"
             )
         return rows
 
@@ -576,22 +652,25 @@ def test_engine_format_and_yaml_metadata_parity(tmp_path, fixed_settings, monkey
     monkeypatch.setattr(nuclei_policy.secrets, "oob", lambda: {})
     templates, cfg = _corpus(tmp_path)
     (templates / "active.json").write_text(json.dumps({
-        "id": "json-active", "info": {"severity": "high", "tags": ["cve"]}, "http": [],
+        "id": "json-active", "info": {"severity": "high", "tags": ["cve"]},
+        "http": [{"method": "GET"}],
     }))
     (templates / "flow.yaml").write_text(
-        '{"id": "flow-active", "info": {"severity": "high", "tags": ["cve"]}, "http": []}\n'
+        '{"id": "flow-active", "info": {"severity": "high", "tags": ["cve"]}, '
+        '"http": [{"method": "GET"}]}\n'
     )
     (templates / "unsupported.yml").write_text(
-        "id: yml-active\ninfo: {severity: high, tags: [cve]}\nhttp: []\n"
+        "id: yml-active\ninfo: {severity: high, tags: [cve]}\nhttp:\n- method: GET\n"
     )
     archive = templates / "cves.json-archive"
     archive.mkdir()
     (archive / "kept.yaml").write_text(
-        "id: config-name-in-directory\ninfo: {severity: high, tags: [cve]}\nhttp: []\n"
+        "id: config-name-in-directory\ninfo: {severity: high, tags: [cve]}\n"
+        "http:\n- method: GET\n"
     )
     (templates / "prefix-cves.json-suffix.json").write_text(json.dumps({
         "id": "known-config-basename", "info": {"severity": "high", "tags": ["cve"]},
-        "http": [],
+        "http": [{"method": "GET"}],
     }))
     document = nuclei_policy.build_document(
         run_id="formats", profile=_profile(oob=False), template_root=templates, config_root=cfg,
@@ -631,7 +710,7 @@ def test_ignore_wildcard_does_not_cross_directory_separator(
     shallow = templates / "http" / "one"
     deep = shallow / "two"
     deep.mkdir(parents=True)
-    body = "info: {severity: high, tags: [cve]}\nhttp: []\n"
+    body = "info: {severity: high, tags: [cve]}\nhttp:\n- method: GET\n"
     (shallow / "blocked.yaml").write_text("id: shallow-blocked\n" + body)
     (deep / "blocked.yaml").write_text("id: deep-kept\n" + body)
     document = nuclei_policy.build_document(
@@ -676,7 +755,8 @@ def test_duplicate_selected_template_ids_are_refused(tmp_path, fixed_settings, m
     templates, cfg = _corpus(tmp_path)
     for name in ("duplicate-a", "duplicate-b"):
         (templates / f"{name}.yaml").write_text(
-            "id: duplicate-id\ninfo:\n  severity: high\n  tags: [cve]\nhttp: []\n"
+            "id: duplicate-id\ninfo:\n  severity: high\n  tags: [cve]\n"
+            "http:\n- method: GET\n"
         )
     with pytest.raises(nuclei_policy.NucleiPolicyError, match="duplicate template id"):
         nuclei_policy.build_document(
@@ -888,6 +968,7 @@ def test_validator_reconstructs_and_requires_the_complete_owner_selection(
     owner["selected_templates"] = []
     owner["selected_count"] = 0
     owner["selection_digest"] = nuclei_policy._sha256(nuclei_policy._canonical([]))
+    owner["protocol_partitions"] = nuclei_policy._protocol_partitions([])
     owner["semantic_inventory"] = {
         "classifier": "quarry.nuclei-semantic-risk.v1",
         "counts": {name: 0 for name in ("not_detected", "potentially_state_changing", "unknown")},

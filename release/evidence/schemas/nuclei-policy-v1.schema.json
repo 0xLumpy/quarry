@@ -174,12 +174,12 @@
     },
     "selectedTemplate": {
       "type": "object", "additionalProperties": false,
-      "required": ["id", "path", "sha256", "severity", "tags", "signature_state", "signature_marker_digest", "semantic_class", "semantic_reasons"],
-      "properties": {"id": {"type": "string", "minLength": 1}, "path": {"type": "string", "minLength": 1}, "sha256": {"$ref": "#/$defs/contentDigest"}, "severity": {"type": "string", "minLength": 1}, "tags": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true}, "signature_state": {"enum": ["digest-marker-present-unverified", "unsigned"]}, "signature_marker_digest": {"anyOf": [{"$ref": "#/$defs/contentDigest"}, {"type": "null"}]}, "semantic_class": {"enum": ["not_detected", "potentially_state_changing", "unknown"]}, "semantic_reasons": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true}}
+      "required": ["id", "path", "sha256", "severity", "tags", "signature_state", "signature_marker_digest", "primary_protocol", "request_protocols", "semantic_class", "semantic_reasons"],
+      "properties": {"id": {"type": "string", "minLength": 1}, "path": {"type": "string", "minLength": 1}, "sha256": {"$ref": "#/$defs/contentDigest"}, "severity": {"type": "string", "minLength": 1}, "tags": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true}, "signature_state": {"enum": ["digest-marker-present-unverified", "unsigned"]}, "signature_marker_digest": {"anyOf": [{"$ref": "#/$defs/contentDigest"}, {"type": "null"}]}, "primary_protocol": {"enum": ["http", "dns", "tcp"]}, "request_protocols": {"type": "array", "minItems": 1, "items": {"enum": ["http", "dns", "tcp"]}, "uniqueItems": true}, "semantic_class": {"enum": ["not_detected", "potentially_state_changing", "unknown"]}, "semantic_reasons": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true}}
     },
     "templateInventoryRow": {
       "type": "object", "additionalProperties": false,
-      "required": ["id", "path", "bytes", "sha256", "severity", "tags", "signature_state", "signature_marker_digest", "load_state", "required_capabilities", "semantic_class", "semantic_reasons", "helper_paths"],
+      "required": ["id", "path", "bytes", "sha256", "severity", "tags", "signature_state", "signature_marker_digest", "load_state", "required_capabilities", "primary_protocol", "request_protocols", "semantic_class", "semantic_reasons", "helper_paths"],
       "properties": {
         "id": {"type": "string", "minLength": 1}, "path": {"type": "string", "minLength": 1},
         "bytes": {"type": "integer", "minimum": 0}, "sha256": {"$ref": "#/$defs/contentDigest"},
@@ -189,6 +189,8 @@
         "signature_marker_digest": {"anyOf": [{"$ref": "#/$defs/contentDigest"}, {"type": "null"}]},
         "load_state": {"enum": ["loaded", "load-excluded", "metadata-rejected"]},
         "required_capabilities": {"type": "array", "items": {"enum": ["headless", "code", "javascript", "dast", "self-contained", "file"]}, "uniqueItems": true},
+        "primary_protocol": {"enum": ["dns", "file", "http", "headless", "tcp", "ssl", "websocket", "whois", "code", "javascript", "workflow", null]},
+        "request_protocols": {"type": "array", "items": {"enum": ["dns", "file", "http", "headless", "tcp", "ssl", "websocket", "whois", "code", "javascript", "workflow"]}, "uniqueItems": true},
         "semantic_class": {"enum": ["not_detected", "potentially_state_changing", "unknown"]},
         "semantic_reasons": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
         "helper_paths": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true}
@@ -213,10 +215,20 @@
         "unknown": {"type": "array", "items": {"$ref": "#/$defs/semanticRef"}}
       }
     },
+    "protocolPartition": {
+      "type": "object", "additionalProperties": false,
+      "required": ["protocol", "selected_count", "selected_paths", "selection_digest"],
+      "properties": {
+        "protocol": {"enum": ["http", "dns", "tcp"]},
+        "selected_count": {"type": "integer", "minimum": 0},
+        "selected_paths": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
+        "selection_digest": {"$ref": "#/$defs/contentDigest"}
+      }
+    },
     "owner": {
       "type": "object", "additionalProperties": false,
-      "required": ["owner", "description", "flags", "private_config", "oob_enabled", "oob_backend", "oob_config_identity", "channel_digest", "flags_digest", "selected_count", "selected_templates", "selection_digest", "semantic_inventory"],
-      "properties": {"owner": {"type": "string", "minLength": 1}, "description": {"type": "string", "minLength": 1}, "flags": {"type": "array", "items": {"type": "string", "minLength": 1}}, "private_config": {"enum": [null, "interactsh-token"]}, "oob_enabled": {"type": "boolean"}, "oob_backend": {"enum": ["off", "public-interactsh", "self-hosted"]}, "oob_config_identity": {"anyOf": [{"$ref": "#/$defs/contentDigest"}, {"type": "null"}]}, "channel_digest": {"$ref": "#/$defs/contentDigest"}, "flags_digest": {"$ref": "#/$defs/contentDigest"}, "selected_count": {"type": "integer", "minimum": 0}, "selected_templates": {"type": "array", "items": {"$ref": "#/$defs/selectedTemplate"}}, "selection_digest": {"$ref": "#/$defs/contentDigest"}, "semantic_inventory": {"$ref": "#/$defs/semanticInventory"}}
+      "required": ["owner", "description", "flags", "private_config", "oob_enabled", "oob_backend", "oob_config_identity", "channel_digest", "flags_digest", "selected_count", "selected_templates", "selection_digest", "protocol_partitions", "semantic_inventory"],
+      "properties": {"owner": {"type": "string", "minLength": 1}, "description": {"type": "string", "minLength": 1}, "flags": {"type": "array", "items": {"type": "string", "minLength": 1}}, "private_config": {"enum": [null, "interactsh-token"]}, "oob_enabled": {"type": "boolean"}, "oob_backend": {"enum": ["off", "public-interactsh", "self-hosted"]}, "oob_config_identity": {"anyOf": [{"$ref": "#/$defs/contentDigest"}, {"type": "null"}]}, "channel_digest": {"$ref": "#/$defs/contentDigest"}, "flags_digest": {"$ref": "#/$defs/contentDigest"}, "selected_count": {"type": "integer", "minimum": 0}, "selected_templates": {"type": "array", "items": {"$ref": "#/$defs/selectedTemplate"}}, "selection_digest": {"$ref": "#/$defs/contentDigest"}, "protocol_partitions": {"type": "array", "minItems": 3, "maxItems": 3, "prefixItems": [{"allOf": [{"$ref": "#/$defs/protocolPartition"}, {"properties": {"protocol": {"const": "http"}}}]}, {"allOf": [{"$ref": "#/$defs/protocolPartition"}, {"properties": {"protocol": {"const": "dns"}}}]}, {"allOf": [{"$ref": "#/$defs/protocolPartition"}, {"properties": {"protocol": {"const": "tcp"}}}]}], "items": false}, "semantic_inventory": {"$ref": "#/$defs/semanticInventory"}}
     },
     "channel": {
       "type": "object", "additionalProperties": false,

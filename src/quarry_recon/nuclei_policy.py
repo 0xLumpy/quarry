@@ -71,9 +71,28 @@ _yaml_depth_bound = 96
 _yaml_event_loader = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
 _semantic_classifier = "quarry.nuclei-semantic-risk.v1"
 _semantic_classes = ("not_detected", "potentially_state_changing", "unknown")
+_ENGINE_PROTOCOL_SECTIONS = (
+    ("dns", ("dns",)),
+    ("file", ("file",)),
+    ("http", ("http", "requests")),
+    ("headless", ("headless",)),
+    ("tcp", ("network", "tcp")),
+    ("ssl", ("ssl",)),
+    ("websocket", ("websocket",)),
+    ("whois", ("whois",)),
+    ("code", ("code",)),
+    ("javascript", ("javascript",)),
+    ("workflow", ("workflows",)),
+)
+_ENGINE_PROTOCOLS = tuple(protocol for protocol, _sections in _ENGINE_PROTOCOL_SECTIONS)
+_POLICY_REQUEST_PROTOCOLS = ("http", "dns", "tcp")
+_PRIMARY_PROTOCOL_ORDER = tuple(
+    protocol for protocol in _ENGINE_PROTOCOLS if protocol in _POLICY_REQUEST_PROTOCOLS
+)
 _selected_template_fields = (
     "id", "path", "sha256", "severity", "tags", "signature_state",
-    "signature_marker_digest", "semantic_class", "semantic_reasons",
+    "signature_marker_digest", "primary_protocol", "request_protocols",
+    "semantic_class", "semantic_reasons",
 )
 
 
@@ -494,6 +513,58 @@ def _required_load_capabilities(document: dict) -> list[str]:
     return [name for name in _LOAD_BLOCKING_CAPABILITIES if name in required]
 
 
+def _request_protocol_metadata(document: dict, *, label: str,
+                               selected_candidate: bool) -> tuple[str | None, list[str]]:
+    """Return v3.11's canonical request protocols and primary protocol.
+
+    The ordering mirrors ``Template.Type`` rather than alphabetical order. Deprecated YAML aliases
+    collapse to the engine's canonical protocol name. Only a template that would otherwise enter an
+    owner selection is held to the accepted transport set; excluded corpus rows remain inventoried.
+    """
+    active: list[str] = []
+    malformed: list[str] = []
+    alias_collisions: list[str] = []
+    for protocol, sections in _ENGINE_PROTOCOL_SECTIONS:
+        protocol_active = False
+        active_sections: list[str] = []
+        for section in sections:
+            if section not in document:
+                continue
+            value = document[section]
+            if type(value) is not list:
+                malformed.append(section)
+            elif value:
+                protocol_active = True
+                active_sections.append(section)
+        if protocol in {"http", "tcp"} and len(active_sections) > 1:
+            alias_collisions.append("/".join(active_sections))
+        if protocol_active:
+            active.append(protocol)
+    primary = active[0] if active else None
+    if selected_candidate:
+        if malformed:
+            raise NucleiPolicyError(
+                f"Nuclei selected template {label} has malformed request sections: "
+                + ", ".join(malformed)
+            )
+        if alias_collisions:
+            raise NucleiPolicyError(
+                f"Nuclei selected template {label} uses mutually exclusive request aliases: "
+                + ", ".join(alias_collisions)
+            )
+        if primary is None:
+            raise NucleiPolicyError(
+                f"Nuclei selected template {label} has no canonical request protocol"
+            )
+        unsupported = [protocol for protocol in active if protocol not in _POLICY_REQUEST_PROTOCOLS]
+        if unsupported:
+            raise NucleiPolicyError(
+                f"Nuclei selected template {label} requires unsupported request protocols: "
+                + ", ".join(unsupported)
+            )
+    return primary, active
+
+
 def _semantic_risk(raw: bytes, document: dict | None = None) -> tuple[str, list[str]]:
     """Versioned, deliberately non-blocking request-semantic telemetry.
 
@@ -751,6 +822,8 @@ def _template_rows(root: Path, inventory: list[dict], ignore: dict) -> list[dict
                 "signature_marker_digest": _sha256(marker.group(0)) if marker else None,
                 "load_state": "metadata-rejected",
                 "required_capabilities": [],
+                "primary_protocol": None,
+                "request_protocols": [],
                 "semantic_class": "unknown",
                 "semantic_reasons": ["metadata-rejected"],
                 "helper_paths": [],
@@ -776,6 +849,14 @@ def _template_rows(root: Path, inventory: list[dict], ignore: dict) -> list[dict
         required_capabilities = _required_load_capabilities(document)
         row["load_state"] = "load-excluded" if required_capabilities else "loaded"
         row["required_capabilities"] = required_capabilities
+        primary_protocol, request_protocols = _request_protocol_metadata(
+            document, label=relative,
+            selected_candidate=(
+                row["load_state"] == "loaded" and _basic_eligible(row) and not _ignored(row, ignore)
+            ),
+        )
+        row["primary_protocol"] = primary_protocol
+        row["request_protocols"] = request_protocols
         if _basic_eligible(row) and not _ignored(row, ignore):
             helper_paths: set[str] = set()
             for scalar in _walk_scalars(document):
@@ -895,6 +976,17 @@ def _selection(owner: str, templates: list[dict], ignore: dict | None = None) ->
     selected = sorted(selected, key=lambda row: row["path"].encode("utf-8"))
     ids: dict[str, str] = {}
     for row in selected:
+        protocols = row.get("request_protocols")
+        primary = row.get("primary_protocol")
+        if (type(protocols) is not list or not protocols
+                or any(protocol not in _POLICY_REQUEST_PROTOCOLS for protocol in protocols)
+                or primary not in _POLICY_REQUEST_PROTOCOLS
+                or primary != next(
+                    (protocol for protocol in _PRIMARY_PROTOCOL_ORDER if protocol in protocols), None
+                )):
+            raise NucleiPolicyError(
+                f"Nuclei owner {owner} has contradictory request protocols for {row['path']}"
+            )
         prior = ids.setdefault(row["id"], row["path"])
         if prior != row["path"]:
             raise NucleiPolicyError(
@@ -906,6 +998,19 @@ def _selection(owner: str, templates: list[dict], ignore: dict | None = None) ->
 
 def _selected_template_row(row: dict) -> dict:
     return {key: row[key] for key in _selected_template_fields}
+
+
+def _protocol_partitions(selection_rows: list[dict]) -> list[dict]:
+    partitions = []
+    for protocol in _POLICY_REQUEST_PROTOCOLS:
+        rows = [row for row in selection_rows if row["primary_protocol"] == protocol]
+        partitions.append({
+            "protocol": protocol,
+            "selected_count": len(rows),
+            "selected_paths": [row["path"] for row in rows],
+            "selection_digest": _sha256(_canonical(rows)),
+        })
+    return partitions
 
 
 def _engine_identity() -> tuple[dict, str | None]:
@@ -1132,6 +1237,7 @@ def build_document(*, run_id: str, profile, template_root: Path, config_root: Pa
             "selected_count": len(selection_rows),
             "selected_templates": selection_rows,
             "selection_digest": _sha256(_canonical(selection_rows)),
+            "protocol_partitions": _protocol_partitions(selection_rows),
             "semantic_inventory": {
                 "classifier": _semantic_classifier,
                 "counts": semantic_counts,
@@ -1427,7 +1533,7 @@ def validate_document(document: dict) -> None:
     template_keys = {
         "id", "path", "bytes", "sha256", "severity", "tags", "signature_state",
         "signature_marker_digest", "load_state", "required_capabilities", "semantic_class",
-        "semantic_reasons", "helper_paths",
+        "semantic_reasons", "helper_paths", "primary_protocol", "request_protocols",
     }
     if type(template_inventory) is not list:
         raise NucleiPolicyError("Nuclei template inventory is not a list")
@@ -1464,6 +1570,17 @@ def validate_document(document: dict) -> None:
                     name for name in _LOAD_BLOCKING_CAPABILITIES
                     if name in row["required_capabilities"]
                 ]
+                or (row["primary_protocol"] is not None
+                    and row["primary_protocol"] not in _ENGINE_PROTOCOLS)
+                or type(row["request_protocols"]) is not list
+                or any(protocol not in _ENGINE_PROTOCOLS for protocol in row["request_protocols"])
+                or row["request_protocols"] != [
+                    protocol for protocol in _ENGINE_PROTOCOLS
+                    if protocol in row["request_protocols"]
+                ]
+                or row["primary_protocol"] != (
+                    row["request_protocols"][0] if row["request_protocols"] else None
+                )
                 or row["semantic_class"] not in _semantic_classes
                 or type(row["semantic_reasons"]) is not list
                 or any(type(reason) is not str or not reason for reason in row["semantic_reasons"])
@@ -1480,6 +1597,7 @@ def validate_document(document: dict) -> None:
         if row["load_state"] == "metadata-rejected" and (
                 row["id"] != row["path"] or row["severity"] != "unknown" or row["tags"]
                 or row["required_capabilities"] or row["helper_paths"]
+                or row["primary_protocol"] is not None or row["request_protocols"]
                 or row["semantic_class"] != "unknown"
                 or row["semantic_reasons"] != ["metadata-rejected"]):
             raise NucleiPolicyError("Nuclei rejected-template inventory is contradictory")
@@ -1494,7 +1612,8 @@ def validate_document(document: dict) -> None:
     for owner in document["owners"]:
         required = {"owner", "description", "flags", "flags_digest", "selected_count",
                     "selected_templates", "selection_digest", "semantic_inventory", "private_config",
-                    "oob_enabled", "oob_backend", "oob_config_identity", "channel_digest"}
+                    "oob_enabled", "oob_backend", "oob_config_identity", "channel_digest",
+                    "protocol_partitions"}
         if type(owner) is not dict or set(owner) != required:
             raise NucleiPolicyError("Nuclei owner policy has unknown or missing fields")
         if owner["selected_count"] != len(owner["selected_templates"]):
@@ -1530,6 +1649,16 @@ def validate_document(document: dict) -> None:
                     }
                     or ((selected["signature_marker_digest"] is None)
                         != (selected["signature_state"] == "unsigned"))
+                    or selected["primary_protocol"] not in _POLICY_REQUEST_PROTOCOLS
+                    or type(selected["request_protocols"]) is not list
+                    or not selected["request_protocols"]
+                    or any(protocol not in _POLICY_REQUEST_PROTOCOLS
+                           for protocol in selected["request_protocols"])
+                    or selected["request_protocols"] != [
+                        protocol for protocol in _PRIMARY_PROTOCOL_ORDER
+                        if protocol in selected["request_protocols"]
+                    ]
+                    or selected["primary_protocol"] != selected["request_protocols"][0]
                     or selected["semantic_class"] not in _semantic_classes
                     or type(selected["semantic_reasons"]) is not list
                     or any(type(reason) is not str or not reason
@@ -1542,6 +1671,28 @@ def validate_document(document: dict) -> None:
             selected_paths.append(selected["path"])
         if selected_paths != sorted(set(selected_paths), key=lambda item: item.encode("utf-8")):
             raise NucleiPolicyError("Nuclei selected-template inventory is duplicated or out of order")
+        expected_partitions = _protocol_partitions(owner["selected_templates"])
+        partitions = owner["protocol_partitions"]
+        if (type(partitions) is not list
+                or any(type(row) is not dict or "protocol" not in row for row in partitions)
+                or [row["protocol"] for row in partitions]
+                != list(_POLICY_REQUEST_PROTOCOLS)):
+            raise NucleiPolicyError("Nuclei protocol partitions are incomplete or out of order")
+        for partition in partitions:
+            if (type(partition) is not dict
+                    or set(partition) != {
+                        "protocol", "selected_count", "selected_paths", "selection_digest",
+                    }
+                    or type(partition["selected_count"]) is not int
+                    or type(partition["selected_paths"]) is not list
+                    or any(type(path) is not str or not path for path in partition["selected_paths"])):
+                raise NucleiPolicyError("Nuclei protocol partition is malformed")
+        flattened = [path for partition in partitions for path in partition["selected_paths"]]
+        if (partitions != expected_partitions or len(flattened) != len(set(flattened))
+                or sorted(flattened, key=lambda item: item.encode("utf-8")) != selected_paths):
+            raise NucleiPolicyError(
+                "Nuclei protocol partitions are not a disjoint complete selected inventory"
+            )
         semantic = owner["semantic_inventory"]
         if (type(semantic) is not dict
                 or set(semantic) != {"classifier", "counts", "potentially_state_changing", "unknown"}
