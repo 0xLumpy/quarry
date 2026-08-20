@@ -213,6 +213,22 @@ def test_gowitness_transport_requires_runner_owned_chrome_proxy(source_id):
         ) is None
 
 
+@pytest.mark.parametrize(
+    "caller_flag",
+    ("-p", "-proxy", "-pi", "-proxy-internal", "-r", "-resolvers",
+     "-sr", "-system-resolvers"),
+)
+def test_nuclei_transport_rejects_caller_proxy_and_resolver_authority(caller_flag):
+    assert network_policy.transport_door(
+        "params.nuclei_scan",
+        argv=("nuclei", "-duc", "-pt", "http,dns"),
+    ).profile == "nuclei-authorized-http"
+    assert network_policy.transport_door(
+        "params.nuclei_scan",
+        argv=("nuclei", "-duc", "-pt", "http,dns", caller_flag),
+    ) is None
+
+
 def test_transport_lookup_requires_exact_native_helper_identity():
     assert network_policy.transport_door(
         "horizontal.csp", helper="fetch.scoped_headers",
@@ -438,6 +454,274 @@ def test_invocation_peer_sets_are_required_and_consumed_only_by_approved_profile
     assert trace[-1]["policy"] == invocation.policy
 
 
+def test_nuclei_uses_proxy_only_peers_and_exact_oob_endpoints(tmp_path, monkeypatch):
+    scope = _native_scope()
+    run = store.Run.create(tmp_path, "example.test")
+    scope.bind(run)
+    invocation = scope.prepare_invocation(
+        request_id="6" * 32, source_id="params.nuclei_scan", tool="nuclei",
+        argv=("nuclei", "-duc", "-l", "targets", "-pt", "http,dns"),
+        environment={},
+        approved_peers=("8.8.8.8",),
+    )
+    assert invocation.policy["peer_mode"] == "deny-all"
+    assert invocation.policy["nuclei_protocol_lane"] == "http,dns"
+    assert invocation.policy["resolver_ips"] == list(
+        network_policy._NUCLEI_DEFAULT_RESOLVERS,
+    )
+    assert invocation.policy["approved_peers"] == ["8.8.8.8"]
+    assert invocation.policy["operator_control_endpoints"] == []
+    assert invocation.policy["public_control_endpoints"] == sorted(
+        f"{host}:{port}"
+        for host in network_policy._NUCLEI_PUBLIC_OOB_HOSTS
+        for port in (80, 443)
+    )
+    parsed = BrokerPolicy.from_json(json.dumps(
+        invocation.policy, ensure_ascii=True, sort_keys=True, separators=(",", ":"),
+    ))
+    monkeypatch.setattr(netguard, "own_ips", lambda: ("192.0.2.10",))
+    monkeypatch.setattr(netguard, "interface_snapshot", _interface_snapshot)
+    # The tracee cannot bypass the proxy even for an invocation-approved IP.
+    assert parsed.decide(
+        "8.8.8.8", 443, socket.SOCK_STREAM, socket.IPPROTO_TCP,
+    )[0] == "deny"
+    # Resolver transport belongs solely to the SOCKS DNS mediator.
+    assert parsed.decide(
+        "1.1.1.1", 53, socket.SOCK_DGRAM, socket.IPPROTO_UDP,
+    )[0] == "deny"
+    # The proxy admits target authority and the exact public OOB pool only.
+    assert parsed.host_allowed("example.test", 443)[0] == "allow"
+    assert parsed.host_allowed("8.8.8.8", 8443)[0] == "allow"
+    assert parsed.host_allowed("1.1.1.1", 53)[0] == "deny"
+    assert parsed.host_allowed("oast.pro", 443)[0] == "allow"
+    assert parsed.host_allowed("oast.pro", 444)[0] == "deny"
+    assert parsed.host_allowed("evil-oast.pro", 443)[0] == "deny"
+    assert parsed.decide_proxy_resolved(
+        "oast.pro", "8.8.8.8", 443,
+        socket.SOCK_STREAM, socket.IPPROTO_TCP,
+    )[0] == "allow"
+    assert parsed.decide_proxy_resolved(
+        "oast.pro", "10.0.0.8", 443,
+        socket.SOCK_STREAM, socket.IPPROTO_TCP,
+    )[0] == "deny"
+    assert parsed.decide_proxy_resolved(
+        "1.1.1.1", "1.1.1.1", 53,
+        socket.SOCK_STREAM, socket.IPPROTO_TCP,
+    )[0] == "deny"
+    assert replace(parsed, nuclei_protocol_lane="tcp").decide(
+        "1.1.1.1", 53, socket.SOCK_DGRAM, socket.IPPROTO_UDP,
+    )[0] == "deny"
+    forged = dict(invocation.policy)
+    forged["public_control_endpoints"] = ["attacker.example:443"]
+    with pytest.raises(NetworkBrokerRefused, match="policy_invalid"):
+        BrokerPolicy.from_json(json.dumps(
+            forged, ensure_ascii=True, sort_keys=True, separators=(",", ":"),
+        ))
+    forged = dict(invocation.policy)
+    forged["nuclei_protocol_lane"] = "http"
+    with pytest.raises(NetworkBrokerRefused, match="policy_invalid"):
+        BrokerPolicy.from_json(json.dumps(
+            forged, ensure_ascii=True, sort_keys=True, separators=(",", ":"),
+        ))
+
+
+def test_nuclei_self_hosted_oob_endpoint_is_exact(tmp_path, monkeypatch):
+    scope = _native_scope()
+    run = store.Run.create(tmp_path, "example.test")
+    scope.bind(run)
+    invocation = scope.prepare_invocation(
+        request_id="7" * 32, source_id="params.nuclei_scan", tool="nuclei",
+        argv=("nuclei", "-duc", "-l", "targets", "-pt", "http,dns", "-iserver",
+              "https://oob.operator.test:8443"),
+        environment={}, approved_peers=("8.8.8.8",),
+    )
+    assert invocation.policy["public_control_endpoints"] == []
+    assert invocation.policy["operator_control_endpoints"] == [
+        "oob.operator.test:8443",
+    ]
+    parsed = BrokerPolicy.from_json(json.dumps(
+        invocation.policy, ensure_ascii=True, sort_keys=True, separators=(",", ":"),
+    ))
+    monkeypatch.setattr(netguard, "own_ips", lambda: ("192.0.2.10",))
+    assert parsed.host_allowed("oob.operator.test", 8443)[0] == "allow"
+    assert parsed.host_allowed("oob.operator.test", 443)[0] == "deny"
+    assert parsed.decide_proxy_resolved(
+        "oob.operator.test", "10.0.0.8", 8443,
+        socket.SOCK_STREAM, socket.IPPROTO_TCP,
+    )[0] == "allow"
+
+
+def _nuclei_dns_policy(*, public=(), operator=(), lane="http,dns"):
+    document = _native_scope().broker_policy(
+        request_id="e" * 32, source_id="params.nuclei_scan", tool="nuclei",
+        approved_peers=("8.8.8.8",), public_control_endpoints=public,
+        operator_control_endpoints=operator, nuclei_protocol_lane=lane,
+    )
+    return BrokerPolicy.from_json(json.dumps(
+        document, ensure_ascii=True, sort_keys=True, separators=(",", ":"),
+    ))
+
+
+def _nuclei_dns_query(name, *, query_type=1, flags=None, questions=1,
+                      answers=0, authority=0, additional=1, opt=None,
+                      trailing=b""):
+    if flags is None:
+        flags = 0x0120 if query_type == 16 else 0x0100
+    if opt is None:
+        opt = network_proxy._NUCLEI_DNS_OPT.pack(
+            0, 41, network_proxy._NUCLEI_DNS_OPT_UDP_SIZE, 0, 0,
+        )
+    return network_dns._DNS_HEADER.pack(
+        17, flags, questions, answers, authority, additional,
+    ) + network_dns._encode_name(name) + struct.pack("!HH", query_type, 1) + \
+        opt + trailing
+
+
+def test_nuclei_socks_dns_questions_are_scope_bound_before_any_upstream_bytes():
+    policy_value = _nuclei_dns_policy(
+        public=network_policy._nuclei_public_control_endpoints(),
+    )
+    proxy = network_proxy.PinnedBrowserProxy.__new__(network_proxy.PinnedBrowserProxy)
+    proxy._policy = policy_value
+    # Parsing/refusal happens before _exchange_nuclei_dns can construct or
+    # write an upstream resolver socket.
+    upstream = []
+    proxy._exchange_nuclei_dns = lambda *_args: upstream.append(True)
+
+    assert proxy._parse_nuclei_dns_query(_nuclei_dns_query("www.example.test")) \
+        == "www.example.test"
+    assert proxy._parse_nuclei_dns_query(_nuclei_dns_query("id.oast.pro")) \
+        == "id.oast.pro"
+    with pytest.raises(network_proxy._SocksProxyRefused, match="qname_out_of_scope"):
+        proxy._parse_nuclei_dns_query(_nuclei_dns_query("foreign.invalid"))
+    proxy._policy = replace(policy_value, oos_patterns=(r"^blocked\.example\.test$",))
+    with pytest.raises(network_proxy._SocksProxyRefused, match="qname_out_of_scope"):
+        proxy._parse_nuclei_dns_query(_nuclei_dns_query("blocked.example.test"))
+    assert upstream == []
+
+
+def test_nuclei_socks_dns_refusal_precedes_resolver_exchange():
+    policy_value = _nuclei_dns_policy()
+    proxy_side, client = socket.socketpair()
+    proxy = network_proxy.PinnedBrowserProxy.__new__(network_proxy.PinnedBrowserProxy)
+    proxy._policy = policy_value
+    proxy._deadline = time.monotonic() + 1.0
+    proxy._stop = threading.Event()
+    upstream = []
+    proxy._exchange_nuclei_dns = lambda *_args: upstream.append(True)
+    faults = []
+    worker = threading.Thread(
+        target=lambda: _capture_fault(
+            lambda: proxy._serve_nuclei_dns(proxy_side, "1.1.1.1"), faults,
+        ),
+    )
+    worker.start()
+    try:
+        message = _nuclei_dns_query("foreign.invalid")
+        client.sendall(len(message).to_bytes(2, "big") + message)
+        worker.join(1.0)
+        assert not worker.is_alive()
+        assert len(faults) == 1
+        assert "qname_out_of_scope" in str(faults[0])
+        assert upstream == []
+    finally:
+        client.close()
+        proxy_side.close()
+
+
+def test_nuclei_socks_dns_selfhost_suffix_is_authorized_by_exact_endpoint_port():
+    policy_value = _nuclei_dns_policy(operator=("oob.operator.test:8443",))
+    assert policy_value.dns_name_allowed("abc.oob.operator.test")[0] == "allow"
+    assert policy_value.dns_name_allowed("oob.operator.test")[0] == "allow"
+    assert policy_value.dns_name_allowed("oob.operator.test.evil.invalid")[0] == "deny"
+    assert policy_value.operator_control_endpoints == ("oob.operator.test:8443",)
+
+
+@pytest.mark.parametrize("message", (
+    _nuclei_dns_query("example.test", questions=2),
+    _nuclei_dns_query("example.test", trailing=b"\x00"),
+    _nuclei_dns_query("example.test", flags=0),
+    _nuclei_dns_query("example.test", additional=0),
+    _nuclei_dns_query("example.test", answers=1),
+    _nuclei_dns_query("example.test", opt=b"\x00" * 11),
+))
+def test_nuclei_socks_dns_refuses_multi_or_noncanonical_query_framing(message):
+    proxy = network_proxy.PinnedBrowserProxy.__new__(network_proxy.PinnedBrowserProxy)
+    proxy._policy = _nuclei_dns_policy()
+    with pytest.raises(network_proxy._SocksProxyRefused, match="dns_query_malformed"):
+        proxy._parse_nuclei_dns_query(message)
+
+
+@pytest.mark.parametrize(
+    ("query_type", "flags"),
+    ((1, 0x0100), (28, 0x0100), (16, 0x0120)),
+)
+def test_nuclei_socks_dns_accepts_v311_edns0_a_aaaa_and_txt_shapes(
+        query_type, flags):
+    proxy = network_proxy.PinnedBrowserProxy.__new__(network_proxy.PinnedBrowserProxy)
+    proxy._policy = _nuclei_dns_policy()
+    assert proxy._parse_nuclei_dns_query(_nuclei_dns_query(
+        "example.test", query_type=query_type, flags=flags,
+    )) == "example.test"
+
+
+@pytest.mark.parametrize(
+    ("query_type", "flags"),
+    ((1, 0x0120), (28, 0x0120), (16, 0x0100)),
+)
+def test_nuclei_socks_dns_refuses_ad_outside_the_v311_query_shape(
+        query_type, flags):
+    proxy = network_proxy.PinnedBrowserProxy.__new__(network_proxy.PinnedBrowserProxy)
+    proxy._policy = _nuclei_dns_policy()
+    with pytest.raises(network_proxy._SocksProxyRefused, match="dns_query_malformed"):
+        proxy._parse_nuclei_dns_query(_nuclei_dns_query(
+            "example.test", query_type=query_type, flags=flags,
+        ))
+
+
+def test_nuclei_tcp_lane_cannot_select_a_resolver_through_socks():
+    proxy = network_proxy.PinnedBrowserProxy.__new__(network_proxy.PinnedBrowserProxy)
+    proxy._policy = _nuclei_dns_policy(lane="tcp")
+    assert not proxy._is_nuclei_resolver("1.1.1.1", 53)
+    assert proxy._policy.decide(
+        "1.1.1.1", 53, socket.SOCK_STREAM, socket.IPPROTO_TCP,
+    )[0] == "deny"
+
+
+@pytest.mark.parametrize(
+    ("lane", "host"),
+    (("http,dns", "10.0.0.2"), ("tcp", "1.1.1.1")),
+)
+def test_nuclei_socks_never_relays_non_mediator_port_53(lane, host):
+    proxy_side, client = socket.socketpair()
+    proxy = network_proxy.PinnedBrowserProxy.__new__(network_proxy.PinnedBrowserProxy)
+    proxy._policy = _nuclei_dns_policy(lane=lane)
+    proxy._deadline = time.monotonic() + 1.0
+    proxy._stop = threading.Event()
+    proxy._effect_fence = NetworkEffectFence()
+    raw_dials = []
+    proxy._dial = lambda *_args: raw_dials.append(True)
+    faults = []
+    worker = threading.Thread(
+        target=lambda: _capture_fault(lambda: proxy._serve_socks(proxy_side), faults),
+    )
+    worker.start()
+    try:
+        client.sendall(b"\x01\x00")
+        assert client.recv(2) == b"\x05\x00"
+        client.sendall(
+            b"\x05\x01\x00\x01" + socket.inet_aton(host) + b"\x005",
+        )
+        worker.join(1.0)
+        assert not worker.is_alive()
+        assert len(faults) == 1
+        assert "nuclei_resolver_refused" in str(faults[0])
+        assert raw_dials == []
+    finally:
+        client.close()
+        proxy_side.close()
+
+
 @pytest.mark.parametrize("field,value", [
     ("authority_class", "public-provider"),
     ("transport_profile", "public-provider"),
@@ -545,7 +829,6 @@ def test_tracee_dns_delegation_retains_exact_resolver_guards(monkeypatch):
     ("vertical.openintel", "openintel-subs"),
     ("horizontal.tlsx_san", "tlsx"),
     ("crawl.katana_headless", "katana"),
-    ("params.nuclei_scan", "nuclei"),
     ("params.oob_control", "interactsh-client"),
 ])
 def test_ineligible_tracee_profiles_cannot_use_direct_dns(
@@ -2203,6 +2486,7 @@ def test_proxy_listener_registration_is_owned_before_cancel_can_return(monkeypat
 @pytest.mark.parametrize(
     ("profile", "expected_field"),
     (("target-http-proxy", "control_clients"),
+     ("nuclei-authorized-http", "control_clients"),
      ("browser-pipe-proxy", "control_helpers")),
 )
 def test_proxy_registration_uses_profile_specific_client_identity(
@@ -2225,6 +2509,45 @@ def test_proxy_registration_uses_profile_specific_client_identity(
     finally:
         proxy.stop()
     assert proxy.summary()["complete"] is True
+
+
+def test_pinned_proxy_accepts_authenticated_socks5_domain_connect():
+    proxy_side, client = socket.socketpair()
+    upstream = object()
+    proxy = network_proxy.PinnedBrowserProxy.__new__(
+        network_proxy.PinnedBrowserProxy,
+    )
+    proxy._authentication = b"QBP1" + b"a" * 32
+    proxy._deadline = time.monotonic() + 2.0
+    proxy._stop = threading.Event()
+    proxy._effect_fence = NetworkEffectFence()
+    observed = []
+    proxy._dial = lambda method, host, port: (
+        observed.append((method, host, port)) or upstream
+    )
+    proxy._relay = lambda left, right: observed.append((left, right))
+    proxy._close_tracked = lambda handle: observed.append(("closed", handle))
+    faults = []
+    worker = threading.Thread(
+        target=lambda: _capture_fault(lambda: proxy._serve(proxy_side), faults),
+    )
+    worker.start()
+    try:
+        client.sendall(proxy._authentication + b"\x05\x01\x00")
+        assert client.recv(2) == b"\x05\x00"
+        host = b"example.test"
+        client.sendall(
+            b"\x05\x01\x00\x03" + bytes((len(host),)) + host + b"\x01\xbb",
+        )
+        assert client.recv(10) == b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00"
+        worker.join(1.0)
+        assert not worker.is_alive() and faults == []
+        assert observed[0] == ("SOCKS5", "example.test", 443)
+        assert observed[1] == (proxy_side, upstream)
+        assert observed[2] == ("closed", upstream)
+    finally:
+        client.close()
+        proxy_side.close()
 
 
 def test_proxy_listener_close_fault_retains_retry_authority(monkeypatch):
@@ -2647,10 +2970,10 @@ def test_proxy_final_peer_refusal_never_falls_through_to_a_second_answer(monkeyp
         ("allow", "initial peer one"),
         ("allow", "initial peer two"),
         ("deny", "peer one became protected"),
-    ))
+        ))
     policy_witness = SimpleNamespace(
-        host_allowed=lambda _host: ("allow", "host admitted"),
-        decide_resolved=lambda *_args: next(decisions),
+        host_allowed=lambda _host, _port: ("allow", "host admitted"),
+        decide_proxy_resolved=lambda *_args: next(decisions),
     )
     proxy = network_proxy.PinnedBrowserProxy.__new__(
         network_proxy.PinnedBrowserProxy,

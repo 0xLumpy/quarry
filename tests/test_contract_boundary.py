@@ -31,7 +31,7 @@ APPROVED_DIRECT = {
     "dns":        {"dnsx": 2},
     "enrich":     {"dnsx": 2, "gowitness": 1, "nuclei": 1, "puredns": 1, "smap": 1},
     "horizontal": {"asnmap": 1, "caduceus": 1, "dnsx": 1, "mapcidr": 1, "tlsx": 1},
-    "params":     {"arjun": 1, "dalfox": 1, "gf": 1, "nuclei": 2},
+    "params":     {"arjun": 1, "dalfox": 2, "gf": 1, "nuclei": 2},
     "probe":      {"cdncheck": 1, "naabu": 2, "nuclei": 1, "smap": 1},
     "vertical":   {"alterx": 1, "dnsx": 1, "github-subdomains": 1, "httpx": 1, "openintel-subs": 1, "puredns": 2},
 }

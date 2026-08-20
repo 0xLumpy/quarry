@@ -28,7 +28,7 @@ EXPECTED_NATIVE_SINKS = {
     ("enrich", "run", "gowitness", (6, 9)),
     ("enrich", "run", "smap", (4,)),
     ("params", "_arjun_exec", "arjun", (4,)),
-    ("params", "_nuclei_scan", "nuclei", (5,)),
+    ("params", "_nuclei_scan_lane", "nuclei", (5,)),
     ("params", "_dalfox_xss_fast", "dalfox", (6,)),
     ("params", "_takeover_nuclei_lane", "nuclei", (7,)),
     ("probe", "_vhost_scan", "probe.ffuf_vhost", (17,)),

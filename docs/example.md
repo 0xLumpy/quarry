@@ -313,7 +313,7 @@ follows only same-host 30x; cross-host `Location` is recorded, not followed.
 
 **WAF fingerprint** — nuclei waf-detect templates over live hosts (names the WAF; recon-side, no bypass):
 ```bash
-nuclei -l <work>/waf_targets.txt -tags waf -jsonl -o raw/probe/nuclei/waf.jsonl
+nuclei -l <work>/waf_targets.txt -pt http,dns -tags waf -jsonl -o raw/probe/nuclei/waf.jsonl
 ```
 → `tech` (`WAF:<name>`). `httpx -cdn` records detected / detector-negative / unknown CDN state;
 none of those states alone asserts that a WAF is absent or that a service is an origin.
@@ -477,7 +477,7 @@ gf xss  < <work>/all_inscope_urls.txt        # then: sqli ssrf redirect lfi idor
 
 **subdomain takeover** (`TAKEOVER: true`) — nuclei takeover templates over resolved subs:
 ```bash
-nuclei -l <work>/takeover_targets.txt -tags takeover -jsonl -o raw/params/nuclei/takeover.jsonl
+nuclei -l <work>/takeover_targets.txt -pt http,dns -tags takeover -jsonl -o raw/params/nuclei/takeover.jsonl
 ```
 → `finding` (severity high, `confirmed:false`).
 
@@ -485,10 +485,12 @@ nuclei -l <work>/takeover_targets.txt -tags takeover -jsonl -o raw/params/nuclei
 medium-through-critical template corpus excludes the `intrusive`, `fuzz`, `dos`, and `brute-force` tags,
 but matching templates can still issue state-changing requests, write files, or execute a payload:
 ```bash
-nuclei -l <work>/nuclei_targets.txt -jsonl -o raw/params/nuclei/findings.jsonl \
+nuclei -l <work>/nuclei_targets.txt -pt <accepted-protocol-lane> -jsonl -o raw/params/nuclei/findings.<lane>.jsonl \
   -etags intrusive,fuzz,dos,brute-force -s critical,high,medium -stats -si 30 \
   -c 25 -bs 25 -nmhe          # -nmhe = full host-error depth (default); -mhe <n> if PERFORMANCE.NUCLEI_MAX_HOST_ERROR set
 ```
+Quarry runs each non-empty accepted protocol lane separately, checkpoints it independently, then publishes
+their deterministic union as `raw/params/nuclei/findings.jsonl`.
 → `finding` (`confirmed:false`). Self-hosted interactsh if `oob.callback_server` is set, else nuclei's
 public server. stderr → `nuclei.run.log`.
 

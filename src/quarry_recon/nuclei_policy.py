@@ -21,7 +21,7 @@ from pathlib import Path
 
 import yaml
 
-from . import budget, events, runtime_identity, secrets, settings, store
+from . import budget, events, normalize, runtime_identity, secrets, settings, store
 
 
 SCHEMA_VERSION = "quarry.nuclei-policy.v1"
@@ -38,6 +38,32 @@ OOB_CHANNELS = (
     "params.dalfox_blind_oob",
     "quarry.oob_import",
 )
+
+
+def target_hosts(values) -> tuple[str, ...]:
+    """Return the exact canonical authorities represented by a Nuclei target chunk."""
+    if type(values) not in {tuple, list}:
+        raise NucleiPolicyError("Nuclei target set is not a finite sequence")
+    hosts: set[str] = set()
+    for value in values:
+        if type(value) is not str:
+            raise NucleiPolicyError("Nuclei target is not canonical text")
+        if "%" in value:
+            host = None
+        else:
+            try:
+                address = ipaddress.ip_address(value)
+            except ValueError:
+                address = None
+            host = (str(getattr(address, "ipv4_mapped", None) or address)
+                    if address is not None
+                    else normalize.host_of_url(value) or normalize.canon_host_strict(value))
+        if host is None:
+            raise NucleiPolicyError("Nuclei target has no canonical authority")
+        hosts.add(host)
+    if not hosts:
+        raise NucleiPolicyError("Nuclei target set has no canonical authority")
+    return tuple(sorted(hosts))
 
 _MAIN_SEVERITIES = ("critical", "high", "medium")
 _MAIN_EXCLUDED_TAGS = ("intrusive", "fuzz", "dos", "brute-force")
@@ -1964,7 +1990,39 @@ class Authority:
         return {"policy_digest": self.digest, "selection_digest": row["selection_digest"],
                 "flags_digest": row["flags_digest"], "channel_digest": row["channel_digest"],
                 "oob_enabled": row["oob_enabled"], "oob_backend": row["oob_backend"],
-                "oob_config_identity": row["oob_config_identity"]}
+                "oob_config_identity": row["oob_config_identity"],
+                "protocol_lanes": list(self.protocol_lanes(owner))}
+
+    def protocol_lanes(self, owner: str) -> tuple[str, ...]:
+        """Return the exact transport lanes needed by this owner's selected templates.
+
+        Nuclei assigns one primary protocol to each template. HTTP and DNS-primary
+        templates share one runner-owned SOCKS transport because a DNS-primary
+        template may also contain HTTP requests; TCP-primary templates use the
+        same transport under a narrower protocol policy.
+        """
+        partitions = self.owner(owner)["protocol_partitions"]
+        counts = {row["protocol"]: row["selected_count"] for row in partitions}
+        lanes = []
+        if counts.get("http", 0) or counts.get("dns", 0):
+            lanes.append("http,dns")
+        if counts.get("tcp", 0):
+            lanes.append("tcp")
+        return tuple(lanes)
+
+    def lane(self, owner: str, protocol_lane: str) -> dict:
+        if protocol_lane not in self.protocol_lanes(owner):
+            raise NucleiPolicyError(
+                f"Nuclei protocol lane is absent from the accepted owner: {owner}/{protocol_lane}"
+            )
+        protocols = {"http,dns": {"http", "dns"}, "tcp": {"tcp"}}[protocol_lane]
+        rows = [row for row in self.owner(owner)["selected_templates"]
+                if row["primary_protocol"] in protocols]
+        return {
+            "protocol_lane": protocol_lane,
+            "selected_count": len(rows),
+            "selection_digest": _sha256(_canonical(rows)),
+        }
 
     def manifest_summary(self) -> dict:
         return _manifest_summary(self.document, self.artifact_digest)
@@ -1972,23 +2030,43 @@ class Authority:
     def prepare(self, owner: str, command: list[str], *, input_total: int, work_unit: str) -> None:
         self.assert_ready()
         row = self.owner(owner)
-        _assert_command(
+        protocol_lane = _assert_command(
             row, command, oob_enabled=self.document["modes"]["oob_enabled"],
             expected_private_config=self._active_private_config,
+            allowed_protocol_lanes=self.protocol_lanes(owner),
         )
+        lane = self.lane(owner, protocol_lane)
         events.emit("nuclei_policy_start", owner, policy_digest=self.digest,
-                    policy_ref=str(self.path), selection_digest=row["selection_digest"],
-                    selected_count=row["selected_count"], flags_digest=row["flags_digest"],
+                    policy_ref=str(self.path), selection_digest=lane["selection_digest"],
+                    selected_count=lane["selected_count"], flags_digest=row["flags_digest"],
+                    owner_selection_digest=row["selection_digest"], protocol_lane=protocol_lane,
                     oob_enabled=row["oob_enabled"], oob_backend=row["oob_backend"],
                     oob_config_identity=row["oob_config_identity"],
                     channel_digest=row["channel_digest"], input_total=input_total,
                     work_unit=work_unit)
 
-    def settle(self, owner: str, result, *, input_total: int, work_unit: str) -> None:
+    def settle(self, owner: str, result, *, input_total: int, work_unit: str,
+               protocol_lane: str | None = None) -> None:
         # Reconcile the policy artifact, engine, corpus and private config again after execution.  The
         # runner's pre-spawn record proves what was admitted; this closes same-UID/tool mutation during
         # the child lifetime before a terminal policy event is accepted.
         row = self.owner(owner)
+        if protocol_lane is not None:
+            executed_lane = _assert_command(
+                row, getattr(result, "cmd", None),
+                oob_enabled=self.document["modes"]["oob_enabled"],
+                expected_private_config=self._active_private_config,
+                allowed_protocol_lanes=self.protocol_lanes(owner),
+            )
+            if executed_lane != protocol_lane:
+                raise NucleiPolicyError(
+                    "the settled Nuclei protocol lane differs from the executed command"
+                )
+        lane = self.lane(owner, protocol_lane) if protocol_lane is not None else {
+            "protocol_lane": None,
+            "selected_count": row["selected_count"],
+            "selection_digest": row["selection_digest"],
+        }
         self.assert_ready()
         meta = getattr(result, "meta", None)
         meta = meta if isinstance(meta, dict) else {}
@@ -2028,8 +2106,10 @@ class Authority:
             if config != expected_config:
                 raise NucleiPolicyError("the executed Nuclei config differs from the accepted policy")
         events.emit("nuclei_policy_finish", owner, policy_digest=self.digest,
-                    selection_digest=row["selection_digest"],
-                    selected_count=row["selected_count"], flags_digest=row["flags_digest"],
+                    selection_digest=lane["selection_digest"],
+                    selected_count=lane["selected_count"], flags_digest=row["flags_digest"],
+                    owner_selection_digest=row["selection_digest"],
+                    protocol_lane=lane["protocol_lane"],
                     input_total=input_total, work_unit=work_unit,
                     oob_enabled=row["oob_enabled"], oob_backend=row["oob_backend"],
                     oob_config_identity=row["oob_config_identity"],
@@ -2065,12 +2145,13 @@ class Authority:
 
 
 def _assert_command(owner: dict, command: list[str], *, oob_enabled: bool,
-                    expected_private_config: Path | None) -> None:
+                    expected_private_config: Path | None,
+                    allowed_protocol_lanes: tuple[str, ...]) -> str:
     if not isinstance(command, list) or not command or Path(command[0]).name != "nuclei":
         raise NucleiPolicyError("Nuclei policy received a non-Nuclei command")
     expected = list(owner["flags"])
     value_flags = {"-l", "-o", "-tags", "-etags", "-ept", "-s", "-si", "-c", "-bs", "-mhe",
-                   "-rl", "-iserver", "-config"}
+                   "-rl", "-iserver", "-config", "-pt"}
 
     def parse(items: list[str]) -> tuple[list[tuple[str, str]], list[str]]:
         pairs, booleans, index = [], [], 0
@@ -2090,11 +2171,14 @@ def _assert_command(owner: dict, command: list[str], *, oob_enabled: bool,
 
     expected_pairs, expected_bools = parse(expected)
     actual_pairs, actual_bools = parse(command[1:])
-    operational_pairs = [pair for pair in actual_pairs if pair[0] in {"-l", "-o"}]
-    if (len(operational_pairs) != 2 or {pair[0] for pair in operational_pairs} != {"-l", "-o"}
-            or any(not Path(value).is_absolute() for _flag, value in operational_pairs)):
+    path_pairs = [pair for pair in actual_pairs if pair[0] in {"-l", "-o"}]
+    if (len(path_pairs) != 2 or {pair[0] for pair in path_pairs} != {"-l", "-o"}
+            or any(not Path(value).is_absolute() for _flag, value in path_pairs)):
         raise NucleiPolicyError("Nuclei command input/output authority is malformed")
-    policy_pairs = [pair for pair in actual_pairs if pair[0] not in {"-l", "-o", "-config"}]
+    lane_pairs = [pair for pair in actual_pairs if pair[0] == "-pt"]
+    if len(lane_pairs) != 1 or lane_pairs[0][1] not in allowed_protocol_lanes:
+        raise NucleiPolicyError("Nuclei command protocol lane is outside the accepted selection")
+    policy_pairs = [pair for pair in actual_pairs if pair[0] not in {"-l", "-o", "-config", "-pt"}]
     if policy_pairs != expected_pairs:
         raise NucleiPolicyError("Nuclei command changes accepted-policy flag/value order")
     if actual_bools != ["-jsonl", *expected_bools]:
@@ -2110,6 +2194,7 @@ def _assert_command(owner: dict, command: list[str], *, oob_enabled: bool,
         raise NucleiPolicyError("Nuclei OOB is enabled but the command disables Interactsh")
     if not oob_enabled and "-ni" not in command:
         raise NucleiPolicyError("Nuclei OOB is disabled but the command can contact Interactsh")
+    return lane_pairs[0][1]
 
 
 def policy_for(ctx) -> "Authority | None":

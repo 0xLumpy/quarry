@@ -83,6 +83,7 @@ _RUNNER_PROXY_FLAGS = frozenset({
     "-proxy", "--proxy", "-http-proxy", "--http-proxy",
     "-socks5", "--socks5", "-socks-proxy", "--socks-proxy",
     "-chrome-proxy", "--chrome-proxy",
+    "-p", "-pi", "-proxy-internal", "--proxy-internal",
 })
 
 
@@ -1031,17 +1032,22 @@ def _configure_network_broker(request: WorkerRequest, launcher) -> WorkerRequest
     launcher._network_control_registry = registry
     launcher._network_effect_fence = effect_fence
     child_request = request
-    proxy_flag = None
+    proxy_flags = None
     if (policy.source_id == "crawl.katana_standard"
             and policy.transport_profile == "target-http-proxy"):
-        proxy_flag = "-proxy"
+        proxy_flags = ("-proxy",)
     elif (policy.source_id in {"probe.gowitness", "enrich.gowitness"}
           and policy.transport_profile == "browser-pipe-proxy"):
         # Gowitness passes this only to its Chromium helper.  The helper's
         # exact executable identity is authorized by the browser-pipe profile,
         # while this runner-owned endpoint remains the only target egress door.
-        proxy_flag = "--chrome-proxy"
-    if proxy_flag is not None:
+        proxy_flags = ("--chrome-proxy",)
+    elif policy.transport_profile == "nuclei-authorized-http":
+        # Nuclei's AliveSocksProxy is also retryabledns' transport: with this
+        # scheme it forces DNS-over-TCP. The pinned proxy owns both the
+        # DNS and raw-TCP lanes, so the tracee has no direct resolver door.
+        proxy_flags = ("-p", "-pi")
+    if proxy_flags is not None:
         if any(value.split("=", 1)[0] in _RUNNER_PROXY_FLAGS
                for value in request.argv):
             raise RuntimeError("network_proxy_caller_argument_forbidden")
@@ -1060,7 +1066,12 @@ def _configure_network_broker(request: WorkerRequest, launcher) -> WorkerRequest
             raise RuntimeError("network_proxy_endpoint_invalid")
         child_request = dataclasses.replace(
             request,
-            argv=request.argv + (proxy_flag, f"http://127.0.0.1:{port}"),
+            argv=request.argv + (
+                proxy_flags[0], f"socks5://127.0.0.1:{port}"
+                if policy.transport_profile == "nuclei-authorized-http"
+                else f"http://127.0.0.1:{port}",
+                *proxy_flags[1:],
+            ),
         )
 
     def bootstrap(*, deadline, clock) -> None:

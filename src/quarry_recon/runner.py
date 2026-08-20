@@ -1904,9 +1904,10 @@ def _run_with_repository(
             return preflight_failure(
                 "bound network policy requires a supported broker source_id and exact transport door",
             )
-        if door.profile == "target-http-exact" and not network_hosts:
+        if door.profile in {"target-http-exact", "nuclei-authorized-http"} \
+                and not network_hosts:
             return preflight_failure(
-                "exact target HTTP transport requires caller-declared network hosts",
+                "host-bound target transport requires caller-declared network hosts",
             )
 
     if type(repository) is store.Run:

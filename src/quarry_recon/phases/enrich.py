@@ -465,6 +465,11 @@ def run(ctx) -> None:
         if new_live:
             if have("nuclei"):                          # WAF fingerprint
                 nuclei_authority = nuclei_policy.policy_for(ctx)
+                if (nuclei_authority is not None
+                        and nuclei_authority.protocol_lanes("enrich.nuclei_waf") != ("http,dns",)):
+                    raise nuclei_policy.NucleiPolicyError(
+                        "the accepted enrich WAF selection requires an unsupported protocol lane"
+                    )
                 wi = ctx.write_list("enrich_waf.txt", new_live)
                 wo = ctx.run.raw_path("enrich", "nuclei", "waf.jsonl")
                 waf_rows = None
@@ -472,7 +477,7 @@ def run(ctx) -> None:
                                contextlib.nullcontext(("-ni",) if not getattr(
                                    prof, "oob_enabled", True) else ()))
                 with oob_context as oob_flags:
-                    wcmd = ["nuclei", "-l", str(wi), "-ept", "javascript",
+                    wcmd = ["nuclei", "-l", str(wi), "-pt", "http,dns", "-ept", "javascript",
                             "-tags", "waf", "-jsonl", "-duc",
                             "-o", str(wo)]
                     if prof.http_rl:
@@ -497,10 +502,12 @@ def run(ctx) -> None:
                             7, *wo.relative_to(ctx.run.dir).parts, required=False,
                         ),),
                         timeout=nuclei_timeout(len(new_live), ctx.http_timeout),
-                        work_unit=wwu, source_id="enrich.nuclei_waf")
+                        work_unit=wwu, source_id="enrich.nuclei_waf",
+                        network_hosts=nuclei_policy.target_hosts(new_live))
                     if nuclei_authority is not None:
                         nuclei_authority.settle(
                             "enrich.nuclei_waf", wr, input_total=len(new_live), work_unit=wwu,
+                            protocol_lane="http,dns",
                         )
                 if native_output_current(wr, wo) and wo.exists():
                     try:

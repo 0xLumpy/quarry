@@ -2663,6 +2663,11 @@ def run(ctx) -> None:
     # recon-side only: identify which WAF fronts each host. Bypass tooling stays human/Burp work.
     if have("nuclei") and ctx.run.count("live"):
         nuclei_authority = nuclei_policy.policy_for(ctx)
+        if (nuclei_authority is not None
+                and nuclei_authority.protocol_lanes("probe.nuclei_waf") != ("http,dns",)):
+            raise nuclei_policy.NucleiPolicyError(
+                "the accepted probe WAF selection requires an unsupported protocol lane"
+            )
         waf_in = ctx.write_list("waf_targets.txt", ctx.run.values("live"))
         waf_out = ctx.run.raw_path("probe", "nuclei", "waf.jsonl")
         waf_rows = None
@@ -2670,7 +2675,7 @@ def run(ctx) -> None:
                        contextlib.nullcontext(("-ni",) if not getattr(
                            prof, "oob_enabled", True) else ()))
         with oob_context as oob_flags:
-            waf_cmd = ["nuclei", "-l", str(waf_in), "-ept", "javascript",
+            waf_cmd = ["nuclei", "-l", str(waf_in), "-pt", "http,dns", "-ept", "javascript",
                        "-tags", "waf", "-jsonl", "-duc",
                        "-o", str(waf_out)]
             if prof.http_rl:                       # else native default (empty = fast)
@@ -2694,10 +2699,12 @@ def run(ctx) -> None:
                               7, *waf_out.relative_to(ctx.run.dir).parts, required=False,
                           ),),
                           timeout=nuclei_timeout(ctx.run.count("live"), ctx.http_timeout),
-                          work_unit=waf_wu, source_id="probe.nuclei_waf")
+                          work_unit=waf_wu, source_id="probe.nuclei_waf",
+                          network_hosts=nuclei_policy.target_hosts(ctx.run.values("live")))
             if nuclei_authority is not None:
                 nuclei_authority.settle(
                     "probe.nuclei_waf", r, input_total=ctx.run.count("live"), work_unit=waf_wu,
+                    protocol_lane="http,dns",
                 )
         if native_output_current(r, waf_out) and waf_out.exists():
             try:

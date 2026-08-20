@@ -104,6 +104,8 @@ def test_every_managed_production_direct_call_binds_a_registered_transport_sourc
             assert door.argv0 and Path(tool.value).name in door.argv0, \
                 (path, call.lineno, source_id, tool.value, door.argv0)
             probe_argv = (tool.value, *door.required_argv)
+            if door.profile == "nuclei-authorized-http":
+                probe_argv += ("-pt", "http,dns")
             assert network_policy.transport_door(source_id, argv=probe_argv) is not None, \
                 (path, call.lineno, source_id, probe_argv)
     assert seen >= 30
@@ -519,14 +521,15 @@ def test_bound_policy_forwards_caller_owned_approved_peers(tmp_path, monkeypatch
     )
 
 
-def test_exact_http_profile_cannot_bypass_host_authority_with_peer_ips(
-        tmp_path, monkeypatch):
+@pytest.mark.parametrize("profile", ("target-http-exact", "nuclei-authorized-http"))
+def test_host_bound_profile_cannot_bypass_authority_with_peer_ips(
+        tmp_path, monkeypatch, profile):
     run = _running_run(tmp_path)
     monkeypatch.setattr(network_policy, "scope_for", lambda repository: object())
     monkeypatch.setattr(
         network_policy, "transport_door",
         lambda _source_id, *, argv: SimpleNamespace(
-            supported=True, broker_required=True, profile="target-http-exact",
+            supported=True, broker_required=True, profile=profile,
         ),
     )
     _forbid_launch(monkeypatch)

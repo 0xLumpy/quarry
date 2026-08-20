@@ -7,6 +7,8 @@ nuclei's `-mhe` host-error skip — was never measured. Status now tracks execut
 structured counters. Pure/offline (exec_tool is faked; no nuclei, no network).
 """
 import json
+import contextlib
+from pathlib import Path
 
 import pytest
 
@@ -349,6 +351,68 @@ class TestExecutionVsCoverage:
         assert len(seen) == 3 and all(p is not None for p in seen)
         assert [p.name for p in seen] == ["stderr_0.log", "stderr_1.log", "stderr_2.log"]
         assert all(p.is_file() and "Scan completed" in p.read_text() for p in seen)
+
+    def test_managed_protocol_lanes_resume_independently_and_merge(self, tmp_path, monkeypatch):
+        calls = []
+
+        class Authority:
+            digest = "a" * 64
+            document = {"corpus": {"digest": "sha256:" + "b" * 64}}
+
+            def assert_ready(self):
+                return None
+
+            def protocol_lanes(self, owner):
+                assert owner == "params.nuclei_scan"
+                return ("http,dns", "tcp")
+
+            def work_config(self, owner):
+                return {"policy_digest": self.digest,
+                        "protocol_lanes": ["http,dns", "tcp"]}
+
+            def oob_flags(self):
+                return contextlib.nullcontext(())
+
+            def prepare(self, owner, command, **_kwargs):
+                calls.append(("prepare", command[command.index("-pt") + 1]))
+
+            def settle(self, owner, result, *, protocol_lane, **_kwargs):
+                assert result.exit_code == 0
+                calls.append(("settle", protocol_lane))
+
+        def execute(tool, cmd, stderr_path=None, **kwargs):
+            stderr_path = stderr_path or _declared_stderr(kwargs)
+            lane = cmd[cmd.index("-pt") + 1]
+            calls.append(("exec", lane))
+            output = Path(cmd[cmd.index("-o") + 1])
+            output.write_text(json.dumps({"lane": lane}) + "\n")
+            if stderr_path is not None:
+                stderr_path.parent.mkdir(parents=True, exist_ok=True)
+                stderr_path.write_text(_stderr())
+            return RunResult("nuclei", cmd, Status.SUCCESS, 0, 0.1, output, 1)
+
+        monkeypatch.setattr(params.nuclei_policy, "policy_for", lambda _ctx: Authority())
+        ctx, result = self._run(tmp_path, monkeypatch, execute, hosts=2, chunk=2)
+        assert result.status is Status.SUCCESS
+        assert [item for item in calls if item[0] == "exec"] == [
+            ("exec", "http,dns"), ("exec", "tcp"),
+        ]
+        aggregate = tmp_path / "raw" / "params" / "nuclei" / "findings.jsonl"
+        assert [json.loads(line)["lane"] for line in aggregate.read_text().splitlines()] == [
+            "http,dns", "tcp",
+        ]
+        nuclei_dir = aggregate.parent
+        assert (nuclei_dir / "chunks.http-dns.state.json").is_file()
+        assert (nuclei_dir / "chunks.tcp.state.json").is_file()
+
+        calls.clear()
+        _ctx, resumed = self._run(
+            tmp_path, monkeypatch,
+            lambda *_a, **_k: pytest.fail("a completed protocol lane was re-run"),
+            hosts=2, chunk=2,
+        )
+        assert resumed.status is Status.SUCCESS
+        assert not calls
 
 
 class TestResumeReportsPersistedCoverage:

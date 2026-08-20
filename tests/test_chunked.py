@@ -37,7 +37,7 @@ class TestResumeKeyFoldsConfig:
 
 
 class TestSourceStructure:
-    @pytest.mark.parametrize("fn", [params._nuclei_scan, params._dalfox_xss_fast])
+    @pytest.mark.parametrize("fn", [params._nuclei_scan_lane, params._dalfox_xss_fast])
     def test_resume_key_is_config_inclusive_work_unit(self, fn):
         src = inspect.getsource(fn)
         assert "scan_wu = events.work_unit(" in src         # config-inclusive resume key
@@ -45,13 +45,13 @@ class TestSourceStructure:
         assert 'prev.get("work_unit")' in src and "scan_wu" in src   # validity check keys on the work_unit
         assert "hashlib.sha256((" not in src                # the old hosts-only input_hash CODE is gone
 
-    @pytest.mark.parametrize("fn", [params._nuclei_scan, params._dalfox_xss_fast])
+    @pytest.mark.parametrize("fn", [params._nuclei_scan_lane, params._dalfox_xss_fast])
     def test_per_chunk_work_unit_on_events(self, fn):
         src = inspect.getsource(fn)
         assert "chunk_wu = events.work_unit(" in src         # a stable per-chunk unit (not the loop index)
         assert "work_unit=chunk_wu" in src                   # tagged on the per-chunk progress event
 
-    @pytest.mark.parametrize("fn", [params._nuclei_scan, params._dalfox_xss_fast])
+    @pytest.mark.parametrize("fn", [params._nuclei_scan_lane, params._dalfox_xss_fast])
     def test_source_terminal_guaranteed(self, fn):
         src = inspect.getsource(fn)
         assert "try:" in src and "finally:" in src           # source tool_finish fires even if the loop raises

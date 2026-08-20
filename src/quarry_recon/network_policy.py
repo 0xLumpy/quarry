@@ -18,6 +18,7 @@ import shlex
 import shutil
 import socket
 import stat
+import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -154,7 +155,10 @@ _register(("params.blind_xss", "params.dalfox"), "external-http", "target",
           "target-http-proxy", argv0=("dalfox",))
 _register(("params.nuclei_oast", "params.nuclei_scan", "params.nuclei_takeover",
            "probe.nuclei_waf", "enrich.nuclei_waf"), "external-template-http", "target",
-          "nuclei-authorized-http", argv0=("nuclei",), required_argv=("-duc",))
+          "nuclei-authorized-http", argv0=("nuclei",), required_argv=("-duc",),
+          forbidden_argv=("-p", "-proxy", "--proxy", "-pi",
+                          "-proxy-internal", "--proxy-internal",
+                          "-r", "-resolvers", "-sr", "-system-resolvers"))
 
 # DNS and literal target doors.  puredns' attested massdns child is named here
 # explicitly; it is not a second anonymous source.
@@ -372,6 +376,7 @@ _proxy_names = frozenset({
 _proxy_flags = frozenset({
     "-proxy", "--proxy", "-http-proxy", "--http-proxy",
     "-socks5", "--socks5", "-socks-proxy", "--socks-proxy",
+    "-p", "-pi", "-proxy-internal", "--proxy-internal",
 })
 _request_id_re = re.compile(r"[0-9a-f]{32}\Z")
 _source_id_re = re.compile(r"[a-z0-9][a-z0-9_.-]{0,127}\Z")
@@ -399,6 +404,136 @@ _maximum_effective_cidrs = 4096
 _maximum_resolvers = 16
 _MAX_NETWORK_HOSTS = 1024
 _RUNNER_NATIVE_DNS_AUTHORITY = object()
+
+_NUCLEI_PUBLIC_OOB_HOSTS = (
+    "oast.fun", "oast.live", "oast.me", "oast.online", "oast.pro", "oast.site",
+)
+# retryabledns' v3.11 pool when Nuclei is given an AliveSocksProxy.  This is
+# an input to the Nuclei boundary, not an ambient resolver preference.
+_NUCLEI_DEFAULT_RESOLVERS = ("1.0.0.1", "1.1.1.1", "8.8.4.4", "8.8.8.8")
+
+
+def _control_endpoint(host: str, port: int) -> str:
+    """Return one canonical host:port key used only inside broker policy."""
+    from . import normalize
+
+    if (type(host) is not str or type(port) is not int or isinstance(port, bool)
+            or not 1 <= port <= 65535 or "%" in host):
+        raise NetworkPolicyError("control endpoint is invalid")
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        canonical = normalize.canon_host_strict(host)
+    else:
+        canonical = str(getattr(address, "ipv4_mapped", None) or address)
+    if canonical is None or canonical != host:
+        raise NetworkPolicyError("control endpoint is invalid")
+    return f"[{canonical}]:{port}" if ":" in canonical else f"{canonical}:{port}"
+
+
+def _canonical_control_endpoints(values, *, limit: int = 16) -> tuple[str, ...]:
+    if type(values) not in {tuple, list} or len(values) > limit:
+        raise NetworkPolicyError("control endpoint set is invalid")
+    canonical = []
+    for value in values:
+        if type(value) is not str or not value or "\x00" in value:
+            raise NetworkPolicyError("control endpoint set is invalid")
+        if value.startswith("["):
+            end = value.find("]")
+            if end <= 1 or end + 2 >= len(value) or value[end + 1] != ":":
+                raise NetworkPolicyError("control endpoint set is invalid")
+            host, raw_port = value[1:end], value[end + 2:]
+        else:
+            if value.count(":") != 1:
+                raise NetworkPolicyError("control endpoint set is invalid")
+            host, raw_port = value.rsplit(":", 1)
+        if (not raw_port.isascii() or not raw_port.isdecimal()
+                or str(int(raw_port)) != raw_port):
+            raise NetworkPolicyError("control endpoint set is invalid")
+        port = int(raw_port)
+        canonical.append(_control_endpoint(host, port))
+    result = tuple(sorted(set(canonical)))
+    if len(result) != len(canonical) or tuple(values) != result:
+        raise NetworkPolicyError("control endpoint set is not canonical")
+    return result
+
+
+def _nuclei_public_control_endpoints() -> tuple[str, ...]:
+    return tuple(sorted(
+        _control_endpoint(host, port)
+        for host in _NUCLEI_PUBLIC_OOB_HOSTS for port in (80, 443)
+    ))
+
+
+def _validate_control_endpoint_authority(profile: str, public, operator) -> None:
+    if profile != "nuclei-authorized-http":
+        if public or operator:
+            raise NetworkPolicyError("transport profile has no control endpoint authority")
+        return
+    if public and public != _nuclei_public_control_endpoints():
+        raise NetworkPolicyError("Nuclei public OOB endpoint set is invalid")
+    if (public and operator) or len(operator) > 1:
+        raise NetworkPolicyError("Nuclei OOB endpoint mode is ambiguous")
+
+
+def _nuclei_control_endpoints(argv) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Bind Nuclei's built-in OOB channel without exposing its secret config."""
+    if type(argv) not in {tuple, list}:
+        raise NetworkPolicyError("Nuclei OOB transport is invalid")
+    disabled = [index for index, value in enumerate(argv) if value == "-ni"]
+    server_flags = [index for index, value in enumerate(argv) if value == "-iserver"]
+    if (len(disabled) > 1 or len(server_flags) > 1
+            or (disabled and server_flags)
+            or any(value.startswith("-iserver=") for value in argv)):
+        raise NetworkPolicyError("Nuclei OOB transport is invalid")
+    if disabled:
+        return (), ()
+    if not server_flags:
+        return _nuclei_public_control_endpoints(), ()
+    index = server_flags[0]
+    if index + 1 >= len(argv):
+        raise NetworkPolicyError("Nuclei OOB transport is invalid")
+    value = argv[index + 1]
+    if type(value) is not str:
+        raise NetworkPolicyError("Nuclei OOB transport is invalid")
+    parsed = urllib.parse.urlsplit(value)
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise NetworkPolicyError("Nuclei OOB transport is invalid") from exc
+    if (parsed.scheme not in {"http", "https"} or parsed.hostname is None
+            or parsed.username is not None or parsed.password is not None
+            or parsed.path not in {"", "/"} or parsed.query or parsed.fragment):
+        raise NetworkPolicyError("Nuclei OOB transport is invalid")
+    host = parsed.hostname.lower()
+    canonical_port = port or (443 if parsed.scheme == "https" else 80)
+    endpoint = _control_endpoint(host, canonical_port)
+    rendered_host = f"[{host}]" if ":" in host else host
+    rendered_port = "" if port is None else f":{port}"
+    rendered = f"{parsed.scheme}://{rendered_host}{rendered_port}"
+    if value.rstrip("/") != rendered:
+        raise NetworkPolicyError("Nuclei OOB transport is not canonical")
+    return (), (endpoint,)
+
+
+def _nuclei_protocol_lane(argv) -> str | None:
+    if type(argv) not in {tuple, list}:
+        return None
+    indexes = [index for index, value in enumerate(argv) if value == "-pt"]
+    if (len(indexes) != 1
+            or any(value.startswith("-pt=") for value in argv)
+            or indexes[0] + 1 >= len(argv)):
+        return None
+    value = argv[indexes[0] + 1]
+    return value if value in {"http,dns", "tcp"} else None
+
+
+def _validate_nuclei_protocol_lane(profile: str, lane: str) -> None:
+    if profile == "nuclei-authorized-http":
+        if lane not in {"http,dns", "tcp"}:
+            raise NetworkPolicyError("Nuclei protocol lane is invalid")
+    elif lane != "none":
+        raise NetworkPolicyError("non-Nuclei transport carries a protocol lane")
 
 
 def _exact_jxscout_chunks_argv(argv: tuple[str, ...] | list[str]) -> bool:
@@ -509,6 +644,9 @@ def transport_door(source_id: str, *, argv=None, helper: str | None = None) -> T
     if any(required not in argv for required in door.required_argv):
         return None
     if any(value.split("=", 1)[0] in door.forbidden_argv for value in argv):
+        return None
+    if door.profile == "nuclei-authorized-http" \
+            and _nuclei_protocol_lane(argv) is None:
         return None
     return door
 
@@ -748,7 +886,8 @@ class NetworkInvocation:
 
     def __init__(self, scope, *, request_id: str, source_id: str, tool: str,
                  runtime_identity=None, private_unix_roots=(),
-                 approved_peers=()):
+                 approved_peers=(), public_control_endpoints=(),
+                 operator_control_endpoints=(), nuclei_protocol_lane="none"):
         self.scope = scope
         self.request_id = request_id
         self.source_id = source_id
@@ -759,6 +898,9 @@ class NetworkInvocation:
             runtime_identity=runtime_identity,
             private_unix_roots=private_unix_roots,
             approved_peers=approved_peers,
+            public_control_endpoints=public_control_endpoints,
+            operator_control_endpoints=operator_control_endpoints,
+            nuclei_protocol_lane=nuclei_protocol_lane,
         )
 
     def attach(self, environment: dict[str, str]) -> dict[str, str]:
@@ -900,7 +1042,9 @@ class NetworkPolicyScope:
 
     def broker_policy(self, *, request_id: str, source_id: str, tool: str,
                       runtime_identity=None, private_unix_roots=(),
-                      approved_peers=()) -> dict:
+                      approved_peers=(), public_control_endpoints=(),
+                      operator_control_endpoints=(),
+                      nuclei_protocol_lane="none") -> dict:
         from . import netguard
 
         if (_request_id_re.fullmatch(request_id) is None
@@ -909,6 +1053,13 @@ class NetworkPolicyScope:
         semantics = broker_transport_semantics(source_id, tool)
         if semantics["resolver_mode"] == "mediated-public":
             semantics = {**semantics, "resolver_mode": self.resolver_mode}
+        resolver_ips = self.resolver_ips
+        if semantics["transport_profile"] == "nuclei-authorized-http":
+            # Nuclei/retryabledns switches DNS to TCP when its SOCKS proxy is
+            # set. Freeze the corresponding upstream pool in the child policy
+            # so its DNS authority cannot inherit resolv.conf.
+            semantics = {**semantics, "resolver_mode": "mediated-public"}
+            resolver_ips = _NUCLEI_DEFAULT_RESOLVERS
         control_helpers = []
         control_clients = []
         if runtime_identity is not None:
@@ -969,6 +1120,16 @@ class NetworkPolicyScope:
         if (len(approved) > _maximum_effective_cidrs
                 or tuple(approved_peers) != approved):
             raise NetworkPolicyError("approved peer set is not canonical")
+        public_controls = _canonical_control_endpoints(public_control_endpoints)
+        operator_controls = _canonical_control_endpoints(operator_control_endpoints)
+        if set(public_controls) & set(operator_controls):
+            raise NetworkPolicyError("control endpoint authority overlaps")
+        _validate_control_endpoint_authority(
+            semantics["transport_profile"], public_controls, operator_controls,
+        )
+        _validate_nuclei_protocol_lane(
+            semantics["transport_profile"], nuclei_protocol_lane,
+        )
         document = {
             "schema_version": "quarry.network-broker-policy.v1",
             "request_id": request_id,
@@ -978,11 +1139,14 @@ class NetworkPolicyScope:
             "block_private_targets": self.block_private_targets,
             "control_plane_cidrs": list(self.control_plane_cidrs),
             "initial_own_ips": list(self.own_ips),
-            "resolver_ips": list(self.resolver_ips),
+            "resolver_ips": list(resolver_ips),
             "apex_domains": list(self.apex_domains),
             "oos_patterns": list(self.oos_patterns),
             "effective_cidrs": list(self.effective_cidrs),
             "approved_peers": list(approved),
+            "public_control_endpoints": list(public_controls),
+            "operator_control_endpoints": list(operator_controls),
+            "nuclei_protocol_lane": nuclei_protocol_lane,
             "control_helpers": control_helpers,
             "control_clients": control_clients,
             "private_unix_roots": unix_roots,
@@ -1182,15 +1346,29 @@ class NetworkPolicyScope:
                 raise NetworkPolicyError(
                     "approved transport lacks an exact peer set",
                 )
+        elif semantics["transport_profile"] == "nuclei-authorized-http":
+            if not approved_peers:
+                raise NetworkPolicyError(
+                    "Nuclei proxy transport lacks an exact target peer set",
+                )
         elif approved_peers:
             raise NetworkPolicyError(
                 "transport profile does not consume caller-approved peers",
             )
+        public_controls = ()
+        operator_controls = ()
+        nuclei_lane = "none"
+        if semantics["transport_profile"] == "nuclei-authorized-http":
+            public_controls, operator_controls = _nuclei_control_endpoints(argv)
+            nuclei_lane = _nuclei_protocol_lane(argv) or "none"
         invocation = NetworkInvocation(
             self, request_id=request_id, source_id=source_id,
             tool=Path(tool).name, runtime_identity=runtime_identity,
             private_unix_roots=private_unix_roots,
             approved_peers=approved_peers,
+            public_control_endpoints=public_controls,
+            operator_control_endpoints=operator_controls,
+            nuclei_protocol_lane=nuclei_lane,
         )
         self._trace({
             "schema_version": "quarry.network-policy-trace.v1",

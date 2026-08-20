@@ -1,4 +1,4 @@
-"""Runner-owned pinned HTTP/CONNECT proxy for sandboxed browser lanes."""
+"""Runner-owned pinned HTTP/CONNECT and SOCKS5 proxy for sandboxed lanes."""
 from __future__ import annotations
 
 import errno
@@ -7,6 +7,7 @@ import json
 import re
 import select
 import socket
+import struct
 import threading
 import time
 from dataclasses import dataclass
@@ -32,10 +33,16 @@ _MAX_PROXY_RECORD_BYTES = 1024
 _MAX_PROXY_SUMMARY_BYTES = _MAX_PROXY_RECORDS * (_MAX_PROXY_RECORD_BYTES + 1)
 _MAX_PROXY_BUFFER_BYTES = 64 * 1024
 _TOKEN = re.compile(rb"[!#$%&'*+.^_`|~0-9A-Za-z-]+\Z")
+_NUCLEI_DNS_OPT = struct.Struct("!BHHIH")
+_NUCLEI_DNS_OPT_UDP_SIZE = 4096
 
 
 class BrowserProxyRefused(NetworkBrokerRefused):
     """A browser proxy request or authority was not safely admissible."""
+
+
+class _SocksProxyRefused(BrowserProxyRefused):
+    """A SOCKS5 request was refused after protocol selection."""
 
 
 @dataclass(frozen=True)
@@ -358,7 +365,9 @@ class PinnedBrowserProxy:
                     raise NetworkBrokerRefused("network_effect_fence_closed")
                 client_identities = (
                     self._policy.control_clients
-                    if self._policy.transport_profile == "target-http-proxy"
+                    if self._policy.transport_profile in {
+                        "target-http-proxy", "nuclei-authorized-http",
+                    }
                     else self._policy.control_helpers
                 )
                 registration = self._registry.register_worker_listener(
@@ -585,6 +594,10 @@ class PinnedBrowserProxy:
             if grant is None:
                 raise BrowserProxyRefused("network_proxy_connection_grant_refused")
             self._serve(client)
+        except _SocksProxyRefused as exc:
+            self._record(
+                stage="request", method="SOCKS5", decision="deny", reason=str(exc),
+            )
         except BrowserProxyRefused as exc:
             self._record(
                 stage="request", method="", decision="deny", reason=str(exc),
@@ -612,14 +625,12 @@ class PinnedBrowserProxy:
             with self._lock:
                 self._threads.discard(current)
 
-    def _read_header(self, client: socket.socket) -> tuple[bytes, bytes]:
-        body = bytearray()
+    def _read_exact(self, client: socket.socket, length: int) -> bytes:
+        if not 0 <= length <= _MAX_PROXY_HEADER_BYTES:
+            raise BrowserProxyRefused("network_proxy_request_oversize")
         client.setblocking(False)
-        authentication = self._authentication
-        if authentication is None:
-            raise BrowserProxyRefused("network_proxy_authentication_invalid")
-        prefix = bytearray()
-        while len(prefix) < len(authentication):
+        body = bytearray()
+        while len(body) < length:
             if self._stop.is_set() or time.monotonic() >= self._deadline:
                 raise BrowserProxyRefused("network_proxy_request_cancelled")
             readable, _writable, exceptional = select.select(
@@ -629,12 +640,21 @@ class PinnedBrowserProxy:
                 raise BrowserProxyRefused("network_proxy_client_failed")
             if not readable:
                 continue
-            block = client.recv(len(authentication) - len(prefix))
+            block = client.recv(length - len(body))
             if not block:
-                raise BrowserProxyRefused("network_proxy_authentication_missing")
-            prefix.extend(block)
-        if bytes(prefix) != authentication:
+                raise BrowserProxyRefused("network_proxy_request_truncated")
+            body.extend(block)
+        return bytes(body)
+
+    def _authenticate(self, client: socket.socket) -> None:
+        authentication = self._authentication
+        if authentication is None:
+            raise BrowserProxyRefused("network_proxy_authentication_invalid")
+        if self._read_exact(client, len(authentication)) != authentication:
             raise BrowserProxyRefused("network_proxy_authentication_refused")
+
+    def _read_header(self, client: socket.socket, initial=b"") -> tuple[bytes, bytes]:
+        body = bytearray(initial)
         while not self._stop.is_set() and time.monotonic() < self._deadline:
             marker = body.find(b"\r\n\r\n")
             if marker >= 0:
@@ -655,6 +675,198 @@ class PinnedBrowserProxy:
             body.extend(block)
         raise BrowserProxyRefused("network_proxy_request_cancelled")
 
+    def _serve_socks(self, client: socket.socket) -> None:
+        upstream = None
+        replied = False
+        try:
+            nmethods = self._read_exact(client, 1)[0]
+            methods = self._read_exact(client, nmethods)
+            if 0 not in methods:
+                self._send(client, b"\x05\xff")
+                raise _SocksProxyRefused("network_proxy_socks_auth_refused")
+            self._send(client, b"\x05\x00")
+            version, command, reserved, address_type = self._read_exact(client, 4)
+            if version != 5 or command != 1 or reserved != 0:
+                raise _SocksProxyRefused("network_proxy_socks_command_refused")
+            if address_type == 1:
+                host = socket.inet_ntop(socket.AF_INET, self._read_exact(client, 4))
+            elif address_type == 4:
+                host = socket.inet_ntop(socket.AF_INET6, self._read_exact(client, 16))
+            elif address_type == 3:
+                size = self._read_exact(client, 1)[0]
+                if size == 0:
+                    raise _SocksProxyRefused("network_proxy_socks_authority_invalid")
+                try:
+                    host = self._read_exact(client, size).decode("ascii")
+                except UnicodeDecodeError as exc:
+                    raise _SocksProxyRefused(
+                        "network_proxy_socks_authority_invalid",
+                    ) from exc
+            else:
+                raise _SocksProxyRefused("network_proxy_socks_address_refused")
+            port = int.from_bytes(self._read_exact(client, 2), "big")
+            if port == 0:
+                raise _SocksProxyRefused("network_proxy_socks_authority_invalid")
+            if self._is_nuclei_resolver(host, port):
+                self._send(client, b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
+                replied = True
+                self._serve_nuclei_dns(client, host)
+                return
+            # The Nuclei SOCKS boundary has one DNS authority only. In
+            # particular, an invocation-approved target IP on port 53 must
+            # not fall through to the raw SOCKS relay.
+            if (getattr(getattr(self, "_policy", None), "transport_profile", None)
+                    == "nuclei-authorized-http" and port == 53):
+                raise _SocksProxyRefused("network_proxy_nuclei_resolver_refused")
+            upstream = self._dial("SOCKS5", host, port)
+            self._send(client, b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
+            replied = True
+            self._relay(client, upstream)
+        except _SocksProxyRefused:
+            raise
+        except (BrowserProxyRefused, OSError) as exc:
+            if not replied and not self._stop.is_set():
+                try:
+                    self._send(
+                        client,
+                        b"\x05\x02\x00\x01\x00\x00\x00\x00\x00\x00",
+                    )
+                except (BrowserProxyRefused, OSError, NetworkBrokerRefused):
+                    pass
+            raise _SocksProxyRefused(str(exc)) from exc
+        finally:
+            if upstream is not None:
+                self._close_tracked(upstream)
+
+    def _is_nuclei_resolver(self, host: str, port: int) -> bool:
+        """Select only the DNS-over-TCP tunnel owned by Nuclei's SOCKS lane."""
+        policy = getattr(self, "_policy", None)
+        if (policy is None or policy.transport_profile != "nuclei-authorized-http"
+                or policy.nuclei_protocol_lane != "http,dns" or port != 53):
+            return False
+        try:
+            address = ipaddress.ip_address(host)
+        except ValueError:
+            return False
+        canonical = str(getattr(address, "ipv4_mapped", None) or address)
+        return canonical == host and canonical in policy.resolver_ips
+
+    def _parse_nuclei_dns_query(self, message: bytes) -> str:
+        """Accept one uncompressed, one-question DNS QUERY frame only."""
+        if len(message) < network_dns._DNS_HEADER.size + 5 + _NUCLEI_DNS_OPT.size:
+            raise _SocksProxyRefused("network_proxy_dns_query_malformed")
+        _transaction, flags, questions, answers, authority, additional = \
+            network_dns._DNS_HEADER.unpack_from(message)
+        if questions != 1 or answers or authority or additional != 1:
+            raise _SocksProxyRefused("network_proxy_dns_query_malformed")
+        try:
+            name, offset = network_dns._decode_name(
+                message, network_dns._DNS_HEADER.size,
+            )
+        except network_dns.NetworkDNSRefused as exc:
+            raise _SocksProxyRefused("network_proxy_dns_query_malformed") from exc
+        # DNS compression in a request is an alternate framing. Re-encoding
+        # makes the accepted QUERY wire shape exact and unambiguous.
+        if (not name or message[network_dns._DNS_HEADER.size:offset]
+                != network_dns._encode_name(name)):
+            raise _SocksProxyRefused("network_proxy_dns_query_malformed")
+        query_type, query_class = struct.unpack_from("!HH", message, offset)
+        opt_offset = offset + 4
+        if query_type == 0 or query_class != 1 or \
+                opt_offset + _NUCLEI_DNS_OPT.size != len(message):
+            raise _SocksProxyRefused("network_proxy_dns_query_malformed")
+        # Nuclei v3.11's dns.Request.Make emits SetEdns0(4096, false) for
+        # every request and adds AD only for TXT. Admit precisely that
+        # request shape, not a general EDNS extension channel.
+        expected_flags = 0x0120 if query_type == 16 else 0x0100
+        owner, opt_type, udp_size, opt_ttl, option_length = \
+            _NUCLEI_DNS_OPT.unpack_from(message, opt_offset)
+        if (flags != expected_flags or owner != 0 or opt_type != 41
+                or udp_size != _NUCLEI_DNS_OPT_UDP_SIZE or opt_ttl != 0
+                or option_length != 0):
+            raise _SocksProxyRefused("network_proxy_dns_query_malformed")
+        decision, _reason = self._policy.dns_name_allowed(name)
+        if decision != "allow":
+            raise _SocksProxyRefused("network_proxy_dns_qname_out_of_scope")
+        return name
+
+    def _read_dns_frame(self, client: socket.socket) -> bytes:
+        length = int.from_bytes(self._read_exact(client, 2), "big")
+        if length < network_dns._DNS_HEADER.size + 5:
+            raise _SocksProxyRefused("network_proxy_dns_query_malformed")
+        return self._read_exact(client, length)
+
+    def _serve_nuclei_dns(self, client: socket.socket, resolver: str) -> None:
+        """Mediate every DNS-over-TCP query before any resolver payload flows."""
+        while not self._stop.is_set() and time.monotonic() < self._deadline:
+            request = self._read_dns_frame(client)
+            name = self._parse_nuclei_dns_query(request)
+            self._exchange_nuclei_dns(client, resolver, request, name)
+        raise _SocksProxyRefused("network_proxy_request_cancelled")
+
+    def _exchange_nuclei_dns(self, client: socket.socket, resolver: str,
+                             request: bytes, name: str) -> None:
+        decision, reason = self._policy.decide_dns(
+            resolver, 53, socket.SOCK_STREAM, socket.IPPROTO_TCP,
+        )
+        if decision != "allow":
+            raise _SocksProxyRefused("network_proxy_dns_resolver_refused")
+        if not self._record(
+                stage="dns-planned", method="SOCKS5-DNS", host=name, port=53,
+                peer=resolver, decision="allow", reason=reason):
+            raise _SocksProxyRefused("network_proxy_trace_authority_failed")
+        upstream = None
+        try:
+            address = ipaddress.ip_address(resolver)
+            family = socket.AF_INET if address.version == 4 else socket.AF_INET6
+            endpoint = (resolver, 53) if family == socket.AF_INET else \
+                (resolver, 53, 0, 0)
+            upstream = socket.socket(family, socket.SOCK_STREAM, socket.IPPROTO_TCP)
+            self._track(upstream)
+            network_dns._connect(
+                upstream, endpoint, deadline_monotonic=self._deadline,
+                effect_fence=self._effect_fence,
+            )
+            observed = ipaddress.ip_address(upstream.getpeername()[0])
+            selected = str(getattr(observed, "ipv4_mapped", None) or observed)
+            if selected != resolver:
+                raise _SocksProxyRefused("network_proxy_dns_resolver_peer_unverified")
+            selected_decision, selected_reason = self._policy.decide_dns(
+                selected, 53, socket.SOCK_STREAM, socket.IPPROTO_TCP,
+            )
+            if selected_decision != "allow":
+                raise _SocksProxyRefused("network_proxy_dns_resolver_refused")
+            network_dns._send_all(
+                upstream, len(request).to_bytes(2, "big") + request,
+                deadline_monotonic=self._deadline, effect_fence=self._effect_fence,
+            )
+            response_length = int.from_bytes(network_dns._read_exact(
+                upstream, 2, deadline_monotonic=self._deadline,
+                effect_fence=self._effect_fence,
+            ), "big")
+            if response_length < network_dns._DNS_HEADER.size:
+                raise _SocksProxyRefused("network_proxy_dns_response_malformed")
+            response = network_dns._read_exact(
+                upstream, response_length, deadline_monotonic=self._deadline,
+                effect_fence=self._effect_fence,
+            )
+            self._send(client, response_length.to_bytes(2, "big") + response)
+            if not self._record(
+                    stage="dns-settled", method="SOCKS5-DNS", host=name,
+                    port=53, peer=selected, decision="allow",
+                    reason=selected_reason):
+                raise _SocksProxyRefused("network_proxy_trace_authority_failed")
+        except BaseException:
+            self._record(
+                stage="dns-settled", method="SOCKS5-DNS", host=name, port=53,
+                peer=resolver, decision="deny",
+                reason="Nuclei DNS-over-TCP exchange did not settle",
+            )
+            raise
+        finally:
+            if upstream is not None:
+                self._close_tracked(upstream)
+
     def _dns_event(self, method: str, host: str, stage: str, peer: str,
                    port: int, decision: str, reason: str) -> None:
         self._record(
@@ -667,7 +879,7 @@ class PinnedBrowserProxy:
     def _dial(self, method: str, host: str, port: int) -> socket.socket:
         if self._stop.is_set() or time.monotonic() >= self._deadline:
             raise BrowserProxyRefused("network_proxy_request_cancelled")
-        host_decision, host_reason = self._policy.host_allowed(host)
+        host_decision, host_reason = self._policy.host_allowed(host, port)
         self._record(
             stage="authority", method=method, host=host, port=port,
             decision=host_decision, reason=host_reason,
@@ -685,8 +897,8 @@ class PinnedBrowserProxy:
         if state != "ok" or not answers:
             raise BrowserProxyRefused("network_proxy_resolution_indeterminate")
         decisions = [
-            (peer, *self._policy.decide_resolved(
-                peer, port, socket.SOCK_STREAM, socket.IPPROTO_TCP,
+            (peer, *self._policy.decide_proxy_resolved(
+                host, peer, port, socket.SOCK_STREAM, socket.IPPROTO_TCP,
             ))
             for peer in answers
         ]
@@ -754,8 +966,8 @@ class PinnedBrowserProxy:
                 selected = str(getattr(observed, "ipv4_mapped", None) or observed)
                 if selected != peer:
                     raise BrowserProxyRefused("network_proxy_selected_peer_unverified")
-                final_decision, final_reason = self._policy.decide_resolved(
-                    selected, port, socket.SOCK_STREAM, socket.IPPROTO_TCP,
+                final_decision, final_reason = self._policy.decide_proxy_resolved(
+                    host, selected, port, socket.SOCK_STREAM, socket.IPPROTO_TCP,
                 )
                 if not self._record(
                     stage="peer-settled", method=method, host=host, port=port,
@@ -889,7 +1101,12 @@ class PinnedBrowserProxy:
         raise BrowserProxyRefused("network_proxy_request_cancelled")
 
     def _serve(self, client: socket.socket) -> None:
-        header, remainder = self._read_header(client)
+        self._authenticate(client)
+        first = self._read_exact(client, 1)
+        if first == b"\x05":
+            self._serve_socks(client)
+            return
+        header, remainder = self._read_header(client, first)
         request = _parse_request(header, remainder)
         upstream = self._dial(request.method, request.host, request.port)
         try:

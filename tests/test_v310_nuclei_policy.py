@@ -94,6 +94,22 @@ def test_offline_inventory_selects_each_owner_and_binds_helpers(tmp_path, fixed_
     nuclei_policy.validate_document(json.loads(json.dumps(document)))
 
 
+def test_target_hosts_are_the_exact_canonical_chunk_authorities():
+    assert nuclei_policy.target_hosts([
+        "https://api.acme.test:8443/a", "api.acme.test", "http://[2001:db8::1]/",
+        "https://api.acme.test/b",
+    ]) == ("2001:db8::1", "api.acme.test")
+    assert nuclei_policy.target_hosts([
+        "2001:0DB8:0:0::1", "::ffff:192.0.2.1", "192.0.2.2",
+    ]) == ("192.0.2.1", "192.0.2.2", "2001:db8::1")
+    with pytest.raises(nuclei_policy.NucleiPolicyError, match="canonical authority"):
+        nuclei_policy.target_hosts(["fe80::1%eth0"])
+    with pytest.raises(nuclei_policy.NucleiPolicyError, match="canonical authority"):
+        nuclei_policy.target_hosts(["https://user@acme.test/"])
+    with pytest.raises(nuclei_policy.NucleiPolicyError, match="no canonical authority"):
+        nuclei_policy.target_hosts([])
+
+
 def test_oob_false_adds_ni_to_every_owner_without_changing_private_default(
         tmp_path, fixed_settings, monkeypatch):
     monkeypatch.setattr(
@@ -212,14 +228,17 @@ def test_frozen_self_hosted_oob_transport_is_exact_for_all_four_owners(
     )
     for owner_name in nuclei_policy.OWNERS:
         row = authority.owner(owner_name)
+        protocol_lane = authority.protocol_lanes(owner_name)[0]
         with authority.oob_flags() as oob_flags:
             assert oob_flags[:2] == ("-iserver", "https://oob.example")
             assert token not in oob_flags and "-itoken" not in oob_flags
             config_path = Path(oob_flags[oob_flags.index("-config") + 1])
             command = ["nuclei", "-l", "/input", "-jsonl", "-o", "/output",
+                       "-pt", protocol_lane,
                        *row["flags"], "-config", str(config_path)]
             nuclei_policy._assert_command(
                 row, command, oob_enabled=True, expected_private_config=config_path,
+                allowed_protocol_lanes=authority.protocol_lanes(owner_name),
             )
         assert not config_path.parent.exists()
 
@@ -233,11 +252,13 @@ def test_command_policy_rejects_duplicate_or_unrecorded_coverage_flags(
         engine_identity=_engine(),
     )
     row = next(owner for owner in document["owners"] if owner["owner"] == "params.nuclei_scan")
-    base = ["nuclei", "-l", "/input", "-jsonl", "-o", "/output", *row["flags"]]
+    base = ["nuclei", "-l", "/input", "-jsonl", "-o", "/output",
+            "-pt", "http,dns", *row["flags"]]
     for addition in (("-s", "low"), ("-headless",), ("-itoken", "secret")):
         with pytest.raises(nuclei_policy.NucleiPolicyError):
             nuclei_policy._assert_command(
                 row, [*base, *addition], oob_enabled=True, expected_private_config=None,
+                allowed_protocol_lanes=("http,dns", "tcp"),
             )
 
 
@@ -439,6 +460,41 @@ def test_mixed_dns_http_template_has_engine_primary_dns_and_one_partition(
     assert "mixed.yaml" not in partitions["http"]["selected_paths"]
     assert partitions["tcp"]["selected_paths"] == ["tcp.yaml"]
     assert sum(row["selected_count"] for row in partitions.values()) == owner["selected_count"]
+    authority = nuclei_policy.Authority(
+        document=document, path=tmp_path / "unused-policy", artifact_bytes=b"",
+        template_path=templates, config_path=cfg, template_check={}, config_check={},
+        engine_identity=_engine(),
+    )
+    assert authority.protocol_lanes("params.nuclei_scan") == ("http,dns", "tcp")
+    webdns = authority.lane("params.nuclei_scan", "http,dns")
+    tcp = authority.lane("params.nuclei_scan", "tcp")
+    assert webdns["selected_count"] + tcp["selected_count"] == owner["selected_count"]
+    assert webdns["selection_digest"] != tcp["selection_digest"]
+
+
+def test_command_policy_requires_one_accepted_protocol_lane(
+        tmp_path, fixed_settings, monkeypatch):
+    monkeypatch.setattr(nuclei_policy.secrets, "oob", lambda: {})
+    templates, cfg = _corpus(tmp_path)
+    document = nuclei_policy.build_document(
+        run_id="lane-command", profile=_profile(), template_root=templates,
+        config_root=cfg, engine_identity=_engine(),
+    )
+    authority = nuclei_policy.Authority(
+        document=document, path=tmp_path / "unused-policy", artifact_bytes=b"",
+        template_path=templates, config_path=cfg, template_check={}, config_check={},
+        engine_identity=_engine(),
+    )
+    row = authority.owner("params.nuclei_scan")
+    base = ["nuclei", "-l", "/input", "-jsonl", "-o", "/output", *row["flags"]]
+    for lane_args in ((), ("-pt", "tcp"),
+                      ("-pt", "http,dns", "-pt", "http,dns")):
+        with pytest.raises(nuclei_policy.NucleiPolicyError, match="protocol lane"):
+            nuclei_policy._assert_command(
+                row, [*base, *lane_args], oob_enabled=True,
+                expected_private_config=None,
+                allowed_protocol_lanes=authority.protocol_lanes("params.nuclei_scan"),
+            )
 
 
 @pytest.mark.parametrize(("request_body", "message"), [
@@ -1289,6 +1345,38 @@ def test_settlement_binds_owner_coverage_for_started_and_non_started_results(
     assert fields["flags_digest"] == row["flags_digest"]
     assert fields["selected_count"] == row["selected_count"]
     assert fields["started"] is started
+
+
+def test_settlement_protocol_lane_must_match_the_executed_command(
+        tmp_path, fixed_settings, monkeypatch):
+    monkeypatch.setattr(nuclei_policy.secrets, "oob", lambda: {})
+    templates, cfg = _corpus(tmp_path)
+    (templates / "tcp.yaml").write_text(
+        "id: tcp-only\ninfo: {severity: high, tags: [cve]}\n"
+        "tcp:\n- host: ['{{Hostname}}']\n"
+    )
+    document = nuclei_policy.build_document(
+        run_id="settlement-lane", profile=_profile(oob=False), template_root=templates,
+        config_root=cfg, engine_identity=_engine(), engine_pin="v3.11.0",
+    )
+    authority = nuclei_policy.Authority(
+        document=document, path=tmp_path / "unused-policy",
+        artifact_bytes=nuclei_policy._canonical(document), template_path=templates,
+        config_path=cfg, template_check={}, config_check={}, engine_identity=_engine(),
+    )
+    authority.assert_ready = lambda: None
+    row = authority.owner("params.nuclei_scan")
+    result = SimpleNamespace(
+        cmd=["nuclei", "-l", "/input", "-jsonl", "-o", "/output",
+             "-pt", "http,dns", *row["flags"]],
+        meta={"started": False}, started=False,
+        status=SimpleNamespace(value="success"),
+    )
+    with pytest.raises(nuclei_policy.NucleiPolicyError, match="differs from the executed"):
+        authority.settle(
+            "params.nuclei_scan", result, input_total=1, work_unit="work-unit",
+            protocol_lane="tcp",
+        )
 
 
 def test_settlement_validates_owner_before_any_authority_reconciliation(

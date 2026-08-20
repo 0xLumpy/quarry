@@ -236,18 +236,24 @@ def test_policy_handoff_verifies_parses_and_starts_before_ack(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("source_id", "tool", "cmd", "profile", "proxy_flag"),
+    ("source_id", "tool", "cmd", "profile", "lane", "proxy_flag", "scheme", "extra"),
     (
         ("crawl.katana_standard", "katana", ("katana", "-duc", "-silent"),
-         "target-http-proxy", "-proxy"),
+         "target-http-proxy", "none", "-proxy", "http", ()),
         ("probe.gowitness", "gowitness", ("gowitness", "scan", "file"),
-         "browser-pipe-proxy", "--chrome-proxy"),
+         "browser-pipe-proxy", "none", "--chrome-proxy", "http", ()),
         ("enrich.gowitness", "gowitness", ("gowitness", "scan", "file"),
-         "browser-pipe-proxy", "--chrome-proxy"),
+         "browser-pipe-proxy", "none", "--chrome-proxy", "http", ()),
+        ("params.nuclei_scan", "nuclei",
+         ("nuclei", "-duc", "-l", "targets", "-pt", "http,dns"),
+         "nuclei-authorized-http", "http,dns", "-p", "socks5", ("-pi",)),
+        ("params.nuclei_scan", "nuclei",
+         ("nuclei", "-duc", "-l", "targets", "-pt", "tcp"),
+         "nuclei-authorized-http", "tcp", "-p", "socks5", ("-pi",)),
     ),
 )
 def test_proxy_is_runner_injected_before_release_and_shares_authority(
-        monkeypatch, source_id, tool, cmd, profile, proxy_flag):
+        monkeypatch, source_id, tool, cmd, profile, lane, proxy_flag, scheme, extra):
     report_read, report_write = os.pipe()
     ack_read, ack_write = os.pipe()
     events = []
@@ -272,6 +278,7 @@ def test_proxy_is_runner_injected_before_release_and_shares_authority(
         tool = request.tool
         source_id = expected_source_id
         transport_profile = expected_profile
+        nuclei_protocol_lane = lane
 
         @classmethod
         def from_json(cls, raw):
@@ -324,7 +331,7 @@ def test_proxy_is_runner_injected_before_release_and_shares_authority(
         assert request.argv == cmd
         assert protocol.request_digest(request) == original_digest
         assert child_request.argv == request.argv + (
-            proxy_flag, "http://127.0.0.1:43123",
+            proxy_flag, f"{scheme}://127.0.0.1:43123", *extra,
         )
 
         launcher._release_callback(
@@ -360,6 +367,40 @@ def test_gowitness_caller_proxy_is_refused_before_proxy_start(monkeypatch, cmd):
         tool = request.tool
         source_id = "probe.gowitness"
         transport_profile = "browser-pipe-proxy"
+
+        @classmethod
+        def from_json(cls, raw):
+            assert raw == "policy-wire"
+            return cls()
+
+    monkeypatch.setattr(runner_worker, "BrokerPolicy", FakePolicy)
+    monkeypatch.setattr(
+        runner_worker, "PinnedBrowserProxy",
+        lambda *_args, **_kwargs: pytest.fail("caller proxy reached proxy startup"),
+    )
+    with pytest.raises(RuntimeError, match="network_proxy_caller_argument_forbidden"):
+        runner_worker._configure_network_broker(request, launcher)
+
+
+@pytest.mark.parametrize(
+    "flag",
+    ("-p", "-proxy", "-pi", "-proxy-internal"),
+)
+def test_nuclei_caller_proxy_is_refused_before_proxy_start(monkeypatch, flag):
+    request = _request(
+        environment=((PRIVATE_POLICY_ENV, "policy-wire"),),
+        tool="nuclei", cmd=("nuclei", "-duc", flag),
+    )
+    launcher = SimpleNamespace(
+        _network_control_registry=None, _network_effect_fence=None,
+    )
+
+    class FakePolicy:
+        request_id = request.request_id
+        tool = request.tool
+        source_id = "params.nuclei_scan"
+        transport_profile = "nuclei-authorized-http"
+        nuclei_protocol_lane = "http,dns"
 
         @classmethod
         def from_json(cls, raw):

@@ -1933,6 +1933,9 @@ class BrokerPolicy:
     transport_profile: str = "test-exact-approved"
     peer_mode: str = "approved"
     resolver_mode: str = "mediated-explicit"
+    public_control_endpoints: tuple[str, ...] = ()
+    operator_control_endpoints: tuple[str, ...] = ()
+    nuclei_protocol_lane: str = "none"
 
     @classmethod
     def from_json(cls, raw: str) -> "BrokerPolicy":
@@ -1941,11 +1944,15 @@ class BrokerPolicy:
             NetworkPolicyError,
             _MAX_BROKER_POLICY_BYTES,
             _MAX_EXECUTABLE_BYTES as POLICY_MAX_EXECUTABLE_BYTES,
+            _canonical_control_endpoints,
             _explicit_resolvers,
+            _NUCLEI_DEFAULT_RESOLVERS,
             _public_resolvers,
             _resolver_snapshot,
             broker_transport_semantics,
             canonical_control_plane_cidrs,
+            _validate_control_endpoint_authority,
+            _validate_nuclei_protocol_lane,
         )
 
         if (type(raw) is not str
@@ -1963,6 +1970,8 @@ class BrokerPolicy:
             "initial_own_ips", "resolver_ips", "proxy_inheritance",
             "apex_domains", "oos_patterns", "effective_cidrs",
             "approved_peers",
+            "public_control_endpoints", "operator_control_endpoints",
+            "nuclei_protocol_lane",
             "control_helpers", "control_clients", "private_unix_roots",
         }
         if type(document) is not dict or set(document) != expected:
@@ -2007,6 +2016,9 @@ class BrokerPolicy:
                 or list(controls) != document["control_plane_cidrs"]
                 or list(initial) != document["initial_own_ips"]
                 or list(resolvers) != document["resolver_ips"]):
+            raise NetworkBrokerRefused("network_broker_policy_invalid")
+        if (semantics["transport_profile"] == "nuclei-authorized-http"
+                and resolvers != _NUCLEI_DEFAULT_RESOLVERS):
             raise NetworkBrokerRefused("network_broker_policy_invalid")
         from . import normalize
         raw_apexes = document["apex_domains"]
@@ -2065,6 +2077,26 @@ class BrokerPolicy:
             raise NetworkBrokerRefused("network_broker_policy_invalid") from exc
         if (len(approved) > 4096 or list(approved) != document["approved_peers"]):
             raise NetworkBrokerRefused("network_broker_policy_invalid")
+        try:
+            public_controls = _canonical_control_endpoints(
+                document["public_control_endpoints"],
+            )
+            operator_controls = _canonical_control_endpoints(
+                document["operator_control_endpoints"],
+            )
+        except NetworkPolicyError as exc:
+            raise NetworkBrokerRefused("network_broker_policy_invalid") from exc
+        if set(public_controls) & set(operator_controls):
+            raise NetworkBrokerRefused("network_broker_policy_invalid")
+        try:
+            _validate_control_endpoint_authority(
+                semantics["transport_profile"], public_controls, operator_controls,
+            )
+            _validate_nuclei_protocol_lane(
+                semantics["transport_profile"], document["nuclei_protocol_lane"],
+            )
+        except NetworkPolicyError as exc:
+            raise NetworkBrokerRefused("network_broker_policy_invalid") from exc
         identities = []
         for name in ("control_helpers", "control_clients"):
             raw_identities = document[name]
@@ -2103,17 +2135,32 @@ class BrokerPolicy:
             control_plane_cidrs=controls, initial_own_ips=initial,
             resolver_ips=resolvers, apex_domains=tuple(apexes),
             oos_patterns=tuple(patterns), effective_cidrs=tuple(effective),
-            approved_peers=approved, control_helpers=identities[0],
+            approved_peers=approved,
+            public_control_endpoints=public_controls,
+            operator_control_endpoints=operator_controls,
+            nuclei_protocol_lane=document["nuclei_protocol_lane"],
+            control_helpers=identities[0],
             control_clients=identities[1], private_unix_roots=tuple(roots),
             **semantics,
         )
 
-    def host_allowed(self, host: str) -> tuple[str, str]:
+    @staticmethod
+    def _endpoint(host: str, port: int) -> str:
+        return f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+
+    def host_allowed(self, host: str, port: int | None = None) -> tuple[str, str]:
         """Decide the canonical HTTP authority before any DNS request."""
         from . import normalize
 
         if "%" in host:
             return "deny", "scoped IPv6 HTTP authority is not canonical"
+        endpoint = self._endpoint(host, port) if type(port) is int else None
+        if endpoint in self.public_control_endpoints:
+            return "allow", "declared public OOB control endpoint"
+        if endpoint in self.operator_control_endpoints:
+            return "allow", "declared operator OOB control endpoint"
+        if port == 53 and host in self.resolver_ips:
+            return "deny", "DNS resolver is direct-only, never proxy authority"
         try:
             address = ipaddress.ip_address(host)
         except ValueError:
@@ -2127,6 +2174,9 @@ class BrokerPolicy:
                    for pattern in self.oos_patterns):
                 return "deny", "HTTP authority matches an out-of-scope rule"
             return "allow", "HTTP authority is inside the active apex scope"
+        if (self.transport_profile == "nuclei-authorized-http"
+                and str(address) in self.approved_peers):
+            return "allow", "literal proxy authority is invocation-approved"
         if any(address.version == network.version and address in network
                for network in map(ipaddress.ip_network, self.effective_cidrs)):
             return "allow", "literal HTTP authority is inside effective CIDR scope"
@@ -2264,6 +2314,26 @@ class BrokerPolicy:
             peer, port, kind, protocol, mediated=True,
         )
 
+    def decide_proxy_resolved(self, host: str, peer: str, port: int, kind: int,
+                              protocol: int) -> tuple[str, str]:
+        """Classify a proxy peer with its exact target/control authority."""
+        from . import netguard
+
+        decision, reason = self.decide_resolved(peer, port, kind, protocol)
+        if port == 53 and host in self.resolver_ips:
+            return "deny", "DNS resolver is direct-only, never proxy authority"
+        if decision != "allow":
+            return decision, reason
+        endpoint = self._endpoint(host, port)
+        if endpoint in self.public_control_endpoints:
+            address = ipaddress.ip_address(peer)
+            if not address.is_global or netguard.is_private_ip(peer):
+                return "deny", "public OOB control peer is not global unicast"
+            return "allow", "declared public OOB control peer admitted"
+        if endpoint in self.operator_control_endpoints:
+            return "allow", "declared operator OOB control peer admitted"
+        return decision, reason
+
     def decide_dns(self, peer: str, port: int, kind: int,
                    protocol: int) -> tuple[str, str]:
         """Authorize only Quarry's validating DNS mediator, never a tracee."""
@@ -2313,6 +2383,34 @@ class BrokerPolicy:
                 and (not address.is_global or netguard.is_private_ip(peer)):
             return "deny", "ambient private resolver lacks explicit authority"
         return "allow", "configured resolver admitted only for DNS mediation"
+
+    def dns_name_allowed(self, name: str) -> tuple[str, str]:
+        """Authorize one canonical DNS question owned by Nuclei's SOCKS lane."""
+        from . import normalize
+
+        if (self.transport_profile != "nuclei-authorized-http"
+                or self.nuclei_protocol_lane != "http,dns"):
+            return "deny", "DNS question is outside the Nuclei protocol lane"
+        if type(name) is not str or normalize.canon_host_strict(name) != name:
+            return "deny", "DNS question name is not canonical"
+        if any(name == apex or name.endswith("." + apex)
+               for apex in self.apex_domains):
+            if any(oos_search(pattern, name) for pattern in self.oos_patterns):
+                return "deny", "DNS question matches an out-of-scope rule"
+            return "allow", "DNS question is inside the active apex scope"
+
+        def endpoint_host(endpoint: str) -> str:
+            if endpoint.startswith("["):
+                return endpoint[1:endpoint.index("]")]
+            return endpoint.rsplit(":", 1)[0]
+
+        suffixes = tuple(endpoint_host(value) for value in (
+            self.public_control_endpoints + self.operator_control_endpoints
+        ))
+        if any(name == suffix or name.endswith("." + suffix)
+               for suffix in suffixes):
+            return "allow", "DNS question is inside declared OOB suffix authority"
+        return "deny", "DNS question is outside target/OOB authority"
 
 
 @dataclass

@@ -895,11 +895,15 @@ def _nuclei_progress(text: str) -> dict:
     return {"completed": completed, "planned": planned, "requests": requests, "errors": errors}
 
 
-def _nuclei_cmd(targets_file, out_file, prof, mhe: int, *, oob_flags=()) -> list[str]:
+def _nuclei_cmd(targets_file, out_file, prof, mhe: int, *, protocol_lane="http,dns",
+                oob_flags=()) -> list[str]:
     """The nuclei main-scan command for one target file; identical flags for every chunk, only -l/-o
     differ (broad active, severity-scoped, governor-scaled -c/-bs, explicit host-error policy, shared
     OOB endpoint)."""
+    if protocol_lane not in {"http,dns", "tcp"}:
+        raise ValueError("invalid Nuclei protocol lane")
     cmd = ["nuclei", "-l", str(targets_file), "-jsonl", "-o", str(out_file),
+           "-pt", protocol_lane,
            "-duc",                         # installed template identity is fixed for this invocation
            "-ept", "javascript",          # signatures are inventoried, never cryptographically trusted
            "-etags", "intrusive,fuzz,dos,brute-force",
@@ -913,8 +917,8 @@ def _nuclei_cmd(targets_file, out_file, prof, mhe: int, *, oob_flags=()) -> list
     return cmd
 
 
-@_base_evidence_claimed
-def _nuclei_scan(ctx, live, findings, log, prof) -> RunResult:
+def _nuclei_scan_lane(ctx, live, findings, log, prof, *, authority,
+                      protocol_lane: str, state_name: str) -> RunResult:
     """Chunked nuclei main scan: split live hosts into NUCLEI_CHUNK_HOSTS batches and scan sequentially (rate
     is target-wide, so parallel batches would blow the budget). Chunking buys resume, progress and per-batch
     isolation, not speed.
@@ -925,19 +929,17 @@ def _nuclei_scan(ctx, live, findings, log, prof) -> RunResult:
     degraded chunk's findings are never discarded and a re-scan cannot duplicate.
     """
     sid = "params.nuclei_scan"
-    authority = nuclei_policy.policy_for(ctx)
-    if authority is not None:
-        authority.assert_ready()                 # a resumed all-done scan must still authenticate policy
     chunk_n = max(1, settings.concurrency("NUCLEI_CHUNK_HOSTS", 50))
     batches = [live[i:i + chunk_n] for i in range(0, len(live), chunk_n)]
-    state_f = ctx.run.raw_path("params", "nuclei", "chunks.state.json")
+    state_f = ctx.run.raw_path("params", "nuclei", state_name)
     # resume validity is a work_unit that folds the coverage-affecting config (severity + excluded tags +
     # chunk size), not just the host list, so any coverage-affecting change invalidates the state
     _tpl = (authority.document["corpus"]["digest"] if authority is not None
             else _nuclei_templates_fp())                    # exact run snapshot, legacy fallback for test doubles
     mhe = _nuclei_mhe()                                     # host-error policy = which hosts get scanned
     _cfg = {"severity": "critical,high,medium", "etags": "intrusive,fuzz,dos,brute-force", "chunk": chunk_n,
-            "templates": _tpl if _tpl is not None else "unknown", "mhe": mhe}
+            "templates": _tpl if _tpl is not None else "unknown", "mhe": mhe,
+            "protocol_lane": protocol_lane}
     if authority is not None:
         _cfg.update(authority.work_config(sid))              # policy/corpus/config/engine -> resume identity
     if _tpl is None:
@@ -1083,14 +1085,17 @@ def _nuclei_scan(ctx, live, findings, log, prof) -> RunResult:
         COVERAGE_TIMEOUT, not CAP: the requests were lost in flight (target/network errors, or nuclei
         dropping a host once `-mhe` is exceeded), which is the TIMEOUT bucket's always-feeds-the-verdict
         contract. Counters go through raw so the validator can flag an impossible triple as unknown."""
+        lane_slug = protocol_lane.replace(",", "-")
+        unit = (f"{lane_slug}.chunk_{ci}"
+                if state_name != "chunks.state.json" else f"chunk_{ci}")
         if planned is None or requests is None:
             # COVERAGE_UNKNOWN, not a reason-only event: a reason-only partial neither opens a generation
             # nor reaches the rollup, so an unmeasurable chunk must reach the verdict as a gap
-            events.coverage_partial(sid, kind=events.COVERAGE_UNKNOWN, unit=f"chunk_{ci}", measure="requests",
+            events.coverage_partial(sid, kind=events.COVERAGE_UNKNOWN, unit=unit, measure="requests",
                                     reason=f"chunk {ci + 1}/{len(batches)}: {why} (request counters unavailable "
                                            f"— coverage UNMEASURED, not assumed complete)")
             return
-        events.coverage_partial(sid, kind=events.COVERAGE_TIMEOUT, measure="requests", unit=f"chunk_{ci}",
+        events.coverage_partial(sid, kind=events.COVERAGE_TIMEOUT, measure="requests", unit=unit,
                                 eligible=planned, tested=requests, omitted=planned - requests,
                                 reason=(f"chunk {ci + 1}/{len(batches)}: {requests}/{planned} planned request(s) "
                                         f"sent ({why})"))
@@ -1146,7 +1151,10 @@ def _nuclei_scan(ctx, live, findings, log, prof) -> RunResult:
             chunk_status = Status.FAILED.value               # promoted only after all bookkeeping below
             try:                                             # chunk terminal always fires (finally)
                 with _nuclei_oob_flags(prof, authority) as oob_flags:
-                    command = _nuclei_cmd(bf, cf, prof, mhe, oob_flags=oob_flags)
+                    command = _nuclei_cmd(
+                        bf, cf, prof, mhe, protocol_lane=protocol_lane,
+                        oob_flags=oob_flags,
+                    )
                     if authority is not None:
                         authority.prepare(sid, command, input_total=len(batch), work_unit=chunk_wu)
                     res = exec_tool("nuclei", command,
@@ -1157,9 +1165,13 @@ def _nuclei_scan(ctx, live, findings, log, prof) -> RunResult:
                                         5, *cf.relative_to(ctx.run.dir).parts, required=False,
                                     ),),
                                     timeout=nuclei_timeout(len(batch), ctx.http_timeout),
-                                    work_unit=chunk_wu, source_id="params.nuclei_scan")
+                                    work_unit=chunk_wu, source_id="params.nuclei_scan",
+                                    network_hosts=nuclei_policy.target_hosts(batch))
                     if authority is not None:
-                        authority.settle(sid, res, input_total=len(batch), work_unit=chunk_wu)
+                        authority.settle(
+                            sid, res, input_total=len(batch), work_unit=chunk_wu,
+                            protocol_lane=protocol_lane,
+                        )
                 if res.stderr_tail:
                     _append_run_log(ctx, log, res.stderr_tail + "\n")
                 # ask nuclei whether it finished, from its terminal line in the full stderr (the 8-line tail
@@ -1274,10 +1286,73 @@ def _nuclei_scan(ctx, live, findings, log, prof) -> RunResult:
         ctx.echo(f"  nuclei coverage: {_sent}/{_planned} planned request(s) sent "
                  f"({100 * _sent / _planned:.2f}%, {_planned - _sent} skipped{_scope}; -mhe "
                  f"{'off (full depth)' if mhe == 0 else mhe})")
-    return RunResult("nuclei", ["nuclei", "-l", "<chunked>"], status, 0,
+    return RunResult("nuclei", ["nuclei", "-l", "<chunked>", "-pt", protocol_lane], status, 0,
                      round(time.monotonic() - t0, 2), findings if findings.exists() else None,
                      lines, note=f"{len(batches)} chunk(s), {len(done_map)} execution-complete, "
                                  f"{incomplete} retryable")
+
+
+@_base_evidence_claimed
+def _nuclei_scan(ctx, live, findings, log, prof) -> RunResult:
+    """Run every non-empty accepted Nuclei protocol lane and merge their evidence."""
+    sid = "params.nuclei_scan"
+    authority = nuclei_policy.policy_for(ctx)
+    if authority is not None:
+        authority.assert_ready()
+        lanes = authority.protocol_lanes(sid)
+    else:
+        # Compatibility fixtures have no accepted template inventory. Keep their
+        # historical single invocation; managed runs always take the branch above.
+        lanes = ("http,dns",)
+    if not lanes:
+        _publish_lines(ctx, findings, ())
+        return RunResult("nuclei", ["nuclei", "-l", "<chunked>"], Status.SUCCESS, 0,
+                         0.0, findings, 0, note="no selected Nuclei protocol lanes")
+    if len(lanes) == 1:
+        return _nuclei_scan_lane(
+            ctx, live, findings, log, prof, authority=authority,
+            protocol_lane=lanes[0], state_name="chunks.state.json",
+        )
+
+    started = time.monotonic()
+    results = []
+    lane_outputs = []
+    for lane in lanes:
+        slug = lane.replace(",", "-")
+        lane_output = ctx.run.raw_path("params", "nuclei", f"findings.{slug}.jsonl")
+        lane_outputs.append(lane_output)
+        results.append(_nuclei_scan_lane(
+            ctx, live, lane_output, log, prof, authority=authority,
+            protocol_lane=lane, state_name=f"chunks.{slug}.state.json",
+        ))
+
+    def merged_lines():
+        seen = set()
+        for path in lane_outputs:
+            if not path.exists():
+                continue
+            for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+                if line and line not in seen:
+                    seen.add(line)
+                    yield line
+
+    _publish_lines(ctx, findings, merged_lines())
+    if any(result.status is Status.FAILED for result in results):
+        status = Status.FAILED
+    elif any(result.status not in (Status.SUCCESS, Status.EMPTY) for result in results):
+        status = Status.PARTIAL
+    else:
+        status = Status.SUCCESS
+    lines = len(findings.read_text().splitlines()) if findings.exists() else 0
+    return RunResult(
+        "nuclei", ["nuclei", "-l", "<chunked>", "-pt", "<accepted-lanes>"],
+        status, 0 if status is Status.SUCCESS else None,
+        round(time.monotonic() - started, 2), findings if findings.exists() else None,
+        lines, note="; ".join(
+            f"{lane}: {result.note or result.status.value}"
+            for lane, result in zip(lanes, results)
+        ),
+    )
 
 
 def _exposed_urls(ctx, scope) -> list[str]:
@@ -2934,6 +3009,11 @@ def _takeover_nuclei_lane(ctx, prof, scope) -> None:
     if not prof.takeover or not have("nuclei"):
         return
     nuclei_authority = nuclei_policy.policy_for(ctx)
+    if (nuclei_authority is not None
+            and nuclei_authority.protocol_lanes("params.nuclei_takeover") != ("http,dns",)):
+        raise nuclei_policy.NucleiPolicyError(
+            "the accepted takeover selection requires an unsupported protocol lane"
+        )
     # Union, not "resolved or subdomain": dangling-CNAME hosts (the takeover signal)
     # have no A record and live only in `subdomain` — they must still be checked.
     subs = scope.filter_hosts(sorted(set(ctx.run.values("resolved"))
@@ -2943,7 +3023,7 @@ def _takeover_nuclei_lane(ctx, prof, scope) -> None:
         return
     tk_in = ctx.write_list("takeover_targets.txt", subs)
     tk_out = ctx.run.raw_path("params", "nuclei", "takeover.jsonl")
-    tk_cmd = ["nuclei", "-l", str(tk_in), "-ept", "javascript",
+    tk_cmd = ["nuclei", "-l", str(tk_in), "-pt", "http,dns", "-ept", "javascript",
               "-tags", "takeover", "-jsonl", "-duc", "-o", str(tk_out)]
     if prof.http_rl:
         tk_cmd += ["-rl", str(prof.http_rl)]
@@ -2971,10 +3051,12 @@ def _takeover_nuclei_lane(ctx, prof, scope) -> None:
             timeout=nuclei_timeout(len(subs), ctx.http_timeout),
             work_unit=tk_wu,
             source_id="params.nuclei_takeover",
+            network_hosts=nuclei_policy.target_hosts(subs),
         )
         if nuclei_authority is not None:
             nuclei_authority.settle(
                 "params.nuclei_takeover", result, input_total=len(subs), work_unit=tk_wu,
+                protocol_lane="http,dns",
             )
     ctx.run.record("params", result)
     produced = 0
