@@ -856,7 +856,7 @@ def test_eligible_tracee_profiles_delegate_exact_ambient_dns_authority(
     )
     assert parsed.decide(
         resolver, 53, socket.SOCK_DGRAM, socket.IPPROTO_UDP,
-    )[0] == "allow"
+    )[0] == ("deny" if source_id == "dns.dnsx_records" else "allow")
 
 
 def test_tracee_dns_delegation_retains_exact_resolver_guards(monkeypatch):

@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import ipaddress
 import errno
+import hmac
 import os
 import select
 import socket
 import struct
+import threading
 import time
 
 from . import normalize
@@ -23,10 +25,525 @@ _MAX_DNS_RECORDS = 512
 _MAX_DNS_CNAME_DEPTH = 8
 _DNSSEC_META_TYPES = frozenset({43, 46, 47, 48, 50, 51, 59, 60})
 _DNS_HEADER = struct.Struct("!HHHHHH")
+_MAX_MEDIATOR_CLIENTS = 32
+_MAX_MEDIATOR_AUTH_PEERS = 512
+_DNS_MEDIATOR_TCP_AUTH_MAGIC = b"QDT1"
+_DNS_MEDIATOR_UDP_PERSISTENT_AUTH_MAGIC = b"QDP1"
+_DNS_MEDIATOR_UDP_QUERY_AUTH_MAGIC = b"QDQ1"
+_DNS_MEDIATOR_AUTH_BYTES = 4 + 32
 
 
 class NetworkDNSRefused(NetworkBrokerRefused):
     """The explicit resolver exchange was malformed or unauthorised."""
+
+
+class TargetDNSMediator:
+    """One held loopback DNS endpoint for a target-DNS tracee.
+
+    The tracee can use either connected UDP or TCP fallback, but every request
+    is checked against its source policy here before the existing literal
+    resolver exchange is allowed to acquire the shared effect fence.
+    """
+
+    def __init__(self, policy: BrokerPolicy, *, authentication: bytes,
+                 deadline_monotonic: float, effect_fence: NetworkEffectFence):
+        if (type(policy) is not BrokerPolicy
+                or policy.transport_profile != "target-dns"
+                or type(deadline_monotonic) not in {int, float}
+                or deadline_monotonic <= time.monotonic()
+                or type(effect_fence) is not NetworkEffectFence
+                or type(authentication) is not bytes
+                or len(authentication) != 32):
+            raise NetworkDNSRefused("network_dns_mediator_invalid")
+        self._policy = policy
+        self._deadline = float(deadline_monotonic)
+        self._fence = effect_fence
+        self._authentication = authentication
+        self._stop = threading.Event()
+        self._state_lock = threading.Lock()
+        self._fatal: str | None = None
+        self._queries = 0
+        self._rejected = 0
+        self._upstream_planned = 0
+        self._upstream_settled = 0
+        self._upstream_denied = 0
+        self._clients_lock = threading.Lock()
+        self._clients: set[socket.socket] = set()
+        self._tcp_auth_pending: dict[socket.socket, bytearray] = {}
+        self._udp_persistent_peers: set[tuple[str, int]] = set()
+        self._tasks_lock = threading.Lock()
+        self._tasks: set[threading.Thread] = set()
+        self._slots = threading.BoundedSemaphore(_MAX_MEDIATOR_CLIENTS)
+        self._udp: socket.socket | None = None
+        self._tcp: socket.socket | None = None
+        self._thread: threading.Thread | None = None
+        self._endpoint: tuple[str, int] | None = None
+
+    @property
+    def endpoint(self) -> tuple[str, int]:
+        if self._endpoint is None:
+            raise NetworkDNSRefused("network_dns_mediator_not_started")
+        return self._endpoint
+
+    def start(self) -> None:
+        if self._thread is not None:
+            raise NetworkDNSRefused("network_dns_mediator_started_twice")
+        tcp = udp = None
+        try:
+            tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            tcp.bind(("127.0.0.1", 0))
+            tcp.listen(_MAX_MEDIATOR_CLIENTS)
+            host, port = tcp.getsockname()
+            if host != "127.0.0.1" or not isinstance(port, int) or port <= 0:
+                raise NetworkDNSRefused("network_dns_mediator_endpoint_invalid")
+            udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            udp.bind((host, port))
+            tcp.setblocking(False)
+            udp.setblocking(False)
+            self._fence.track_socket(tcp)
+            self._fence.track_socket(udp)
+            self._tcp, self._udp, self._endpoint = tcp, udp, (host, port)
+            thread = threading.Thread(
+                target=self._run, name="quarry-target-dns", daemon=False,
+            )
+            self._thread = thread
+            thread.start()
+        except BaseException:
+            for handle in (udp, tcp):
+                if handle is None:
+                    continue
+                try:
+                    self._fence.close_tracked_socket(handle)
+                except NetworkBrokerRefused:
+                    try:
+                        handle.close()
+                    except OSError:
+                        pass
+            self._udp = self._tcp = None
+            self._endpoint = None
+            raise
+
+    def stop(self) -> None:
+        """Close both held listeners and join every mediator task."""
+        self._stop.set()
+        faults: list[BaseException] = []
+        for attr in ("_udp", "_tcp"):
+            handle = getattr(self, attr)
+            if handle is not None:
+                try:
+                    self._fence.close_tracked_socket(handle)
+                except BaseException as exc:
+                    self._set_fatal("network_dns_mediator_listener_close_failed")
+                    faults.append(exc)
+                else:
+                    setattr(self, attr, None)
+        with self._clients_lock:
+            clients = tuple(self._clients)
+        for handle in clients:
+            try:
+                self._fence.close_tracked_socket(handle)
+            except BaseException as exc:
+                self._set_fatal("network_dns_mediator_client_close_failed")
+                faults.append(exc)
+        deadline = time.monotonic() + 5.0
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
+            if thread.is_alive():
+                self._set_fatal("network_dns_mediator_join_failed")
+                faults.append(NetworkDNSRefused("network_dns_mediator_join_failed"))
+        while True:
+            with self._tasks_lock:
+                tasks = tuple(task for task in self._tasks
+                              if task is not threading.current_thread())
+            if not tasks:
+                break
+            for task in tasks:
+                task.join(timeout=max(0.0, deadline - time.monotonic()))
+            if time.monotonic() >= deadline:
+                if any(task.is_alive() for task in tasks):
+                    self._set_fatal("network_dns_mediator_join_failed")
+                    faults.append(NetworkDNSRefused("network_dns_mediator_join_failed"))
+                break
+        if faults:
+            raise faults[0]
+
+    def summary(self) -> dict:
+        with self._state_lock:
+            fatal, queries, rejected = self._fatal, self._queries, self._rejected
+            upstream = {
+                "planned": self._upstream_planned,
+                "settled": self._upstream_settled,
+                "denied": self._upstream_denied,
+            }
+        with self._tasks_lock:
+            active = sum(task.is_alive() for task in self._tasks)
+        thread = self._thread
+        return {
+            "endpoint": self._endpoint,
+            "queries": queries,
+            "rejected": rejected,
+            "upstream": upstream,
+            "fatal": fatal,
+            "complete": (
+                fatal is None and self._udp is None and self._tcp is None
+                and active == 0 and (thread is None or not thread.is_alive())
+                and upstream["planned"] == upstream["settled"]
+            ),
+        }
+
+    def _set_fatal(self, reason: str) -> None:
+        with self._state_lock:
+            self._fatal = self._fatal or reason
+        self._stop.set()
+        self._fence.cancel()
+
+    def _on_upstream(self, stage, _peer, _port, decision, _reason) -> None:
+        if stage not in {"dns-planned", "dns-settled"} or decision not in {"allow", "deny"}:
+            self._set_fatal("network_dns_mediator_event_invalid")
+            raise NetworkDNSRefused("network_dns_mediator_event_invalid")
+        with self._state_lock:
+            if stage == "dns-planned":
+                self._upstream_planned += 1
+            else:
+                self._upstream_settled += 1
+                if decision == "deny":
+                    self._upstream_denied += 1
+
+    def _failure(self, query: bytes, *, refused: bool = False) -> bytes | None:
+        if len(query) < _DNS_HEADER.size:
+            return None
+        flags = 0x8185 if refused else 0x8182
+        return query[:2] + struct.pack("!H", flags) + query[4:]
+
+    def _relay(self, query: bytes) -> bytes | None:
+        decision, _reason = self._policy.decide_dns_question(query)
+        if decision != "allow":
+            with self._state_lock:
+                self._rejected += 1
+            return self._failure(query, refused=True)
+        with self._state_lock:
+            self._queries += 1
+        transaction = struct.unpack_from("!H", query)[0]
+        for resolver in self._policy.resolver_ips:
+            if self._stop.is_set() or self._fence.is_set():
+                break
+            try:
+                response = _exchange(
+                    self._policy, resolver, query,
+                    deadline_monotonic=min(self._deadline, time.monotonic() + 5.0),
+                    transaction=transaction, on_event=self._on_upstream,
+                    effect_fence=self._fence,
+                )
+                if not _response_question_matches(query, response):
+                    raise NetworkDNSRefused("network_dns_mediator_response_mismatch")
+                return response
+            except (OSError, TimeoutError, NetworkDNSRefused):
+                if self._fence.is_set():
+                    break
+        if not self._stop.is_set() and not self._fence.is_set():
+            self._set_fatal("network_dns_mediator_upstream_failed")
+        return self._failure(query)
+
+    def _start_task(self, target, *args, slot_reserved: bool = False) -> bool:
+        if self._stop.is_set():
+            if slot_reserved:
+                self._slots.release()
+            return False
+        if not slot_reserved and not self._slots.acquire(blocking=False):
+            return False
+
+        def task() -> None:
+            try:
+                target(*args)
+            except BaseException:
+                self._set_fatal("network_dns_mediator_task_failed")
+            finally:
+                self._slots.release()
+                with self._tasks_lock:
+                    self._tasks.discard(threading.current_thread())
+
+        thread = threading.Thread(target=task, name="quarry-target-dns-query",
+                                  daemon=False)
+        with self._tasks_lock:
+            self._tasks.add(thread)
+        try:
+            thread.start()
+        except BaseException as exc:
+            with self._tasks_lock:
+                self._tasks.discard(thread)
+            self._slots.release()
+            self._set_fatal("network_dns_mediator_task_start_failed")
+            if not isinstance(exc, Exception):
+                raise
+            return False
+        return True
+
+    def _serve_udp(self, query: bytes, peer) -> None:
+        response = self._relay(query)
+        udp = self._udp
+        if response is not None and udp is not None and not self._stop.is_set():
+            try:
+                with self._fence:
+                    udp.sendto(response, peer)
+            except (OSError, NetworkBrokerRefused):
+                if not self._stop.is_set():
+                    self._set_fatal("network_dns_mediator_udp_response_failed")
+
+    @staticmethod
+    def _auth_peer(peer) -> tuple[str, int] | None:
+        """Return a canonical loopback UDP peer suitable for bounded state."""
+        if (type(peer) is not tuple or len(peer) != 2
+                or type(peer[0]) is not str or type(peer[1]) is not int
+                or not 1 <= peer[1] <= 65535):
+            return None
+        try:
+            address = ipaddress.ip_address(peer[0])
+        except ValueError:
+            return None
+        if address.version != 4 or str(address) != "127.0.0.1":
+            return None
+        return str(address), peer[1]
+
+    def _persistent_authentication_datagram(self, query: bytes) -> bool:
+        if type(query) is not bytes or len(query) != _DNS_MEDIATOR_AUTH_BYTES:
+            return False
+        return (query[:4] == _DNS_MEDIATOR_UDP_PERSISTENT_AUTH_MAGIC
+                and hmac.compare_digest(query[4:], self._authentication))
+
+    def _consume_udp_authentication(self, query: bytes, peer) -> bool:
+        """Consume only an exact broker auth datagram, never a DNS query."""
+        auth_peer = self._auth_peer(peer)
+        if not self._persistent_authentication_datagram(query) or auth_peer is None:
+            return False
+        if (auth_peer not in self._udp_persistent_peers
+                and len(self._udp_persistent_peers) >= _MAX_MEDIATOR_AUTH_PEERS):
+            return True
+        self._udp_persistent_peers.add(auth_peer)
+        return True
+
+    def _udp_query_authorized(self, query: bytes, peer) -> bytes | None:
+        auth_peer = self._auth_peer(peer)
+        if auth_peer is None:
+            return None
+        if auth_peer in self._udp_persistent_peers:
+            return query
+        if (len(query) < _DNS_MEDIATOR_AUTH_BYTES
+                or query[:4] != _DNS_MEDIATOR_UDP_QUERY_AUTH_MAGIC
+                or not hmac.compare_digest(query[4:_DNS_MEDIATOR_AUTH_BYTES],
+                                           self._authentication)):
+            return None
+        # The exact broker envelope is consumed as one datagram.  There is no
+        # reusable source-port grant for addressed sendto/sendmsg traffic.
+        return query[_DNS_MEDIATOR_AUTH_BYTES:]
+
+    def _close_client(self, handle: socket.socket) -> None:
+        try:
+            self._fence.close_tracked_socket(handle)
+        except BaseException:
+            self._set_fatal("network_dns_mediator_client_close_failed")
+        else:
+            with self._clients_lock:
+                self._clients.discard(handle)
+            self._tcp_auth_pending.pop(handle, None)
+
+    def _consume_tcp_authentication(self, handle: socket.socket) -> bool | None:
+        """Return True once the fixed preamble is verified, False if invalid."""
+        pending = self._tcp_auth_pending.get(handle)
+        if pending is None:
+            return False
+        expected = _DNS_MEDIATOR_TCP_AUTH_MAGIC + self._authentication
+        if len(pending) == _DNS_MEDIATOR_AUTH_BYTES:
+            return hmac.compare_digest(bytes(pending), expected)
+        try:
+            block = handle.recv(_DNS_MEDIATOR_AUTH_BYTES - len(pending))
+        except BlockingIOError:
+            return None
+        except OSError:
+            return False
+        if not block:
+            return False
+        pending.extend(block)
+        if len(pending) < _DNS_MEDIATOR_AUTH_BYTES:
+            return None
+        return hmac.compare_digest(bytes(pending), expected)
+
+    def _serve_tcp(self, handle: socket.socket) -> None:
+        try:
+            while not self._stop.is_set() and not self._fence.is_set():
+                length = struct.unpack("!H", _read_exact(
+                    handle, 2, deadline_monotonic=self._deadline,
+                    effect_fence=self._fence,
+                ))[0]
+                if not 17 <= length <= 512:
+                    return
+                query = _read_exact(
+                    handle, length, deadline_monotonic=self._deadline,
+                    effect_fence=self._fence,
+                )
+                response = self._relay(query)
+                if response is None:
+                    return
+                _send_all(
+                    handle, struct.pack("!H", len(response)) + response,
+                    deadline_monotonic=self._deadline, effect_fence=self._fence,
+                )
+        except (OSError, TimeoutError, NetworkDNSRefused):
+            pass
+        finally:
+            try:
+                self._fence.close_tracked_socket(handle)
+            except BaseException:
+                # Keep the socket in both ownership registries: a failed close
+                # must remain cancellable rather than being forgotten.
+                self._set_fatal("network_dns_mediator_client_close_failed")
+            else:
+                with self._clients_lock:
+                    self._clients.discard(handle)
+
+    def _run(self) -> None:
+        while (not self._stop.is_set() and not self._fence.is_set()
+               and time.monotonic() < self._deadline):
+            udp, tcp = self._udp, self._tcp
+            if udp is None or tcp is None:
+                return
+            try:
+                with self._clients_lock:
+                    pending = tuple(self._tcp_auth_pending)
+                readable, _writable, _errors = select.select(
+                    (udp, tcp, *pending), (), (), 0.05,
+                )
+            except (OSError, ValueError):
+                if not self._stop.is_set() and not self._fence.is_set():
+                    self._set_fatal("network_dns_mediator_listener_failed")
+                return
+            if udp in readable:
+                # Leave datagrams in the bounded kernel receive queue while all
+                # workers are occupied.  dnsx/massdns can legitimately have
+                # more outstanding queries than this mediator has threads;
+                # transient pressure must apply backpressure, not cancel the
+                # invocation after already consuming and dropping a query.
+                try:
+                    query, peer = udp.recvfrom(
+                        512 + _DNS_MEDIATOR_AUTH_BYTES, socket.MSG_PEEK,
+                    )
+                except BlockingIOError:
+                    continue
+                except OSError:
+                    if not self._stop.is_set() and not self._fence.is_set():
+                        self._set_fatal("network_dns_mediator_listener_failed")
+                    return
+                if self._persistent_authentication_datagram(query):
+                    try:
+                        query, peer = udp.recvfrom(512 + _DNS_MEDIATOR_AUTH_BYTES)
+                    except (BlockingIOError, OSError):
+                        continue
+                    self._consume_udp_authentication(query, peer)
+                    continue
+                authorized_query = self._udp_query_authorized(query, peer)
+                if authorized_query is None:
+                    try:
+                        udp.recvfrom(512 + _DNS_MEDIATOR_AUTH_BYTES)
+                    except (BlockingIOError, OSError):
+                        pass
+                    continue
+                if not self._slots.acquire(blocking=False):
+                    time.sleep(0.005)
+                    continue
+                slot_reserved = True
+                try:
+                    query, peer = udp.recvfrom(512)
+                except BlockingIOError:
+                    self._slots.release()
+                    slot_reserved = False
+                except OSError:
+                    self._slots.release()
+                    slot_reserved = False
+                    if not self._stop.is_set() and not self._fence.is_set():
+                        self._set_fatal("network_dns_mediator_listener_failed")
+                    return
+                else:
+                    slot_reserved = False
+                    self._start_task(
+                        self._serve_udp, authorized_query, peer, slot_reserved=True,
+                    )
+                finally:
+                    if slot_reserved:
+                        self._slots.release()
+            if tcp in readable:
+                handle = None
+                try:
+                    handle, _peer = tcp.accept()
+                    self._fence.track_socket(handle)
+                    with self._clients_lock:
+                        if len(self._clients) >= _MAX_MEDIATOR_AUTH_PEERS:
+                            raise NetworkDNSRefused("network_dns_mediator_client_capacity")
+                        self._clients.add(handle)
+                    handle.setblocking(False)
+                    self._tcp_auth_pending[handle] = bytearray()
+                except BlockingIOError:
+                    pass
+                except (OSError, NetworkBrokerRefused):
+                    if handle is not None:
+                        self._close_client(handle)
+                    if not self._stop.is_set():
+                        self._set_fatal("network_dns_mediator_listener_failed")
+                        return
+            for handle in tuple(readable):
+                if handle in {udp, tcp}:
+                    continue
+                authenticated = self._consume_tcp_authentication(handle)
+                if authenticated is None:
+                    continue
+                if authenticated is not True:
+                    self._close_client(handle)
+                    continue
+                self._tcp_auth_pending.pop(handle, None)
+                if not self._slots.acquire(blocking=False):
+                    # Authentication cannot consume query capacity.  A valid
+                    # client waits until a slot is actually available.
+                    self._tcp_auth_pending[handle] = bytearray(
+                        _DNS_MEDIATOR_TCP_AUTH_MAGIC + self._authentication,
+                    )
+                    continue
+                self._start_task(self._serve_tcp, handle, slot_reserved=True)
+        if not self._stop.is_set() and time.monotonic() >= self._deadline:
+            self._set_fatal("network_dns_mediator_deadline_expired")
+
+
+def _question_end(message: bytes) -> int | None:
+    """Return the exact uncompressed IN question boundary, if present."""
+    if len(message) < _DNS_HEADER.size:
+        return None
+    try:
+        _transaction, _flags, questions, _answers, _authority, _additional = \
+            _DNS_HEADER.unpack_from(message)
+    except struct.error:
+        return None
+    if questions != 1:
+        return None
+    cursor = _DNS_HEADER.size
+    while True:
+        if cursor >= len(message):
+            return None
+        size = message[cursor]
+        cursor += 1
+        if size == 0:
+            break
+        if size > 63 or size & 0xC0 or cursor + size > len(message):
+            return None
+        cursor += size
+    return cursor + 4 if cursor + 4 <= len(message) else None
+
+
+def _response_question_matches(query: bytes, response: bytes) -> bool:
+    """Bind a resolver response to the exact question accepted for this hop."""
+    query_end = _question_end(query)
+    response_end = _question_end(response)
+    if query_end is None or response_end is None:
+        return False
+    flags = struct.unpack_from("!H", response, 2)[0]
+    return bool(flags & 0x8000) and response[12:response_end] == query[12:query_end]
 
 
 def _encode_name(host: str) -> bytes:
@@ -561,4 +1078,4 @@ def resolve(policy: BrokerPolicy, host: str, *, timeout: float = 5.0,
     return (), "nodata"
 
 
-__all__ = ("NetworkDNSRefused", "resolve")
+__all__ = ("NetworkDNSRefused", "TargetDNSMediator", "resolve")

@@ -38,7 +38,7 @@ from . import horizontal, vertical, dns, probe, crawl, enrich, origin, content, 
 REGISTRY = {
     "horizontal": (horizontal.run, "Horizontal discovery (ASN/CIDR/cert/SAN)", False),
     "vertical": (vertical.run, "Vertical subdomain discovery", False),
-    "dns": (dns.run, "DNS-record enrichment (dnsx: A/AAAA/MX/NS/TXT/SOA/CAA/ASN)", True),
+    "dns": (dns.run, "DNS-record enrichment (dnsx: A/AAAA/MX/NS/TXT/SOA/CAA)", True),
     "probe": (probe.run, "Probe / fingerprint / screenshots / ports", True),
     "crawl": (crawl.run, "Crawl + URL/archive + JS mining", False),
     "enrich": (enrich.run, "Enrich late-discovered hosts (resolve/takeover/probe)", True),

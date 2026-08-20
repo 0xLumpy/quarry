@@ -277,13 +277,13 @@ CNAME with no A — flagged `takeover_candidate`).
 
 **dnsx record enrichment** over the in-scope resolved set (one pass, wildcard-filtered):
 ```bash
-dnsx -l <work>/resolved.txt -a -aaaa -cname -mx -ns -txt -soa -caa -asn -cdn -json -silent
+dnsx -l <work>/resolved.txt -a -aaaa -cname -mx -ns -txt -soa -caa -json -silent
 ```
-→ `raw/dns/dnsx/records.jsonl` · per host → `dns_record` entities (A/AAAA/MX/NS/TXT/SOA/CAA/ASN).
+→ `raw/dns/dnsx/records.jsonl` · per host → `dns_record` entities (A/AAAA/MX/NS/TXT/SOA/CAA).
 No dnsx or no in-scope resolved hosts → recorded skip.
 
 ```
-▸ DNS-record enrichment (dnsx: A/AAAA/MX/NS/TXT/SOA/CAA/ASN)
+▸ DNS-record enrichment (dnsx: A/AAAA/MX/NS/TXT/SOA/CAA)
   dns_record: +N record(s) over M host(s)
 ```
 

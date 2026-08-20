@@ -344,9 +344,8 @@ def broker_transport_semantics(source_id: str, tool: str) -> dict[str, str]:
     if door.authority_class == "offline" or door.profile in _PROXY_BOUND_PROFILES:
         peer_mode = "deny-all"
     elif door.profile == "target-dns":
-        # Address-only mediation cannot validate a DNS message/qname.  These
-        # subprocess doors remain fail-closed until the dedicated DNS adapter
-        # owns their complete wire protocol.
+        # Tracees get no resolver peer authority.  The worker-held mediator
+        # validates their complete questions and owns the upstream exchange.
         peer_mode = "deny-all"
     elif door.profile in _CIDR_PEER_PROFILES:
         peer_mode = "effective-cidr"
@@ -1163,8 +1162,13 @@ class NetworkPolicyScope:
             identities = runtime_identity.get("identities")
             if type(identities) is not list:
                 raise NetworkPolicyError("runtime identity for network policy is invalid")
+            dns_tracees = semantics["transport_profile"] == "target-dns"
             for identity in identities:
-                if type(identity) is not dict or identity.get("role") not in {"browser", "adapter"}:
+                if (type(identity) is not dict or identity.get("role") not in {
+                        "browser", "adapter", "dependency",
+                }):
+                    continue
+                if (identity.get("role") == "dependency" and not dns_tracees):
                     continue
                 executable = identity.get("executable")
                 if (type(executable) is not dict
@@ -1175,10 +1179,8 @@ class NetworkPolicyScope:
                         or type(executable.get("bytes")) is not int
                         or not 1 <= executable["bytes"] <= _MAX_EXECUTABLE_BYTES):
                     raise NetworkPolicyError("browser control identity is invalid")
-                collection = (
-                    control_helpers if identity.get("role") == "browser"
-                    else control_clients
-                )
+                collection = (control_helpers if identity.get("role") == "browser"
+                              else control_clients)
                 collection.append({
                     "sha256": executable["sha256"], "bytes": executable["bytes"],
                 })
@@ -1210,6 +1212,11 @@ class NetworkPolicyScope:
                 and runtime_identity is not None and len(control_clients) != 1):
             raise NetworkPolicyError(
                 "Interactsh proxy transport requires one exact adapter identity",
+            )
+        if (semantics["transport_profile"] == "target-dns"
+                and runtime_identity is not None and not control_clients):
+            raise NetworkPolicyError(
+                "target DNS transport requires attested client identities",
             )
         if type(approved_peers) not in {tuple, list}:
             raise NetworkPolicyError("approved peer set must be finite")

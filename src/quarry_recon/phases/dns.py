@@ -1,5 +1,5 @@
 """DNS-record enrichment: one dnsx pass over the in-scope resolved set → `dns_record` entities
-(A/AAAA/CNAME/MX/NS/TXT/SOA/CAA + per-host ASN/CDN) with provenance. Does not re-discover hosts.
+(A/AAAA/CNAME/MX/NS/TXT/SOA/CAA) with provenance. Does not re-discover hosts.
 
 `enrich_hosts()` is the reusable core: the `dns` phase runs it over the full resolved set, `enrich`
 over late-discovered hosts. Wildcard-inherited records (A/AAAA/CNAME/TXT spread by a `*.apex` record)
@@ -13,9 +13,13 @@ from .. import normalize
 from ..runner import have, run as exec_tool, skipped
 from ..runner_repository import RepositoryOutput
 
-_RECORD_FLAGS = ["-a", "-aaaa", "-cname", "-mx", "-ns", "-txt", "-soa", "-caa", "-asn", "-cdn"]
+# dnsx's ``-asn`` is HTTPS to the ProjectDiscovery ASN API, and ``-cdn`` uses
+# Go's ambient resolver instead of dnsx's selected resolver.  ASN enrichment
+# stays in mediated OSINT; CDN classification stays in the offline cdncheck
+# lane.  Neither may inherit this target-DNS authority.
+_RECORD_FLAGS = ["-a", "-aaaa", "-cname", "-mx", "-ns", "-txt", "-soa", "-caa"]
 # types a `*.apex` wildcard spuriously spreads → filtered against the baseline; zone-level types
-# (mx/ns/soa/caa/asn/cdn) are meaningful context, never filtered.
+# (mx/ns/soa/caa) are meaningful context, never filtered.
 _WILDCARD_TYPES = frozenset({"a", "aaaa", "cname", "txt"})
 _WILDCARD_PROBE_FLAGS = ["-a", "-aaaa", "-cname", "-txt"]   # baseline only needs the filtered types
 

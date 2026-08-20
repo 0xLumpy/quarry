@@ -15,7 +15,10 @@ import hashlib
 import os
 import select
 import signal
+import shutil
+import stat
 import sys
+import tempfile
 import time
 
 from . import runner_ipc
@@ -65,6 +68,7 @@ from .network_broker import (
     verify_listener_bootstrap,
 )
 from .network_proxy import PinnedBrowserProxy
+from .network_dns import TargetDNSMediator
 from .network_policy import PRIVATE_POLICY_ENV
 
 
@@ -85,6 +89,190 @@ _RUNNER_PROXY_FLAGS = frozenset({
     "-chrome-proxy", "--chrome-proxy",
     "-p", "-pi", "-proxy-internal", "--proxy-internal",
 })
+_DNS_RESOLVER_FLAGS = frozenset({
+    "-r", "--resolver", "-resolver", "--resolvers", "-resolvers",
+    "--resolvers-trusted", "-system-resolvers", "--system-resolvers",
+})
+
+
+def _strip_dns_resolver_overrides(argv: tuple[str, ...]) -> tuple[str, ...]:
+    """Remove known resolver selections so policy values are the only ones used."""
+    result = [argv[0]]
+    cursor = 1
+    valueless = {"-system-resolvers", "--system-resolvers"}
+    while cursor < len(argv):
+        value = argv[cursor]
+        if value in _DNS_RESOLVER_FLAGS:
+            if value in valueless:
+                cursor += 1
+                continue
+            if cursor + 1 >= len(argv) or not argv[cursor + 1]:
+                raise RuntimeError("network_dns_caller_resolver_invalid")
+            cursor += 2
+            continue
+        if any(value.startswith(flag + "=") for flag in _DNS_RESOLVER_FLAGS):
+            cursor += 1
+            continue
+        result.append(value)
+        cursor += 1
+    return tuple(result)
+
+
+def _strip_puredns_bin_override(argv: tuple[str, ...]) -> tuple[str, ...]:
+    """Keep puredns' delegated resolver binary worker-selected and attested."""
+    result = [argv[0]]
+    cursor = 1
+    while cursor < len(argv):
+        value = argv[cursor]
+        if value in {"-b", "--bin"}:
+            if cursor + 1 >= len(argv) or not argv[cursor + 1]:
+                raise RuntimeError("network_dns_caller_massdns_invalid")
+            cursor += 2
+            continue
+        if value.startswith("--bin=") or value.startswith("-b="):
+            cursor += 1
+            continue
+        result.append(value)
+        cursor += 1
+    return tuple(result)
+
+
+def _attested_massdns_path(request: WorkerRequest) -> str:
+    """Return the private runtime anchor which prepared puredns may execute."""
+    path = shutil.which("massdns", path=dict(request.environment).get("PATH"))
+    if not path or not os.path.isabs(path):
+        raise RuntimeError("network_dns_massdns_unavailable")
+    try:
+        observed = os.stat(path)
+    except OSError as exc:
+        raise RuntimeError("network_dns_massdns_unavailable") from exc
+    if not stat.S_ISREG(observed.st_mode) or not observed.st_mode & stat.S_IXUSR:
+        raise RuntimeError("network_dns_massdns_unavailable")
+    return path
+
+
+def _write_pinned_resolver_file(resolvers: tuple[str, ...]) -> tuple[str, str]:
+    """Create a bounded private puredns resolver file owned by this worker."""
+    if (not resolvers or len(resolvers) > 16
+            or any(type(value) is not str or not value.isascii() for value in resolvers)):
+        raise RuntimeError("network_dns_resolver_set_invalid")
+    body = ("\n".join(resolvers) + "\n").encode("ascii")
+    if not 1 <= len(body) <= 4096:
+        raise RuntimeError("network_dns_resolver_file_invalid")
+    directory = tempfile.mkdtemp(prefix="quarry-resolvers-")
+    path = os.path.join(directory, "resolvers.txt")
+    descriptor = -1
+    try:
+        os.chmod(directory, 0o700)
+        descriptor = os.open(
+            path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+            | getattr(os, "O_NOFOLLOW", 0), 0o600,
+        )
+        pending = memoryview(body)
+        while pending:
+            written = os.write(descriptor, pending)
+            if written <= 0:
+                raise RuntimeError("network_dns_resolver_file_invalid")
+            pending = pending[written:]
+        os.fsync(descriptor)
+        observed = os.fstat(descriptor)
+        if observed.st_size != len(body) or observed.st_mode & 0o077:
+            raise RuntimeError("network_dns_resolver_file_invalid")
+    except BaseException:
+        _close_quietly(descriptor)
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        try:
+            os.rmdir(directory)
+        except OSError:
+            pass
+        raise
+    _close_quietly(descriptor)
+    return directory, path
+
+
+def _configure_target_dns_resolvers(request: WorkerRequest, policy: BrokerPolicy,
+                                    launcher, endpoint: tuple[str, int]) -> WorkerRequest:
+    """Replace ambient resolver configuration with the held local mediator."""
+    argv = _strip_dns_resolver_overrides(request.argv)
+    tool = os.path.basename(argv[0])
+    host, port = endpoint
+    if host != "127.0.0.1" or type(port) is not int or not 1 <= port <= 65535:
+        raise RuntimeError("network_dns_mediator_endpoint_invalid")
+    resolver = f"{host}:{port}"
+    if tool == "dnsx":
+        return dataclasses.replace(request, argv=argv + ("-r", resolver))
+    if tool == "dig":
+        # OSINT owns one fixed DMARC lookup.  Reject a widened dig grammar,
+        # then force one literal resolver and a wire shape the broker parses:
+        # no search/config expansion, EDNS option channel, AD bit, or TCP
+        # retry on truncation.
+        if (len(argv) != 4 or argv[1:3] != ("+short", "TXT")
+                or not argv[3].startswith("_dmarc.")
+                or any(value.startswith("@") for value in argv)):
+            raise RuntimeError("network_dns_dig_argv_invalid")
+        return dataclasses.replace(
+            request,
+            argv=argv + (
+                "@" + host, "-p", str(port), "+noedns", "+noadflag", "+ignore", "-r",
+            ),
+        )
+    if tool != "puredns":
+        raise RuntimeError("network_dns_tool_invalid")
+    argv = _strip_puredns_bin_override(argv)
+    massdns = _attested_massdns_path(request)
+    directory, path = _write_pinned_resolver_file((resolver,))
+    launcher._network_resolver_directory = directory
+    launcher._network_resolver_path = path
+    # puredns delegates its first pass to the pinned massdns binary and then
+    # performs trusted validation itself.  Pin both files so neither path can
+    # silently fall back to puredns' user configuration.
+    return dataclasses.replace(
+        request,
+        argv=argv + (
+            "--bin", massdns, "--resolvers", path, "--resolvers-trusted", path,
+        ),
+    )
+
+
+def _cleanup_target_dns_resolvers(launcher) -> None:
+    path = getattr(launcher, "_network_resolver_path", None)
+    directory = getattr(launcher, "_network_resolver_directory", None)
+    fault = None
+    if path is not None:
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            launcher._network_resolver_path = None
+        except OSError as exc:
+            fault = exc
+        else:
+            launcher._network_resolver_path = None
+    if directory is not None:
+        try:
+            os.rmdir(directory)
+        except FileNotFoundError:
+            launcher._network_resolver_directory = None
+        except OSError as exc:
+            fault = fault or exc
+        else:
+            launcher._network_resolver_directory = None
+    if fault is not None:
+        raise RuntimeError("network_dns_resolver_cleanup_failed") from fault
+
+
+def _stop_target_dns_mediator(launcher) -> dict | None:
+    mediator = getattr(launcher, "_network_dns_mediator", None)
+    if mediator is not None:
+        mediator.stop()
+        summary = mediator.summary()
+        if type(summary) is not dict or summary.get("complete") is not True:
+            raise NetworkBrokerRefused("network_dns_mediator_settlement_incomplete")
+        launcher._network_dns_mediator = None
+        return summary
+    return None
 
 
 def _expected_parent_pid() -> int:
@@ -1052,6 +1240,35 @@ def _configure_network_broker(request: WorkerRequest, launcher) -> WorkerRequest
     launcher._network_control_registry = registry
     launcher._network_effect_fence = effect_fence
     child_request = request
+    # Kept only in this worker's mediator/session objects.  In particular it
+    # is never added to the policy JSON or derived child environment.
+    dns_mediator_authentication = None
+    if policy.transport_profile == "target-dns":
+        session_deadline = (
+            time.monotonic() + float(request.timeout) + _BROKER_BOOTSTRAP_SECONDS
+            if request.timeout else float((1 << 53) - 1)
+        )
+        dns_mediator_authentication = os.urandom(32)
+        mediator = TargetDNSMediator(
+            policy, authentication=dns_mediator_authentication,
+            deadline_monotonic=session_deadline, effect_fence=effect_fence,
+        )
+        try:
+            mediator.start()
+            launcher._network_dns_mediator = mediator
+            policy = dataclasses.replace(
+                policy, dns_mediator_endpoint=mediator.endpoint,
+            )
+            child_request = _configure_target_dns_resolvers(
+                child_request, policy, launcher, mediator.endpoint,
+            )
+        except BaseException:
+            try:
+                mediator.stop()
+            finally:
+                launcher._network_dns_mediator = None
+                _cleanup_target_dns_resolvers(launcher)
+            raise
     proxy_flags = None
     proxy_environment = False
     if (policy.source_id == "crawl.katana_standard"
@@ -1149,6 +1366,7 @@ def _configure_network_broker(request: WorkerRequest, launcher) -> WorkerRequest
                 deadline_monotonic=session_deadline,
                 control_registry=registry,
                 effect_fence=effect_fence,
+                dns_mediator_authentication=dns_mediator_authentication,
             )
             session.start()
             child_pidfd = handoff.child_pidfd
@@ -1188,6 +1406,20 @@ def _settle_network_broker(launcher) -> dict | None:
     launcher._network_proxy = None
     launcher._network_broker_session = None
     proxy_fault = None
+    mediator_fault = None
+    mediator_summary = None
+    try:
+        mediator_summary = _stop_target_dns_mediator(launcher)
+    except BaseException as exc:
+        mediator_fault = exc
+        fence = getattr(launcher, "_network_effect_fence", None)
+        if fence is not None:
+            try:
+                fence.cancel()
+            except BaseException as cancel_fault:
+                if isinstance(mediator_fault, Exception) \
+                        and not isinstance(cancel_fault, Exception):
+                    mediator_fault = cancel_fault
     if proxy is not None:
         try:
             proxy.stop()
@@ -1209,8 +1441,13 @@ def _settle_network_broker(launcher) -> dict | None:
                         proxy_fault = cancel_fault
     if session is None:
         if proxy_fault is not None:
+            _cleanup_target_dns_resolvers(launcher)
             raise proxy_fault
-        return None
+        if mediator_fault is not None:
+            _cleanup_target_dns_resolvers(launcher)
+            raise mediator_fault
+        _cleanup_target_dns_resolvers(launcher)
+        return None if mediator_summary is None else {"dns_mediator": mediator_summary}
     try:
         session.settle_after_tasks(
             deadline_monotonic=time.monotonic() + _BROKER_BOOTSTRAP_SECONDS,
@@ -1220,6 +1457,11 @@ def _settle_network_broker(launcher) -> dict | None:
             raise NetworkBrokerRefused("network_broker_settlement_incomplete")
         if proxy_fault is not None:
             raise proxy_fault
+        if mediator_fault is not None:
+            raise mediator_fault
+        if mediator_summary is not None:
+            summary["dns_mediator"] = mediator_summary
+        _cleanup_target_dns_resolvers(launcher)
         return summary
     except BaseException as primary:
         fence = getattr(launcher, "_network_effect_fence", None)
@@ -1230,6 +1472,7 @@ def _settle_network_broker(launcher) -> dict | None:
             except BaseException as exc:
                 cancel_fault = exc
         session.stop()
+        _cleanup_target_dns_resolvers(launcher)
         if (cancel_fault is not None and isinstance(primary, Exception)
                 and not isinstance(cancel_fault, Exception)):
             raise cancel_fault

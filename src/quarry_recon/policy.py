@@ -413,6 +413,12 @@ EXCLUDED: dict[str, tuple[str, str]] = {
     "quarry_recon.network_dns:_MAX_DNS_CNAME_DEPTH": (
         "resource", "the explicit per-request CNAME follow bound; exhaustion is indeterminate and no "
                     "upstream connection is attempted"),
+    "quarry_recon.network_dns:_MAX_MEDIATOR_CLIENTS": (
+        "resource", "the fixed target-DNS mediator worker and TCP backlog bound; saturation leaves "
+                    "requests in the kernel queue until one bounded worker is available"),
+    "quarry_recon.network_dns:_MAX_MEDIATOR_AUTH_PEERS": (
+        "resource", "the bounded authenticated UDP source-port registry; excess persistent peers are "
+                    "ignored rather than allocating unbounded loopback authority"),
     "quarry_recon.network_proxy:_MAX_PROXY_HEADER_BYTES": (
         "resource", "the private browser proxy's per-request header allocation bound; oversized input "
                     "is refused before DNS or upstream contact"),

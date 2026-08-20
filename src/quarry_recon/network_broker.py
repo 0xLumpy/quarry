@@ -398,6 +398,37 @@ _HANDOFF_MAGIC = b"QNB1"
 _HANDOFF_VERSION = 1
 _HANDOFF_CLOSED = b"SC1!"
 _HANDOFF_ACK = b"G"
+_DNS_MEDIATOR_TCP_AUTH_MAGIC = b"QDT1"
+_DNS_MEDIATOR_UDP_PERSISTENT_AUTH_MAGIC = b"QDP1"
+_DNS_MEDIATOR_UDP_QUERY_AUTH_MAGIC = b"QDQ1"
+_DNS_MEDIATOR_AUTH_BYTES = 32
+
+# DNS wire values which the target-DNS doors can originate.  These are source
+# identities, not a user-configurable query vocabulary.
+_DNS_QTYPE_A = 1
+_DNS_QTYPE_NS = 2
+_DNS_QTYPE_CNAME = 5
+_DNS_QTYPE_SOA = 6
+_DNS_QTYPE_PTR = 12
+_DNS_QTYPE_MX = 15
+_DNS_QTYPE_TXT = 16
+_DNS_QTYPE_AAAA = 28
+_DNS_QTYPE_CAA = 257
+_DNS_EMPTY_OPT = struct.Struct("!BHHIH")
+_DNS_EMPTY_OPT_UDP_SIZE = 4096
+_DNS_SOURCE_QTYPES = {
+    "dns.dnsx_records": frozenset({
+        _DNS_QTYPE_A, _DNS_QTYPE_AAAA, _DNS_QTYPE_CNAME, _DNS_QTYPE_MX,
+        _DNS_QTYPE_NS, _DNS_QTYPE_TXT, _DNS_QTYPE_SOA, _DNS_QTYPE_CAA,
+    }),
+    "enrich.dnsx_resolve": frozenset({_DNS_QTYPE_A}),
+    "enrich.dnsx_cname": frozenset({_DNS_QTYPE_A, _DNS_QTYPE_CNAME}),
+    "horizontal.revdns": frozenset({_DNS_QTYPE_PTR}),
+    "vertical.puredns_brute": frozenset({_DNS_QTYPE_A}),
+    "vertical.puredns_resolve": frozenset({_DNS_QTYPE_A}),
+    "enrich.a1d_brute": frozenset({_DNS_QTYPE_A}),
+    "osint.dmarc": frozenset({_DNS_QTYPE_TXT}),
+}
 _HEX32 = re.compile(r"[0-9a-f]{32}\Z")
 _SOURCE = re.compile(r"[a-z0-9][a-z0-9_.-]{0,127}\Z")
 _CHROMIUM_SINGLETON_DIR = re.compile(
@@ -1939,6 +1970,10 @@ class BrokerPolicy:
     public_control_endpoints: tuple[str, ...] = ()
     operator_control_endpoints: tuple[str, ...] = ()
     nuclei_protocol_lane: str = "none"
+    # Worker-only authority.  It is deliberately absent from the serialized
+    # policy: the worker creates and holds this endpoint after parsing the
+    # parent-authenticated policy, before the tracee is released.
+    dns_mediator_endpoint: tuple[str, int] | None = None
 
     @classmethod
     def from_json(cls, raw: str) -> "BrokerPolicy":
@@ -2236,15 +2271,27 @@ class BrokerPolicy:
                 declared_control_endpoint: bool = False) -> tuple[str, str]:
         from . import netguard
 
+        # Target-DNS tracees may reach only the worker-held loopback mediator.
+        # It is a runtime capability rather than an input-policy endpoint.
+        if self.transport_profile == "target-dns":
+            endpoint = self.dns_mediator_endpoint
+            base_kind = kind & 0xF
+            expected = {
+                socket.SOCK_STREAM: {0, socket.IPPROTO_TCP},
+                socket.SOCK_DGRAM: {0, socket.IPPROTO_UDP},
+            }
+            if (endpoint is not None and (peer, port) == endpoint
+                    and base_kind in expected
+                    and protocol in expected[base_kind]):
+                return "allow", "held loopback DNS mediator admitted"
+            return "deny", "target DNS requires its held loopback mediator"
         # A small, source-derived set of tracees owns DNS transport directly.
         # Delegate its complete destination check to the DNS authority before
         # the ordinary peer path: explicit ambient resolvers can legitimately
         # be loopback/private, and decide_dns owns those exact exceptions.
         if not mediated and port == 53:
             if (self.authority_class == "public-provider"
-                    or self.transport_profile in {
-                        "target-dns", "target-http-exact", "target-tls",
-                    }):
+                    or self.transport_profile in {"target-http-exact", "target-tls"}):
                 return self.decide_dns(peer, port, kind, protocol)
         try:
             current_own = netguard.own_ips()
@@ -2397,6 +2444,118 @@ class BrokerPolicy:
                 and (not address.is_global or netguard.is_private_ip(peer)):
             return "deny", "ambient private resolver lacks explicit authority"
         return "allow", "configured resolver admitted only for DNS mediation"
+
+    def decide_dns_question(self, payload: bytes) -> tuple[str, str]:
+        """Validate the complete one-question DNS UDP query for this source.
+
+        No compression, response sections, EDNS options, or trailing bytes are
+        accepted.  dnsx emits one empty 4096-byte EDNS0 OPT record; accepting
+        that exact inert suffix preserves compatibility without creating a
+        second question or extension channel.
+        """
+        from . import normalize
+
+        if self.transport_profile != "target-dns":
+            return "allow", "DNS payload is not a target-DNS tracee payload"
+        allowed_qtypes = _DNS_SOURCE_QTYPES.get(self.source_id)
+        if allowed_qtypes is None:
+            return "deny", "target DNS source has no query authority"
+        if type(payload) is not bytes or not 17 <= len(payload) <= 512:
+            return "deny", "DNS UDP payload length is invalid"
+        try:
+            flags, questions, answers, authority, additional = struct.unpack_from(
+                "!HHHHH", payload, 2,
+            )
+        except struct.error:
+            return "deny", "DNS UDP header is truncated"
+        # Query, standard opcode, and exactly one IN question; no optional
+        # records makes the bounded parser and the sent wire image identical.
+        if (flags & ~0x0100 or questions != 1
+                or answers or authority or additional not in {0, 1}):
+            return "deny", "DNS packet is not one standard query"
+        cursor = 12
+        labels = []
+        while True:
+            if cursor >= len(payload):
+                return "deny", "DNS question name is truncated"
+            size = payload[cursor]
+            cursor += 1
+            if size == 0:
+                break
+            # Compression turns the question into an indirect tracee-memory
+            # parser and has no place in a request generated by these tools.
+            if size > 63 or size & 0xC0 or cursor + size > len(payload):
+                return "deny", "DNS question name is compressed or malformed"
+            label = payload[cursor:cursor + size]
+            cursor += size
+            try:
+                text = label.decode("ascii")
+            except UnicodeDecodeError:
+                return "deny", "DNS question name is not ASCII"
+            if not text or text.lower() != text:
+                return "deny", "DNS question name is not canonical"
+            labels.append(text)
+            if sum(len(item) + 1 for item in labels) > 253:
+                return "deny", "DNS question name exceeds its bound"
+        if cursor + 4 > len(payload):
+            return "deny", "DNS question has trailing or missing fields"
+        qtype, qclass = struct.unpack_from("!HH", payload, cursor)
+        cursor += 4
+        if additional:
+            if cursor + _DNS_EMPTY_OPT.size != len(payload):
+                return "deny", "DNS question has malformed EDNS framing"
+            owner, record_type, udp_size, ttl, options = \
+                _DNS_EMPTY_OPT.unpack_from(payload, cursor)
+            if (owner != 0 or record_type != 41
+                    or udp_size != _DNS_EMPTY_OPT_UDP_SIZE
+                    or ttl != 0 or options != 0):
+                return "deny", "DNS question has unsupported EDNS options"
+        elif cursor != len(payload):
+            return "deny", "DNS question has trailing or missing fields"
+        if qclass != 1 or qtype not in allowed_qtypes:
+            return "deny", "DNS question type is outside source authority"
+        name = ".".join(labels)
+        if qtype == _DNS_QTYPE_PTR:
+            address = self._ptr_question_address(name)
+            if address is None:
+                return "deny", "PTR question is not a canonical reverse address"
+            if not any(address.version == network.version and address in network
+                       for network in map(ipaddress.ip_network, self.effective_cidrs)):
+                return "deny", "PTR question is outside effective CIDR authority"
+            return "allow", "PTR question is inside effective CIDR authority"
+        if self.source_id == "osint.dmarc":
+            if not any(name == f"_dmarc.{apex}" for apex in self.apex_domains):
+                return "deny", "DMARC question is outside active apex authority"
+            return "allow", "DMARC question is inside active apex authority"
+        if normalize.canon_host_strict(name) != name:
+            return "deny", "DNS question name is not canonical"
+        if not any(name == apex or name.endswith("." + apex)
+                   for apex in self.apex_domains):
+            return "deny", "DNS question is outside active apex authority"
+        if any(oos_search(pattern, name) for pattern in self.oos_patterns):
+            return "deny", "DNS question matches an out-of-scope rule"
+        return "allow", "DNS question is inside active apex authority"
+
+    @staticmethod
+    def _ptr_question_address(name: str) -> ipaddress._BaseAddress | None:
+        """Decode one uncompressed in-addr.arpa/ip6.arpa name exactly."""
+        labels = name.split(".")
+        try:
+            if len(labels) == 6 and labels[-2:] == ["in-addr", "arpa"]:
+                octets = labels[:4]
+                if any(not item.isdecimal() or str(int(item)) != item
+                       or not 0 <= int(item) <= 255 for item in octets):
+                    return None
+                return ipaddress.ip_address(".".join(reversed(octets)))
+            if len(labels) == 34 and labels[-2:] == ["ip6", "arpa"]:
+                nibbles = labels[:32]
+                if any(len(item) != 1 or item not in "0123456789abcdef"
+                       for item in nibbles):
+                    return None
+                return ipaddress.ip_address("".join(reversed(nibbles)))
+        except ValueError:
+            pass
+        return None
 
     def dns_name_allowed(self, name: str) -> tuple[str, str]:
         """Authorize one canonical DNS question owned by Nuclei's SOCKS lane."""
@@ -2933,7 +3092,8 @@ class NetworkBrokerSession:
                  expected_profile: str,
                  deadline_monotonic: float,
                  cancellation_event: threading.Event | None = None,
-                 effect_fence: NetworkEffectFence | None = None):
+                 effect_fence: NetworkEffectFence | None = None,
+                 dns_mediator_authentication: bytes | None = None):
         if type(policy) is not BrokerPolicy:
             raise NetworkBrokerRefused("network_broker_policy_invalid")
         if type(handoff) is not ListenerHandoff:
@@ -2954,6 +3114,12 @@ class NetworkBrokerSession:
         if (effect_fence is not None and cancellation_event is not None
                 and effect_fence.event is not cancellation_event):
             raise NetworkBrokerRefused("network_effect_fence_event_mismatch")
+        if policy.transport_profile == "target-dns":
+            if (type(dns_mediator_authentication) is not bytes
+                    or len(dns_mediator_authentication) != _DNS_MEDIATOR_AUTH_BYTES):
+                raise NetworkBrokerRefused("network_dns_mediator_authentication_invalid")
+        elif dns_mediator_authentication is not None:
+            raise NetworkBrokerRefused("network_dns_mediator_authentication_invalid")
         listener_fd = handoff.listener_fd
         _validate_listener_fd(listener_fd)
         try:
@@ -2965,6 +3131,10 @@ class NetworkBrokerSession:
         self._child_pidfd = handoff.child_pidfd
         self._profile = handoff.profile
         self._policy = policy
+        # This runtime capability is intentionally not a BrokerPolicy field:
+        # policy JSON is inherited by the tracee, while this token stays only
+        # in the worker's mediator and broker objects.
+        self._dns_mediator_authentication = dns_mediator_authentication
         self._deadline = float(deadline_monotonic)
         self._architecture = _architecture()
         self._local_stop = threading.Event()
@@ -3903,6 +4073,102 @@ class NetworkBrokerSession:
             return "deny", "browser target egress requires the pinned proxy"
         return self._policy.decide(peer, port, kind, protocol)
 
+    def _target_dns_client_allowed(self, tid: int, notification_id: int,
+                                   peer: str | None, port: int | None,
+                                   kind: int, protocol: int) -> tuple[str, str]:
+        """Bind the held DNS endpoint to the attested DNS executable set."""
+        decision, reason = self._policy.decide(
+            peer or "", port if port is not None else -1, kind, protocol,
+        )
+        if decision != "allow":
+            return decision, reason
+        if not self._client_allowed(tid, notification_id):
+            return "deny", "DNS mediator client executable is not attested"
+        return "allow", "attested DNS client reached held loopback mediator"
+
+    def _target_dns_payload_allowed(self, destination: _Destination | None,
+                                    kind: int, protocol: int,
+                                    payload: bytes) -> tuple[str, str]:
+        if destination is None:
+            return "deny", "target DNS requires a connected mediator endpoint"
+        base_kind = kind & 0xF
+        if (base_kind == socket.SOCK_STREAM
+                and protocol in {0, socket.IPPROTO_TCP}):
+            # TCP carries a two-byte DNS length prefix; the mediator validates
+            # the complete framed question before any resolver exchange.
+            return "allow", "TCP DNS framing is validated by the mediator"
+        if (base_kind == socket.SOCK_DGRAM
+                and protocol in {0, socket.IPPROTO_UDP}):
+            return self._policy.decide_dns_question(payload)
+        return "deny", "target DNS socket metadata is invalid"
+
+    def _inject_target_dns_bytes(self, fd: int, notification_id: int,
+                                 body: bytes,
+                                 destination: _Destination | None = None) -> int:
+        """Write a worker-only mediator capability on the tracee's OFD.
+
+        This runs while the caller holds the same effect fence as its emulated
+        syscall, so an addressed UDP envelope cannot be separated from the
+        query by another brokered effect.  Datagram writes must be exact;
+        stream preambles may require bounded partial-write retries.
+        """
+        if type(body) is not bytes or not body:
+            return errno.EINVAL
+        buffer = ctypes.create_string_buffer(body)
+        offset = 0
+        while offset < len(body):
+            if destination is None:
+                operation = lambda: _libc().send(
+                    fd, ctypes.byref(buffer, offset), len(body) - offset,
+                    getattr(socket, "MSG_NOSIGNAL", 0)
+                    | getattr(socket, "MSG_DONTWAIT", 0),
+                )
+            else:
+                address = ctypes.create_string_buffer(destination.raw)
+                operation = lambda: _libc().sendto(
+                    fd, ctypes.byref(buffer, offset), len(body) - offset,
+                    getattr(socket, "MSG_DONTWAIT", 0), ctypes.byref(address),
+                    len(destination.raw),
+                )
+            result, error = self._send_cancellable(fd, notification_id, operation)
+            if result < 0 or error:
+                return error or errno.EIO
+            if result <= 0 or (destination is not None and result != len(body)):
+                return errno.EIO
+            offset += result
+        return 0
+
+    def _inject_target_dns_connected_authentication(self, fd: int,
+                                                     notification_id: int,
+                                                     kind: int, protocol: int) -> int:
+        authentication = self._dns_mediator_authentication
+        if type(authentication) is not bytes or len(authentication) != _DNS_MEDIATOR_AUTH_BYTES:
+            return errno.EPERM
+        base_kind = kind & 0xF
+        if base_kind == socket.SOCK_STREAM and protocol in {0, socket.IPPROTO_TCP}:
+            magic = _DNS_MEDIATOR_TCP_AUTH_MAGIC
+        elif base_kind == socket.SOCK_DGRAM and protocol in {0, socket.IPPROTO_UDP}:
+            magic = _DNS_MEDIATOR_UDP_PERSISTENT_AUTH_MAGIC
+        else:
+            return errno.EPERM
+        return self._inject_target_dns_bytes(fd, notification_id, magic + authentication)
+
+    def _inject_target_dns_addressed_query(self, fd: int, notification_id: int,
+                                           destination: _Destination,
+                                           kind: int, protocol: int,
+                                           payload: bytes) -> int:
+        authentication = self._dns_mediator_authentication
+        if (type(authentication) is not bytes
+                or len(authentication) != _DNS_MEDIATOR_AUTH_BYTES
+                or (kind & 0xF) != socket.SOCK_DGRAM
+                or protocol not in {0, socket.IPPROTO_UDP}):
+            return errno.EPERM
+        return self._inject_target_dns_bytes(
+            fd, notification_id,
+            _DNS_MEDIATOR_UDP_QUERY_AUTH_MAGIC + authentication + payload,
+            destination,
+        )
+
     def _classify_destination(self, fd: int, domain: int, kind: int,
                               protocol: int,
                               destination: _Destination | None, *, tid: int,
@@ -3974,6 +4240,7 @@ class NetworkBrokerSession:
             destination = None
         else:
             raise NetworkBrokerRefused("network_broker_sockaddr_length_invalid")
+        addressed = destination is not None
         flags = int(notification.data.args[3])
         if flags & _MSG_ZEROCOPY or flags > 0x7FFFFFFF:
             raise NetworkBrokerRefused("network_broker_send_flags_refused")
@@ -3990,6 +4257,14 @@ class NetworkBrokerSession:
             )
             peer = None if destination is None else destination.peer
             port = None if destination is None else destination.port
+            if decision == "allow" and self._policy.transport_profile == "target-dns":
+                decision, reason = self._target_dns_client_allowed(
+                    tid, notification.id, peer, port, kind, protocol,
+                )
+                if decision == "allow":
+                    decision, reason = self._target_dns_payload_allowed(
+                        destination, kind, protocol, payload,
+                    )
             if decision != "allow":
                 if self._respond(notification.id, error=errno.EPERM):
                     self._record(
@@ -4018,15 +4293,22 @@ class NetworkBrokerSession:
                     tid, remote_fd, duplicate,
                     validate=lambda: self._require_valid(notification.id),
                 )
-                result, error = self._send_cancellable(
-                    duplicate, notification.id,
-                    lambda: _libc().sendto(
-                        duplicate, ctypes.byref(buffer), len(payload),
-                        flags | getattr(socket, "MSG_DONTWAIT", 0),
-                        ctypes.byref(name_buffer) if name_buffer is not None else None,
-                        len(destination.raw) if name_buffer is not None else 0,
-                    ),
-                )
+                if (self._policy.transport_profile == "target-dns" and addressed
+                        and (kind & 0xF) == socket.SOCK_DGRAM):
+                    error = self._inject_target_dns_addressed_query(
+                        duplicate, notification.id, destination, kind, protocol, payload,
+                    )
+                    result = len(payload) if error == 0 else -1
+                else:
+                    result, error = self._send_cancellable(
+                        duplicate, notification.id,
+                        lambda: _libc().sendto(
+                            duplicate, ctypes.byref(buffer), len(payload),
+                            flags | getattr(socket, "MSG_DONTWAIT", 0),
+                            ctypes.byref(name_buffer) if name_buffer is not None else None,
+                            len(destination.raw) if name_buffer is not None else 0,
+                        ),
+                    )
             _require_same_tracee_ofd(
                 tid, remote_fd, duplicate,
                 validate=lambda: self._require_valid(notification.id),
@@ -4055,6 +4337,7 @@ class NetworkBrokerSession:
             ),
         )
         try:
+            addressed = message.destination is not None
             flags = int(notification.data.args[2])
             if flags & _MSG_ZEROCOPY or flags > 0x7FFFFFFF:
                 raise NetworkBrokerRefused("network_broker_send_flags_refused")
@@ -4079,6 +4362,20 @@ class NetworkBrokerSession:
                 )
                 peer = None if destination is None else destination.peer
                 port = None if destination is None else destination.port
+                if decision == "allow" and self._policy.transport_profile == "target-dns":
+                    decision, reason = self._target_dns_client_allowed(
+                        tid, notification.id, peer, port, kind, protocol,
+                    )
+                    if decision == "allow":
+                        payload = b"".join(
+                            bytes(buffer)[:int(vector.length)]
+                            for buffer, vector in zip(
+                                message.payload_buffers, message.iovectors,
+                            )
+                        )
+                        decision, reason = self._target_dns_payload_allowed(
+                            destination, kind, protocol, payload,
+                        )
                 if decision != "allow":
                     if self._respond(notification.id, error=errno.EPERM):
                         self._record(
@@ -4102,13 +4399,21 @@ class NetworkBrokerSession:
                         tid, remote_fd, duplicate,
                         validate=lambda: self._require_valid(notification.id),
                     )
-                    result, error = self._send_cancellable(
-                        duplicate, notification.id,
-                        lambda: _libc().sendmsg(
-                            duplicate, ctypes.byref(message.header),
-                            flags | getattr(socket, "MSG_DONTWAIT", 0),
-                        ),
-                    )
+                    if (self._policy.transport_profile == "target-dns" and addressed
+                            and (kind & 0xF) == socket.SOCK_DGRAM):
+                        error = self._inject_target_dns_addressed_query(
+                            duplicate, notification.id, destination, kind, protocol,
+                            payload,
+                        )
+                        result = len(payload) if error == 0 else -1
+                    else:
+                        result, error = self._send_cancellable(
+                            duplicate, notification.id,
+                            lambda: _libc().sendmsg(
+                                duplicate, ctypes.byref(message.header),
+                                flags | getattr(socket, "MSG_DONTWAIT", 0),
+                            ),
+                        )
                 _require_same_tracee_ofd(
                     tid, remote_fd, duplicate,
                     validate=lambda: self._require_valid(notification.id),
@@ -4213,7 +4518,12 @@ class NetworkBrokerSession:
                 tid, notification.id, destination,
                 domain, kind, protocol,
             ) if destination.family == socket.AF_UNIX else None
-            if control is not None:
+            if self._policy.transport_profile == "target-dns":
+                decision, reason = self._target_dns_client_allowed(
+                    tid, notification.id, destination.peer, destination.port,
+                    kind, protocol,
+                )
+            elif control is not None:
                 decision, reason = (
                     "allow", "invocation-owned browser control channel",
                 )
@@ -4298,6 +4608,27 @@ class NetworkBrokerSession:
                         retained = None
                     result, error = -1, errno.EPERM
                     decision, reason = final_decision, final_reason
+            if result == 0 and self._policy.transport_profile == "target-dns":
+                # The tracee never sees this capability.  It is written on
+                # the broker's duplicate before connect(2) is acknowledged,
+                # making the mediator's first TCP bytes / connected-UDP
+                # datagram an attested broker effect.
+                with self._effect_lock:
+                    if self._stop.is_set():
+                        result, error = -1, errno.ECANCELED
+                    else:
+                        self._require_valid(notification.id)
+                        _require_same_tracee_ofd(
+                            tid, remote_fd, duplicate,
+                            validate=lambda: self._require_valid(notification.id),
+                        )
+                        error = self._inject_target_dns_connected_authentication(
+                            duplicate, notification.id, kind, protocol,
+                        )
+                        result = 0 if error == 0 else -1
+                if result != 0 and retained is not None:
+                    self._release_retained(retained)
+                    retained = None
             if result != 0:
                 self._record(
                     syscall="connect", tid=tid,
@@ -4440,11 +4771,20 @@ class NetworkBrokerSession:
                 # only a post-effect rollback guard through response, terminal
                 # trace, and control-grant commit.  After commit the parent-owned
                 # cgroup kill+empty authority is required for cancellation.
-                self._release_retained(
-                    retained,
-                    shutdown=not (recorded and final_result == "ok"),
-                )
-                retained = None
+                if (self._policy.transport_profile == "target-dns"
+                        and (kind & 0xF) == socket.SOCK_DGRAM
+                        and protocol in {0, socket.IPPROTO_UDP}
+                        and recorded and final_result == "ok"):
+                    # Connected UDP's persistent auth is bound to this exact
+                    # source port.  Keep a broker-owned duplicate until the
+                    # normal session settlement drains it.
+                    retained = None
+                else:
+                    self._release_retained(
+                        retained,
+                        shutdown=not (recorded and final_result == "ok"),
+                    )
+                    retained = None
             if not recorded and connected_effect:
                 self._effect_fence.cancel()
         except BaseException:
