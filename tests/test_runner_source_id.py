@@ -1,13 +1,19 @@
 """Source identity admission at the repository runner boundary."""
 
 import ast
+import hashlib
+import sys
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import ANY
 
 import pytest
 
-from quarry_recon import contract, events, runner, runtime_identity, store
+from quarry_recon import (contract, events, runner, runner_protocol,
+                          runner_repository, runner_supervisor, runtime_identity, store)
 import quarry_recon.network_policy as network_policy
 from quarry_recon.runner import Status
+from quarry_recon.runner_native import RepositoryNativeOutput
 from quarry_recon.runner_repository import RepositoryOutput
 
 
@@ -99,6 +105,138 @@ def _forbid_launch(monkeypatch):
     monkeypatch.setattr(runner.subprocess, "Popen", forbidden)
 
 
+def _authenticated_outcome(request_id, *, clean=False):
+    if clean:
+        empty_digest = hashlib.sha256(b"").hexdigest()
+        settlement = runner_protocol.WorkerSettlement(
+            request_id=request_id,
+            terminal=runner_protocol.ExecutionTerminal.COMPLETE,
+            launched=True,
+            exit_code=1,
+            process_group_settled=True,
+            process_tree_settled=False,
+            streams=(
+                runner_protocol.StreamSettlement(
+                    role=runner_protocol.StreamRole.STDIN,
+                    terminal=runner_protocol.StreamTerminal.COMPLETE,
+                    observed_bytes=0,
+                    retained_bytes=0,
+                    observed_sha256=empty_digest,
+                    retained_sha256=None,
+                ),
+                *(
+                    runner_protocol.StreamSettlement(
+                        role=role,
+                        terminal=runner_protocol.StreamTerminal.EOF,
+                        observed_bytes=0,
+                        retained_bytes=0,
+                        observed_sha256=empty_digest,
+                        retained_sha256=None,
+                    )
+                    for role in (
+                        runner_protocol.StreamRole.STDOUT,
+                        runner_protocol.StreamRole.STDERR,
+                    )
+                ),
+            ),
+            worker_pid=51231,
+            tool_pid=51232,
+        )
+        execution = runner_supervisor.ExecutionOutcome(
+            reason=runner_supervisor.ExecutionReason.COMPLETE,
+            request_id=request_id,
+            worker_pid=51231,
+            settlement=settlement,
+            validated=runner_protocol.ValidatedSettlement(
+                worker=settlement,
+                mechanically_settled=True,
+                containment_assurance=runner_protocol.ContainmentAssurance.COOPERATIVE_SCOPE,
+                escape_protected=False,
+                tree_proven=False,
+                clean_eligible=True,
+                capture_complete=True,
+                _authority=runner_protocol._VALIDATION_AUTHORITY,
+            ),
+            worker_returncode=0,
+            worker_spawned=True,
+            worker_reaped=True,
+            control_eof=True,
+            go_command_sent=True,
+            parent_pipes_closed=True,
+            containment_settled=True,
+            stages_settled=True,
+            _authority=runner_supervisor._EXECUTION_OUTCOME_AUTHORITY,
+        )
+    else:
+        execution = runner_supervisor.ExecutionOutcome(
+            reason=runner_supervisor.ExecutionReason.INCOMPLETE,
+            request_id=request_id,
+            stages_settled=True,
+            _authority=runner_supervisor._EXECUTION_OUTCOME_AUTHORITY,
+        )
+    return runner_repository.RepositoryExecutionOutcome(
+        execution=execution,
+        publication=runner_repository.RepositoryPublication.NOT_REQUESTED,
+        requested_roles=(),
+        discarded_roles=(
+            runner_protocol.StreamRole.STDOUT,
+            runner_protocol.StreamRole.STDERR,
+        ),
+    )
+
+
+class _PreparedLaunch:
+    def __init__(self, argv):
+        self.argv = tuple(argv)
+        self.environment = {"PREPARED": "yes"}
+        self.record = {"identity": "prepared"}
+        self.redactions = ()
+        self.source_argv_indexes = tuple(range(len(argv)))
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+class _PolicyInvocation:
+    def __init__(self):
+        self.attached = None
+        self.settlements = []
+
+    def attach(self, environment):
+        self.attached = dict(environment)
+        attached = dict(environment)
+        attached[network_policy.PRIVATE_POLICY_ENV] = "broker-policy"
+        return attached
+
+    def settle(self, **kwargs):
+        self.settlements.append(kwargs)
+
+
+class _PolicyScope:
+    def __init__(self):
+        self.invocation = _PolicyInvocation()
+        self.prepared = None
+
+    def prepare_invocation(self, **kwargs):
+        self.prepared = kwargs
+        return self.invocation
+
+
+def _install_bound_policy(monkeypatch, run, scope):
+    monkeypatch.setattr(network_policy, "scope_for", lambda repository: scope if repository is run else None)
+    monkeypatch.setattr(
+        network_policy, "transport_door",
+        lambda _source_id, *, argv: SimpleNamespace(supported=True, broker_required=True),
+    )
+    monkeypatch.setattr(runner, "have", lambda _name: True)
+    prepared = _PreparedLaunch(("fixture", "--exact"))
+    monkeypatch.setattr(runtime_identity, "prepare_launch", lambda *_args, **_kwargs: prepared)
+    monkeypatch.setattr(runtime_identity, "revalidate_launch", lambda _prepared: None)
+    monkeypatch.setattr(runtime_identity, "publish_launch_identity", lambda *_args: "identity")
+    return prepared
+
+
 def test_bound_repository_requires_source_id_before_prepare_launch(tmp_path, monkeypatch):
     run = _running_run(tmp_path)
     monkeypatch.setattr(network_policy, "scope_for",
@@ -158,3 +296,103 @@ def test_unbound_repository_keeps_optional_source_id_compatibility(tmp_path, mon
 
     assert result.status is Status.SKIPPED
     assert result.started is False
+
+
+def test_bound_policy_payload_is_attached_before_supervise_and_settles_allow(tmp_path, monkeypatch):
+    run = _running_run(tmp_path)
+    scope = _PolicyScope()
+    prepared = _install_bound_policy(monkeypatch, run, scope)
+    observed = {}
+
+    def supervise(_repository, invocation, **_kwargs):
+        observed["environment"] = invocation.worker.environment
+        return _authenticated_outcome(invocation.worker.request_id, clean=True)
+
+    monkeypatch.setattr(runner_repository, "supervise_repository_execution", supervise)
+
+    _managed_call(run, ["fixture", "--exact"], source_id="fixture.source")
+
+    assert scope.prepared == {
+        "request_id": ANY,
+        "source_id": "fixture.source",
+        "tool": "fixture",
+        "argv": ["fixture", "--exact"],
+        "environment": prepared.environment,
+        "runtime_identity": prepared.record,
+        "approved_peers": (),
+    }
+    assert dict(observed["environment"])[network_policy.PRIVATE_POLICY_ENV] == "broker-policy"
+    assert scope.invocation.settlements == [{
+        "decision": "allow",
+        "reason": "repository supervisor returned an authenticated outcome",
+        "summary": {"runner": "repository"},
+    }]
+
+
+@pytest.mark.parametrize("failure", ("normalize", "supervisor"))
+def test_bound_policy_settles_deny_on_admission_or_supervisor_failure(tmp_path, monkeypatch, failure):
+    run = _running_run(tmp_path)
+    scope = _PolicyScope()
+    _install_bound_policy(monkeypatch, run, scope)
+    if failure == "normalize":
+        monkeypatch.setattr(runner_protocol, "normalize_invocation", lambda **_kwargs: (_ for _ in ()).throw(RuntimeError()))
+    else:
+        monkeypatch.setattr(
+            runner_repository, "supervise_repository_execution",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError()),
+        )
+
+    result = _managed_call(run, ["fixture", "--exact"], source_id="fixture.source")
+
+    assert result.status is Status.FAILED
+    assert [item["decision"] for item in scope.invocation.settlements] == ["deny"]
+
+
+def test_bound_policy_denies_matching_incomplete_supervisor_outcome(tmp_path, monkeypatch):
+    run = _running_run(tmp_path)
+    scope = _PolicyScope()
+    _install_bound_policy(monkeypatch, run, scope)
+    monkeypatch.setattr(
+        runner_repository, "supervise_repository_execution",
+        lambda _repository, invocation, **_kwargs: _authenticated_outcome(
+            invocation.worker.request_id,
+        ),
+    )
+
+    result = _managed_call(run, ["fixture", "--exact"], source_id="fixture.source")
+
+    assert result.status is Status.FAILED
+    assert [item["decision"] for item in scope.invocation.settlements] == ["deny"]
+
+
+def test_bound_policy_native_cleanup_does_not_settle_twice(tmp_path, monkeypatch):
+    run = _running_run(tmp_path)
+    scope = _PolicyScope()
+    _install_bound_policy(monkeypatch, run, scope)
+    final = run.dir / "raw" / "probe" / "fixture" / "native.txt"
+    command = [sys.executable, "-c", "pass", str(final)]
+    policy = RepositoryNativeOutput.file(3, "raw", "probe", "fixture", "native.txt")
+    monkeypatch.setattr(
+        runtime_identity, "prepare_launch",
+        lambda *_args, **_kwargs: _PreparedLaunch(command),
+    )
+    monkeypatch.setattr(
+        runner_repository, "supervise_repository_execution",
+        lambda _repository, invocation, **_kwargs: _authenticated_outcome(
+            invocation.worker.request_id,
+            clean=True,
+        ),
+    )
+    monkeypatch.setattr(
+        runner, "_repository_run_result",
+        lambda tool, cmd, *_args, **_kwargs: runner.RunResult(
+            tool, cmd, Status.EMPTY, 0, 0.0, None, 0,
+            meta={"started": True, "repository_ownership_settled": True},
+        ),
+    )
+
+    _managed_call(
+        run, command, source_id="fixture.source", native_outputs=(policy,),
+    )
+
+    assert [item["decision"] for item in scope.invocation.settlements] == ["allow"]

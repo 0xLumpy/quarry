@@ -1641,11 +1641,12 @@ def _run_with_repository(
     # execution.  Admission must carry the literal source identity and the
     # caller's exact argv through the transport-door registry; otherwise a
     # scoped repository must not reach runtime identity preparation or spawn.
-    if network_policy.scope_for(repository) is not None:
+    policy_scope = network_policy.scope_for(repository)
+    if policy_scope is not None:
         door = network_policy.transport_door(source_id, argv=safe_cmd)
-        if door is None or not door.supported:
+        if door is None or not door.supported or not door.broker_required:
             return preflight_failure(
-                "bound network policy requires a supported source_id and exact transport door",
+                "bound network policy requires a supported broker source_id and exact transport door",
             )
 
     if type(repository) is store.Run:
@@ -1677,6 +1678,35 @@ def _run_with_repository(
         return missing
 
     prepared = None
+    network_invocation = None
+    network_settlement_attempted = False
+
+    def settle_network_invocation(decision: str):
+        """Settle a planned broker claim once without replacing a primary fault."""
+        nonlocal network_settlement_attempted
+        if network_invocation is None or network_settlement_attempted:
+            return None
+        network_settlement_attempted = True
+        try:
+            network_invocation.settle(
+                decision=decision,
+                reason=(
+                    "repository supervisor returned an authenticated outcome"
+                    if decision == "allow"
+                    else "runner admission or repository supervision did not complete"
+                ),
+                summary={"runner": "repository"},
+            )
+        except BaseException as exc:
+            return exc
+        return None
+
+    def is_authenticated_repository_outcome(outcome, current_invocation) -> bool:
+        return bool(
+            type(outcome) is runner_repository.RepositoryExecutionOutcome
+            and outcome.execution.request_id == current_invocation.worker.request_id
+        )
+
     try:
         from . import runtime_identity
         request_id = runner_protocol.new_request_id(os.urandom(16))
@@ -1685,6 +1715,16 @@ def _run_with_repository(
             payload_scope=getattr(repository, "_runtime_payload_scope", None),
         )
         runtime_identity.revalidate_launch(prepared)
+        if policy_scope is not None:
+            network_invocation = policy_scope.prepare_invocation(
+                request_id=request_id,
+                source_id=source_id,
+                tool=tool,
+                argv=safe_cmd,
+                environment=prepared.environment,
+                runtime_identity=prepared.record,
+                approved_peers=(),
+            )
         identity_ref = (
             runtime_identity.publish_launch_identity(repository, request_id, prepared.record)
             if type(repository) is store.Run else None
@@ -1694,6 +1734,8 @@ def _run_with_repository(
             worker_environment["QUARRY_RUNNER_PRIVATE_REDACTIONS"] = json.dumps(
                 list(prepared.redactions), ensure_ascii=False, separators=(",", ":"),
             )
+        if network_invocation is not None:
+            worker_environment = network_invocation.attach(worker_environment)
         invocation = runner_protocol.normalize_invocation(
             request_id=request_id,
             tool=tool,
@@ -1711,11 +1753,13 @@ def _run_with_repository(
             max_output_bytes=max_output_bytes,
         )
     except BaseException as exc:
+        settlement_fault = settle_network_invocation("deny")
         if prepared is not None:
             try:
                 prepared.close()
             except BaseException as cleanup_fault:
                 exc = _preferred_native_fault(exc, cleanup_fault)
+        exc = _preferred_native_fault(exc, settlement_fault)
         if not isinstance(exc, Exception):
             raise exc.with_traceback(exc.__traceback__)
         return preflight_failure(f"runtime admission rejected ({type(exc).__name__})")
@@ -1761,8 +1805,20 @@ def _run_with_repository(
         try:
             runtime_identity.revalidate_launch(prepared)
             outcome = supervise(invocation)
+            if (network_invocation is not None
+                    and not is_authenticated_repository_outcome(outcome, invocation)):
+                raise RuntimeError("repository supervisor returned an unauthenticated outcome")
+            if network_invocation is not None:
+                settlement_fault = settle_network_invocation(
+                    "allow" if outcome.clean else "deny",
+                )
+                if settlement_fault is not None:
+                    raise settlement_fault
         except BaseException as exc:
             operation_fault = exc
+            operation_fault = _preferred_native_fault(
+                operation_fault, settle_network_invocation("deny"),
+            )
         try:
             prepared.close()
         except BaseException as exc:
@@ -1811,6 +1867,15 @@ def _run_with_repository(
                 )
                 runtime_identity.revalidate_launch(prepared)
                 outcome = supervise(child_invocation)
+                if (network_invocation is not None
+                        and not is_authenticated_repository_outcome(outcome, child_invocation)):
+                    raise RuntimeError("repository supervisor returned an unauthenticated outcome")
+                if network_invocation is not None:
+                    settlement_fault = settle_network_invocation(
+                        "allow" if outcome.clean else "deny",
+                    )
+                    if settlement_fault is not None:
+                        raise settlement_fault
                 result = _repository_run_result(
                     tool,
                     safe_cmd,
@@ -1838,6 +1903,9 @@ def _run_with_repository(
                 )
     except BaseException as exc:
         operation_fault = exc
+        operation_fault = _preferred_native_fault(
+            operation_fault, settle_network_invocation("deny"),
+        )
     try:
         prepared.close()
     except BaseException as exc:
