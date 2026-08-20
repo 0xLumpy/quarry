@@ -719,11 +719,13 @@ class TestTheConsumersHonourTheirUnboundedValue:
 
     def test_the_CLOUD_name_cap_probes_every_candidate_when_unbound(self, tmp_path, monkeypatch):
         from quarry_recon import cloud, events, policy, settings, store
-        monkeypatch.setattr(cloud, "_check", lambda url: (False, None))     # nothing exists; no network
+        monkeypatch.setattr(cloud, "_check", lambda ctx, url: (False, None))  # no network
         probed: list = []
         monkeypatch.setattr(cloud, "_all_candidates", lambda prof: [f"n{i}" for i in range(300)])
         real = cloud._check
-        monkeypatch.setattr(cloud, "_check", lambda url: (probed.append(url), (False, None))[1])
+        monkeypatch.setattr(
+            cloud, "_check", lambda ctx, url: (probed.append(url), (False, None))[1],
+        )
         run = store.Run.create(tmp_path, "t")
         events.reset(); events.configure(run.dir)
         ctx = type("C", (), {"run": run, "profile": type("P", (), {"apex_domains": ["acme.com"]})()})()

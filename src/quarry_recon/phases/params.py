@@ -2659,7 +2659,9 @@ def _redirect_confirm(ctx, cands, prof) -> RunResult:
                     "request": {"method": "GET", "url": probe, "follow_redirects": False},
                 }
                 try:
-                    loc, status_code = fetch.redirect_location(ctx, probe, host)
+                    loc, status_code = fetch.redirect_location(
+                        ctx, probe, host, source_id="params.redirect_confirm",
+                    )
                 except Exception as exc:
                     degraded += 1
                     provider_record["outcome"] = "probe-error"
@@ -2789,7 +2791,10 @@ def _oob_probe(ctx, scope, prof):
             try:
                                 # no-follow + header-only: if the target 302s to Location: <our-callback> we must not
                                 # follow it, or Quarry fetches its own collector; the server-side SSRF still fires
-                fetch.redirect_location(ctx, probe_url, normalize.host_of_url(probe_url), timeout=10)
+                fetch.redirect_location(
+                    ctx, probe_url, normalize.host_of_url(probe_url), timeout=10,
+                    source_id="params.oob_probe",
+                )
             except Exception:
                 pass                               # a target that doesn't SSRF-fetch is the common case
             events.tool_progress(sid, current_index=i, input_total=len(probes),

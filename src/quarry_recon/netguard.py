@@ -1,7 +1,9 @@
-"""Self-attack guard. `record`: a host resolving private/self is a review(internal-resolution) finding.
-`deny`: contact refused only for the scan box itself (loopback, link-local, cloud metadata, unspecified,
-own-interface addrs); private space is contacted unless block_private_targets. Hosts fresh-resolve at the
-tool boundary (bounded, uncached); a public->metadata rebind between resolve and tool is a residual risk."""
+"""Protected-destination classification and bounded resolver authority.
+
+Private space remains reachable by default.  Native callers retain the exact
+approved answer set for a pinned connection, while tool callers pair these
+classifiers with the OS-level authority in :mod:`network_policy`.
+"""
 from __future__ import annotations
 
 import hashlib
@@ -12,6 +14,7 @@ import multiprocessing as _mp
 import os
 import re
 import socket
+import ctypes
 import threading
 import time
 from collections.abc import Mapping
@@ -28,32 +31,258 @@ _SELF_NETS = tuple(ipaddress.ip_network(c) for c in
                    ("127.0.0.0/8", "169.254.0.0/16", "fe80::/10", "0.0.0.0/32", "::1/128", "::/128"))
 # Cloud instance-metadata endpoints — our own credentials sit behind these.
 _METADATA_NETS = tuple(ipaddress.ip_network(c) for c in
-                       ("169.254.169.254/32", "169.254.170.2/32", "100.100.100.200/32", "fd00:ec2::254/128"))
+                       ("169.254.169.254/32", "169.254.170.2/32", "100.100.100.200/32",
+                        "fd00:ec2::254/128", "fd20:ce::254/128"))
 # Contacted unless block_private_targets; also the trigger for recording internal-resolution intel.
 _PRIVATE_NETS = tuple(ipaddress.ip_network(c) for c in
                       ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "fc00::/7"))
 
 
-def _own_ips() -> frozenset[str]:
-    """The scan box's own interface addresses. Best-effort; computed once at import."""
-    ips: set[str] = set()
+def _subtract_exceptions(network, exceptions):
+    fragments = [network]
+    for exception in exceptions:
+        fragments = [
+            part
+            for fragment in fragments
+            for part in (
+                list(fragment.address_exclude(exception))
+                if exception.subnet_of(fragment) else [fragment]
+            )
+        ]
+    return tuple(fragments)
+
+
+# Exact non-unicast/special-use partition matching ``is_non_unicast_ip`` while
+# retaining Quarry's explicitly target-contactable RFC1918/CGNAT/ULA classes.
+# Exceptions are globally routed IANA protocol assignments inside 192.0.0.0/24
+# and 2001::/23.  Keeping this finite partition in the protected CIDR set makes
+# planned/effective CIDRs equal the addresses connect-time policy can admit.
+_V4_PROTOCOL = ipaddress.ip_network("192.0.0.0/24")
+_V4_PROTOCOL_EXCEPTIONS = (
+    ipaddress.ip_network("192.0.0.9/32"),
+    ipaddress.ip_network("192.0.0.10/32"),
+)
+_V6_PROTOCOL = ipaddress.ip_network("2001::/23")
+_V6_PROTOCOL_EXCEPTIONS = tuple(ipaddress.ip_network(value) for value in (
+    "2001:1::1/128", "2001:1::2/128", "2001:3::/32", "2001:4:112::/48",
+    "2001:20::/28", "2001:30::/28",
+))
+_NON_UNICAST_NETS = (
+    *(ipaddress.ip_network(value) for value in (
+        "0.0.0.0/8", "192.0.2.0/24", "198.18.0.0/15",
+        "198.51.100.0/24", "203.0.113.0/24", "224.0.0.0/4", "240.0.0.0/4",
+    )),
+    *_subtract_exceptions(_V4_PROTOCOL, _V4_PROTOCOL_EXCEPTIONS),
+    *(ipaddress.ip_network(value) for value in (
+        "::/8", "64:ff9b:1::/48", "100::/64", "2001:db8::/32",
+        "2002::/16", "3fff::/20", "400::/6", "800::/5", "1000::/4",
+        "4000::/3", "6000::/3", "8000::/3", "a000::/3", "c000::/3",
+        "e000::/4", "f000::/5", "f800::/6", "fe00::/9", "ff00::/8",
+    )),
+    *_subtract_exceptions(_V6_PROTOCOL, _V6_PROTOCOL_EXCEPTIONS),
+)
+
+
+class _Sockaddr(ctypes.Structure):
+    _fields_ = [("family", ctypes.c_ushort), ("data", ctypes.c_ubyte * 14)]
+
+
+class _InAddr(ctypes.Structure):
+    _fields_ = [("bytes", ctypes.c_ubyte * 4)]
+
+
+class _SockaddrIn(ctypes.Structure):
+    _fields_ = [
+        ("family", ctypes.c_ushort), ("port", ctypes.c_ushort),
+        ("address", _InAddr), ("padding", ctypes.c_ubyte * 8),
+    ]
+
+
+class _In6Addr(ctypes.Structure):
+    _fields_ = [("bytes", ctypes.c_ubyte * 16)]
+
+
+class _SockaddrIn6(ctypes.Structure):
+    _fields_ = [
+        ("family", ctypes.c_ushort), ("port", ctypes.c_ushort),
+        ("flowinfo", ctypes.c_uint32), ("address", _In6Addr),
+        ("scope_id", ctypes.c_uint32),
+    ]
+
+
+class _Ifaddrs(ctypes.Structure):
+    pass
+
+
+_Ifaddrs._fields_ = [
+    ("next", ctypes.POINTER(_Ifaddrs)),
+    ("name", ctypes.c_char_p),
+    ("flags", ctypes.c_uint),
+    ("address", ctypes.POINTER(_Sockaddr)),
+    ("netmask", ctypes.POINTER(_Sockaddr)),
+    ("ifu", ctypes.POINTER(_Sockaddr)),
+    ("data", ctypes.c_void_p),
+]
+
+
+_MAX_INTERFACE_RECORDS = 4096
+
+
+def _directed_broadcast(address: str, netmask: str) -> str:
     try:
-        for info in socket.getaddrinfo(socket.gethostname(), None):
-            ips.add(info[4][0])
-    except Exception:
-        pass
-    for fam, dst in ((socket.AF_INET, ("8.8.8.8", 80)), (socket.AF_INET6, ("2001:4860:4860::8888", 80))):
-        try:
-            s = socket.socket(fam, socket.SOCK_DGRAM)
-            s.connect(dst)
-            ips.add(s.getsockname()[0])
-            s.close()
-        except Exception:
-            pass
-    return frozenset(ips)
+        network = ipaddress.ip_network(
+            f"{address}/{netmask}", strict=False,
+        )
+    except ValueError as exc:
+        raise OSError("interface returned a noncanonical netmask") from exc
+    if network.version != 4:
+        raise OSError("directed broadcast requires IPv4")
+    if network.prefixlen > 30:
+        raise OSError("IPv4 /31 and /32 interfaces have no directed broadcast")
+    return str(network.broadcast_address)
 
 
-_OWN_IPS = _own_ips()
+class InterfaceSnapshot(NamedTuple):
+    """One simultaneous, tagged interface authority snapshot."""
+
+    unicast_ips: tuple[str, ...]
+    broadcast_ips: tuple[str, ...]
+
+    @property
+    def protected_ips(self) -> tuple[str, ...]:
+        return canonical_ip_set((*self.unicast_ips, *self.broadcast_ips))
+
+
+def _interface_snapshot() -> tuple[frozenset[str], frozenset[str]]:
+    """Return exact unicast and IPv4-broadcast sets from one getifaddrs walk."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    getifaddrs = getattr(libc, "getifaddrs", None)
+    freeifaddrs = getattr(libc, "freeifaddrs", None)
+    if getifaddrs is None or freeifaddrs is None:
+        raise OSError("getifaddrs is unavailable")
+    getifaddrs.argtypes = [ctypes.POINTER(ctypes.POINTER(_Ifaddrs))]
+    getifaddrs.restype = ctypes.c_int
+    freeifaddrs.argtypes = [ctypes.POINTER(_Ifaddrs)]
+    freeifaddrs.restype = None
+    head = ctypes.POINTER(_Ifaddrs)()
+    if getifaddrs(ctypes.byref(head)) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    unicast: set[str] = set()
+    broadcasts: set[str] = {"255.255.255.255"}
+    seen: set[int] = set()
+    count = 0
+    try:
+        current = head
+        while current:
+            pointer = ctypes.addressof(current.contents)
+            if pointer in seen:
+                raise OSError("getifaddrs returned a cycle")
+            seen.add(pointer)
+            count += 1
+            if count > _MAX_INTERFACE_RECORDS:
+                raise OSError("interface snapshot exceeds its finite bound")
+            address = current.contents.address
+            if address:
+                family = address.contents.family
+                if family == socket.AF_INET:
+                    item = ctypes.cast(
+                        address, ctypes.POINTER(_SockaddrIn),
+                    ).contents
+                    text = socket.inet_ntop(
+                        socket.AF_INET, bytes(item.address.bytes),
+                    )
+                    unicast.add(text)
+                    # IFF_BROADCAST=0x2 and IFF_POINTOPOINT=0x10.  /31 and
+                    # /32 have no directed broadcast even if a platform
+                    # reports the broadcast capability bit.
+                    if (current.contents.flags & 0x2
+                            and not current.contents.flags & 0x10):
+                        mask = current.contents.netmask
+                        if not mask or mask.contents.family != socket.AF_INET:
+                            raise OSError(
+                                "broadcast interface lacks an IPv4 netmask",
+                            )
+                        mask_item = ctypes.cast(
+                            mask, ctypes.POINTER(_SockaddrIn),
+                        ).contents
+                        mask_text = socket.inet_ntop(
+                            socket.AF_INET, bytes(mask_item.address.bytes),
+                        )
+                        network = ipaddress.ip_network(
+                            f"{text}/{mask_text}", strict=False,
+                        )
+                        if network.prefixlen <= 30:
+                            broadcasts.add(str(network.broadcast_address))
+                elif family == socket.AF_INET6:
+                    item = ctypes.cast(
+                        address, ctypes.POINTER(_SockaddrIn6),
+                    ).contents
+                    parsed = ipaddress.ip_address(socket.inet_ntop(
+                        socket.AF_INET6, bytes(item.address.bytes),
+                    ))
+                    unicast.add(str(parsed.ipv4_mapped or parsed))
+            current = current.contents.next
+    finally:
+        freeifaddrs(head)
+    if not unicast:
+        raise OSError("interface address snapshot is empty")
+    return frozenset(unicast), frozenset(broadcasts)
+
+
+def _own_ips() -> frozenset[str]:
+    """Return the complete interface/self deny snapshot for this instant.
+
+    Hostname/default-route inference misses secondary, container and VPN
+    addresses.  ``getifaddrs`` is the kernel's complete interface view; failure,
+    cycles and an implausibly large result refuse rather than silently producing
+    an incomplete self-protection set.  IPv4 directed-broadcast addresses are
+    included as protected peers: allowing private targets must never turn one
+    admitted datagram into traffic to every host on a scanner-attached LAN.
+    """
+    unicast, broadcasts = _interface_snapshot()
+    return frozenset((*unicast, *broadcasts))
+
+
+# Importing classifiers must not require network-namespace enumeration.  A
+# scope/effect refreshes this fail-closed; tests may pin the compatibility
+# baseline explicitly.
+_OWN_IPS: frozenset[str] | None = None
+
+
+def _default_own_ips() -> frozenset[str]:
+    return _own_ips() if _OWN_IPS is None else _OWN_IPS
+
+
+def canonical_ip_set(values) -> tuple[str, ...]:
+    """Return a deterministic exact address set, rejecting malformed members."""
+    try:
+        snapshot = tuple(values)
+    except TypeError as exc:
+        raise ValueError("scanner address snapshot is not finite") from exc
+    normalized = []
+    for value in snapshot:
+        if type(value) is not str:
+            raise ValueError("scanner address snapshot contains a non-string")
+        address = _norm(value)
+        if address is None:
+            raise ValueError("scanner address snapshot contains an invalid address")
+        normalized.append(str(address))
+    return tuple(sorted(set(normalized), key=lambda item: (ipaddress.ip_address(item).version,
+                                                           int(ipaddress.ip_address(item)))))
+
+
+def own_ips() -> tuple[str, ...]:
+    """Refresh the scanner/VPN interface address snapshot for one policy scope."""
+    return interface_snapshot().protected_ips
+
+
+def interface_snapshot() -> InterfaceSnapshot:
+    """Refresh tagged unicast/broadcast authority in one atomic traversal."""
+    unicast, broadcasts = _interface_snapshot()
+    return InterfaceSnapshot(
+        canonical_ip_set(unicast), canonical_ip_set(broadcasts),
+    )
 
 
 def _norm(ip: str):
@@ -62,20 +291,33 @@ def _norm(ip: str):
         a = ipaddress.ip_address(ip)
     except ValueError:
         return None
+    # A textual IPv6 zone selects an interface and is therefore transport
+    # authority, not a canonical peer identity.  Binary sockaddr scope IDs are
+    # refused independently at the syscall boundary.
+    if isinstance(a, ipaddress.IPv6Address) and a.scope_id is not None:
+        return None
     if isinstance(a, ipaddress.IPv6Address) and a.ipv4_mapped is not None:
         return a.ipv4_mapped
     return a
 
 
-def is_self_attack_ip(ip: str) -> bool:
+def is_self_attack_ip(ip: str, *, own_ips=None, control_plane_cidrs=()) -> bool:
     """True for a destination that is the scan box itself: loopback, link-local, metadata, own interface.
     Never contactable under any mode; an unparseable address is also true, to fail closed."""
     a = _norm(ip)
     if a is None:
         return True
-    if ip in _OWN_IPS or str(a) in _OWN_IPS:
+    current_own = _default_own_ips() if own_ips is None else frozenset(own_ips)
+    if ip in current_own or str(a) in current_own:
         return True
-    return any(a in n for n in _SELF_NETS) or any(a in n for n in _METADATA_NETS)
+    if any(a in n for n in _SELF_NETS) or any(a in n for n in _METADATA_NETS):
+        return True
+    try:
+        controls = tuple(ipaddress.ip_network(value, strict=True)
+                         for value in control_plane_cidrs)
+    except (TypeError, ValueError):
+        return True
+    return any(a.version == network.version and a in network for network in controls)
 
 
 def is_private_ip(ip: str) -> bool:
@@ -84,9 +326,39 @@ def is_private_ip(ip: str) -> bool:
     return a is not None and any(a in n for n in _PRIVATE_NETS)
 
 
+def is_non_unicast_ip(ip: str) -> bool:
+    """True unless *ip* is global unicast or explicitly target-private space."""
+    a = _norm(ip)
+    if a is None:
+        return True
+    if (a.is_unspecified or a.is_multicast or a.is_reserved
+            or a.is_loopback or a.is_link_local):
+        return True
+    # RFC1918, shared CGNAT and ULA are intentionally target-contactable unless
+    # the operator opts out.  Every other non-global category is not unicast
+    # target authority (documentation, benchmarking, future-use, etc.).
+    return not a.is_global and not is_private_ip(str(a))
+
+
+def is_local_broadcast_ip(ip: str, *, broadcast_ips=None) -> bool:
+    """Classify limited/exact directed broadcasts from one tagged snapshot."""
+    address = _norm(ip)
+    if not isinstance(address, ipaddress.IPv4Address):
+        return False
+    if int(address) == 0xFFFFFFFF:
+        return True
+    current = (
+        interface_snapshot().broadcast_ips
+        if broadcast_ips is None else canonical_ip_set(broadcast_ips)
+    )
+    return str(address) in current
+
+
 def is_contactable_ip(ip: str, *, block_private: bool = False) -> bool:
     """Contactable unless it's a self-attack destination (always) or private-under-block_private."""
     if is_self_attack_ip(ip):
+        return False
+    if is_non_unicast_ip(ip):
         return False
     if block_private and is_private_ip(ip):
         return False
@@ -104,19 +376,55 @@ def _mapped_cidr(net) -> str:
     return f"::ffff:{net.network_address}/{96 + net.prefixlen}"
 
 
+def protected_cidrs(*, own_ips=None, control_plane_cidrs=(), block_private=False) -> tuple[str, ...]:
+    """Canonical IP-deny set for one connect-time enforcement scope."""
+    current_own = canonical_ip_set(
+        _default_own_ips() if own_ips is None else own_ips,
+    )
+    networks = list(_SELF_NETS + _METADATA_NETS + _NON_UNICAST_NETS)
+    for value in control_plane_cidrs:
+        try:
+            network = ipaddress.ip_network(value, strict=True)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("control-plane destination must be canonical CIDR text") from exc
+        if str(network) != value.lower():
+            raise ValueError("control-plane destination must be canonical CIDR text")
+        networks.append(network)
+    for value in current_own:
+        address = ipaddress.ip_address(value)
+        networks.append(ipaddress.ip_network(
+            f"{address}/{32 if address.version == 4 else 128}", strict=True,
+        ))
+    if block_private:
+        networks.extend(_PRIVATE_NETS)
+    collapsed = [
+        network
+        for version in (4, 6)
+        for network in ipaddress.collapse_addresses(
+            item for item in networks if item.version == version
+        )
+    ]
+    parts = {str(network) for network in collapsed}
+    parts.update(_mapped_cidr(network) for network in collapsed if network.version == 4)
+    return tuple(sorted(parts, key=lambda value: (
+        ipaddress.ip_network(value).version,
+        int(ipaddress.ip_network(value).network_address),
+        ipaddress.ip_network(value).prefixlen,
+    )))
+
+
 def self_deny_list() -> str:
     """Comma-joined CIDR deny list of self, metadata and own-interface ranges, each v4 range also in its
     IPv4-mapped form so a tool whose deny parser does not normalize `::ffff:…` still refuses it. Private
     space is deliberately absent — it is contacted."""
-    nets = _SELF_NETS + _METADATA_NETS
-    parts = {str(n) for n in nets}
-    parts |= {_mapped_cidr(n) for n in nets if n.version == 4}
-    for ip in _OWN_IPS:
-        if ":" in ip:
-            parts.add(f"{ip}/128")
-        else:
-            parts.add(f"{ip}/32")
-            parts.add(f"::ffff:{ip}/128")
+    nets = _SELF_NETS + _METADATA_NETS + _NON_UNICAST_NETS
+    parts = {str(network) for network in nets}
+    parts.update(_mapped_cidr(network) for network in nets if network.version == 4)
+    for value in canonical_ip_set(_default_own_ips()):
+        address = ipaddress.ip_address(value)
+        parts.add(f"{address}/{32 if address.version == 4 else 128}")
+        if address.version == 4:
+            parts.add(f"::ffff:{address}/128")
     return ",".join(sorted(parts))
 
 
@@ -1045,7 +1353,18 @@ def resolve_many(hosts, *, timeout: float = 5.0, corpus_deadline_s: float | None
     )
 
 
-def contact_state(host, stored_ips=None, *, block_private=False, timeout=5.0):
+class ContactState(tuple):
+    """Three-field compatibility tuple plus the exact connect-time answer set."""
+
+    def __new__(cls, state, denied, intel, *, answers=(), approved=()):
+        value = tuple.__new__(cls, (state, list(denied), list(intel)))
+        value.answers = tuple(answers)
+        value.approved = tuple(approved)
+        return value
+
+
+def contact_state(host, stored_ips=None, *, block_private=False, timeout=5.0,
+                  own_ips=None, control_plane_cidrs=()):
     """(state, deny_ips, intel) for a native fetch (scoped_get). state is 'contact' | 'self' |
     'private_blocked' | 'nxdomain' | 'indeterminate'; deny_ips says why contact was refused; intel is the
     answers worth recording. Stored non-contactable answers decide without a live lookup, but a host that
@@ -1053,14 +1372,21 @@ def contact_state(host, stored_ips=None, *, block_private=False, timeout=5.0):
     stored = [ip for ip in (stored_ips or []) if ip]
     ips, state = (stored, "ok") if stored else resolve(host, timeout=timeout)
     if not stored and state != "ok":
-        return state, [], []
+        return ContactState(state, [], [], answers=(), approved=())
     all_ips = set(ips) | set(stored)
     intel = intel_ips(all_ips)
-    if any(is_self_attack_ip(ip) for ip in all_ips):
-        return "self", [ip for ip in all_ips if is_self_attack_ip(ip)], intel
+    protected = [ip for ip in all_ips if is_self_attack_ip(
+        ip, own_ips=own_ips, control_plane_cidrs=control_plane_cidrs,
+    )]
+    answers = canonical_ip_set(all_ips)
+    if protected:
+        return ContactState("self", canonical_ip_set(protected), intel,
+                            answers=answers, approved=())
     if block_private and any(is_private_ip(ip) for ip in all_ips):
-        return "private_blocked", [ip for ip in all_ips if is_private_ip(ip)], intel
-    return "contact", [], intel
+        denied = canonical_ip_set(ip for ip in all_ips if is_private_ip(ip))
+        return ContactState("private_blocked", denied, intel,
+                            answers=answers, approved=())
+    return ContactState("contact", [], intel, answers=answers, approved=answers)
 
 
 def _block_private(ctx) -> bool:

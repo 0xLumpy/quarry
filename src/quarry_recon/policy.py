@@ -73,7 +73,7 @@ SOURCE_OWNERSHIP: dict[str, str] = {
         "vertical.crtsh", "vertical.shosubgo", "vertical.github_subs")},
     **{lane: "external_tool" for lane in
        ("vertical.subfinder", "crawl.gau", "crawl.waymore_urls", "crawl.waymore_responses",
-        "horizontal.caduceus", "horizontal.asnmap", "enrich.smap", "probe.smap", "params.oob_probe")},
+        "horizontal.caduceus", "horizontal.asnmap", "enrich.smap", "probe.smap")},
     **{lane: "local" for lane in
        ("vertical.openintel", "horizontal.kaeferjaeger", "horizontal.mapcidr",
         "params.gf", "crawl.js_beautify", "crawl.jsluice_urls", "crawl.jsluice_secrets",
@@ -90,9 +90,10 @@ SOURCE_OWNERSHIP: dict[str, str] = {
         "enrich.gowitness", "enrich.httpx", "enrich.nuclei_waf", "enrich.wildcard_a1d",
         "horizontal.cloud_buckets", "horizontal.revdns", "horizontal.tlsx_san", "params.arjun",
         "params.blind_xss", "params.dalfox", "params.dalfox_xss_fast", "params.nuclei_oast",
-        "params.nuclei_scan", "params.nuclei_takeover", "params.redirect_confirm", "probe.ffuf_vhost",
+        "params.nuclei_scan", "params.nuclei_takeover", "params.oob_probe",
+        "params.redirect_confirm", "probe.ffuf_vhost",
         "probe.gowitness", "probe.httpx", "probe.naabu_infra", "probe.naabu_web", "probe.nmap_service",
-        "probe.tlsx_certs", "vertical.puredns_brute", "vertical.puredns_resolve",
+        "probe.tlsx_certs", "probe.nuclei_waf", "vertical.puredns_brute", "vertical.puredns_resolve",
         "vertical.wildcard_http",
         # both active: the CSP lane fetches the apex through `fetch.scoped_headers` (guarded, paced), the
         # sourcemap lane fetches scoped `sourceMappingURL` targets.
@@ -307,9 +308,166 @@ EXCLUDED: dict[str, tuple[str, str]] = {
                                               "are retained exactly the same"),
     "quarry_recon.evidence:_DEEP_SCAN_OVERLAP": ("resource", "bytes carried between windows so a secret "
                                                  "on a boundary is not cut in half"),
+    "quarry_recon.fetch:_MAX_NATIVE_SEND_CHUNK": (
+        "resource", "the largest request-write slice admitted to one nonblocking native HTTP effect-fence "
+                    "epoch; larger bodies are streamed through repeated bounded writes"),
     "quarry_recon.bootstrap:DISK_MIN": ("resource", "a run that fills the disk loses evidence it has"),
     "quarry_recon.sweep:_UNSELECTABLE_DETAIL": ("resource", "a diagnostic list bound; the counters beside "
                                                             "it are authoritative"),
+    "quarry_recon.netguard:_MAX_INTERFACE_RECORDS": (
+        "resource", "the bounded getifaddrs traversal used to refresh scanner-owned addresses before "
+                    "each network decision; overflow refuses contact rather than accepting a prefix"),
+    "quarry_recon.oos_regex:_MAX_OOS_PATTERN_BYTES": (
+        "parser", "the shared profile/parent/broker OOS grammar byte ceiling; larger expressions are "
+                  "refused before attacker-controlled hostname matching"),
+    "quarry_recon.network_policy:_MAX_TRACE_BYTES": (
+        "resource", "the canonical byte envelope for one durable network-policy trace row; oversize "
+                    "truth is refused rather than truncated"),
+    "quarry_recon.network_policy:_MAX_BROKER_POLICY_BYTES": (
+        "resource", "the serialized child broker policy must leave room for its enclosing durable scope "
+                    "trace and is refused before launch when it cannot"),
+    "quarry_recon.network_policy:_MAX_EXECUTABLE_BYTES": (
+        "resource", "the largest helper identity the parent may authorize for broker authentication; "
+                    "larger launch identities are rejected before network authority"),
+    "quarry_recon.network_broker:_MAX_SOCKADDR_BYTES": (
+        "resource", "the allocation bound for one copied tracee sockaddr; an oversized address is "
+                    "rejected before any broker-owned socket effect"),
+    "quarry_recon.network_broker:_MAX_PROC_STATUS_BYTES": (
+        "resource", "the allocation bound for one procfs thread-identity record; overflow refuses the "
+                    "notification rather than trusting partial process identity"),
+    "quarry_recon.network_broker:_MAX_DECISIONS": (
+        "resource", "the bounded in-memory decision journal for one broker invocation; overflow makes "
+                    "settlement incomplete and can never certify a truncated trace"),
+    "quarry_recon.network_broker:_MAX_RECORD_BYTES": (
+        "resource", "the allocation bound for one canonical broker decision record; oversize control "
+                    "evidence is rejected rather than truncated"),
+    "quarry_recon.network_broker:_MAX_DECISION_SUMMARY_BYTES": (
+        "resource", "the finite component-local broker journal envelope; the backend remains incomplete "
+                    "until a compact authenticated artifact summary replaces inline settlement rows"),
+    "quarry_recon.network_broker:_MAX_EXECUTABLE_BYTES": (
+        "resource", "the broker-side tracee executable read budget, matched to the parent-authorized "
+                    "identity envelope before any body read"),
+    "quarry_recon.network_broker:_MAX_EXECUTABLE_HASH_SECONDS": (
+        "resource", "the finite per-identity hashing deadline checked with notification validity between "
+                    "bounded regular-file reads"),
+    "quarry_recon.network_broker:_MAX_SEND_BYTES": (
+        "resource", "the maximum tracee payload copied for one emulated send; oversize input is refused "
+                    "before the broker performs any network effect"),
+    "quarry_recon.network_broker:_MAX_IOVECTORS": (
+        "resource", "the allocation bound for one emulated sendmsg vector table; overflow is rejected "
+                    "before copying payloads or contacting a peer"),
+    "quarry_recon.network_broker:_MAX_CONTROL_BYTES": (
+        "resource", "the parser bound used when rejecting ancillary sendmsg data; no accepted control "
+                    "payload is truncated or forwarded"),
+    "quarry_recon.network_broker:_MAX_RIGHTS_FDS": (
+        "resource", "the kernel-compatible per-message SCM_RIGHTS descriptor allocation bound; overflow "
+                    "is rejected before any local IPC effect"),
+    "quarry_recon.network_broker:_MAX_INHERITED_FDS": (
+        "resource", "the bounded pre-exec procfs descriptor inventory; overflow refuses the launcher "
+                    "rather than leaving an inherited connected socket unaudited"),
+    "quarry_recon.network_broker:_MAX_REAPED_DESCENDANTS": (
+        "resource", "the bounded adopted-child settlement journal; overflow refuses completion rather "
+                    "than losing daemon cleanup or exit-status evidence"),
+    "quarry_recon.network_broker:_MAX_CONTROL_GRANTS": (
+        "resource", "the bounded one-shot browser-control accept grant set; capacity exhaustion refuses "
+                    "the connector before the accepted descriptor can reach Chromium"),
+    "quarry_recon.network_broker:_MAX_NOTIFICATION_WORKERS": (
+        "resource", "the finite per-invocation notification concurrency envelope; excess syscalls are "
+                    "refused rather than starving accept/connect authority or allocating threads"),
+    "quarry_recon.network_cdp:_MAX_CDP_HTTP_BYTES": (
+        "resource", "the strict worker-owned DevTools HTTP upgrade header allocation bound; oversize "
+                    "input is refused before a WebSocket session is established"),
+    "quarry_recon.network_cdp:_MAX_CDP_MESSAGE_BYTES": (
+        "resource", "the per-message WebSocket and Chromium-pipe parser bound; oversized CDP messages "
+                    "fail the request-owned bridge without truncation"),
+    "quarry_recon.network_cdp:_MAX_CDP_BUFFER_BYTES": (
+        "resource", "the per-direction DevTools relay backpressure bound; overflow cancels the bridge "
+                    "rather than accumulating unbounded controller or browser data"),
+    "quarry_recon.network_cdp:_MAX_CDP_RECORDS": (
+        "resource", "the bounded request-owned DevTools control journal; overflow marks the bridge "
+                    "incomplete and synchronously cancels further control effects"),
+    "quarry_recon.network_cdp:_MAX_CDP_RECORD_BYTES": (
+        "resource", "the canonical allocation bound for one DevTools control record; oversize evidence "
+                    "fails instead of being truncated"),
+    "quarry_recon.network_cdp:_MAX_CDP_SUMMARY_BYTES": (
+        "resource", "the finite component-local DevTools journal envelope pending authenticated streamed "
+                    "artifact persistence before backend completion"),
+    "quarry_recon.network_cdp:_MAX_CDP_FOREIGN_CLIENTS": (
+        "resource", "the hostile unauthenticated DevTools accept-drain bound; exhaustion cancels the "
+                    "bridge before a foreign client reaches Chromium"),
+    "quarry_recon.network_cdp:_MAX_CDP_METHODS": (
+        "resource", "the bounded distinct CDP method inventory returned with boundary evidence; excess "
+                    "method diversity fails the bridge instead of losing certificate-policy truth"),
+    "quarry_recon.network_dns:_MAX_DNS_MESSAGE_BYTES": (
+        "resource", "the strict UDP/TCP DNS response allocation bound for the pinned browser proxy; "
+                    "oversize replies are refused before address admission"),
+    "quarry_recon.network_dns:_MAX_DNS_POINTERS": (
+        "resource", "the DNS compression-pointer traversal bound; cycles or excess indirection refuse "
+                    "the response rather than yielding a partial hostname"),
+    "quarry_recon.network_dns:_MAX_DNS_RECORDS": (
+        "resource", "the finite answer/authority/additional record parser bound for one explicit DNS "
+                    "response; overflow refuses the request"),
+    "quarry_recon.network_dns:_MAX_DNS_CNAME_DEPTH": (
+        "resource", "the explicit per-request CNAME follow bound; exhaustion is indeterminate and no "
+                    "upstream connection is attempted"),
+    "quarry_recon.network_proxy:_MAX_PROXY_HEADER_BYTES": (
+        "resource", "the private browser proxy's per-request header allocation bound; oversized input "
+                    "is refused before DNS or upstream contact"),
+    "quarry_recon.network_proxy:_MAX_PROXY_LINE_BYTES": (
+        "resource", "the strict HTTP request/header line parser bound; an oversized line is refused "
+                    "before authority classification"),
+    "quarry_recon.network_proxy:_MAX_PROXY_AUTHORITY_BYTES": (
+        "resource", "the bounded CONNECT/Host authority parser input; overflow is refused before DNS"),
+    "quarry_recon.network_proxy:_MAX_PROXY_REQUEST_BODY_BYTES": (
+        "resource", "the maximum browser request body streamed by one proxy request; larger requests "
+                    "are refused without buffering or contacting an upstream"),
+    "quarry_recon.network_proxy:_MAX_PROXY_CONNECTIONS": (
+        "resource", "the finite invocation-local proxy connection/thread capacity; excess accepts are "
+                    "closed and truthfully recorded rather than queued without limit"),
+    "quarry_recon.network_proxy:_MAX_PROXY_RECORDS": (
+        "resource", "the bounded proxy/DNS/peer decision journal; overflow marks settlement incomplete"),
+    "quarry_recon.network_proxy:_MAX_PROXY_RECORD_BYTES": (
+        "resource", "the canonical byte bound for one proxy decision; oversize evidence fails the "
+                    "session rather than being truncated"),
+    "quarry_recon.network_proxy:_MAX_PROXY_SUMMARY_BYTES": (
+        "resource", "the finite component-local proxy/DNS journal envelope pending authenticated streamed "
+                    "artifact persistence before backend completion"),
+    "quarry_recon.network_proxy:_MAX_PROXY_BUFFER_BYTES": (
+        "resource", "the per-direction streaming relay buffer bound; backpressure replaces unbounded "
+                    "request or response accumulation"),
+    "quarry_recon.network_trace:NETWORK_TRACE_MAX_ROWS": (
+        "resource", "the exact invocation-owned network decision row envelope; the next plan is refused "
+                    "before an effect instead of producing an unauthenticated journal prefix"),
+    "quarry_recon.network_trace:NETWORK_TRACE_MAX_BYTES": (
+        "resource", "the preallocated logical byte envelope for one invocation-owned network trace; "
+                    "capacity is durably reserved before tool effects begin"),
+    "quarry_recon.network_trace:NETWORK_TRACE_MAX_ROW_BYTES": (
+        "resource", "the canonical framing bound for one network trace row; oversize truth is refused "
+                    "before its corresponding network effect"),
+    "quarry_recon.network_trace:NETWORK_TRACE_MAX_JSON_DEPTH": (
+        "parser", "the recursion-safety grammar for one canonical network trace row or compact settlement"),
+    "quarry_recon.network_trace:NETWORK_TRACE_MAX_INTEGER_MAGNITUDE": (
+        "parser", "the portable exact-integer domain of the canonical network trace schema"),
+    "quarry_recon.network_trace:NETWORK_TRACE_MAX_SETTLEMENT_BYTES": (
+        "resource", "the compact terminal network-trace identity envelope embedded in the existing durable "
+                    "settlement record; full decision rows remain in the authenticated artifact"),
+    "quarry_recon.network_trace:NETWORK_TRACE_MAX_COMPONENTS": (
+        "resource", "the finite typed component inventory sharing one invocation trace; unknown or excess "
+                    "component identities are refused rather than merged"),
+    "quarry_recon.network_trace:NETWORK_TRACE_MAX_RESERVED_ROWS": (
+        "resource", "the maximum durable future-row reservation attached to one pre-effect plan; excess "
+                    "work is refused before contact"),
+    "quarry_recon.network_trace:NETWORK_TRACE_MAX_RELPATH_BYTES": (
+        "identity", "the bounded descriptor-relative identity of the private invocation trace artifact"),
+    "quarry_recon.network_trace:NETWORK_TRACE_READ_CHUNK_BYTES": (
+        "resource", "the bounded replay-validation read allocation; it does not truncate the authenticated "
+                    "artifact byte envelope"),
+    "quarry_recon.network_trace:NETWORK_TRACE_MIN_ALLOCATION_GRANULARITY": (
+        "identity", "the minimum trusted filesystem allocation-unit identity accepted before aligned "
+                    "network-trace tail deallocation"),
+    "quarry_recon.network_trace:NETWORK_TRACE_MAX_ALLOCATION_GRANULARITY": (
+        "resource", "the maximum trusted filesystem allocation unit used to bound aligned preallocation-tail "
+                    "retention and deallocation"),
 
     # acquisition + corpus envelopes — structural truthfulness/safety ceilings, not per-run volume knobs.
     # Overflow is refused with a durable remainder, never dropped; `--unbound` uses work a run already has.

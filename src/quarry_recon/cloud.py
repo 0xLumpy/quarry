@@ -9,9 +9,8 @@ from __future__ import annotations
 import re
 import socket
 import urllib.error
-import urllib.request
 
-from . import events, policy
+from . import events, fetch, policy
 
 # common bucket-name patterns around a seed (apex label / org / brand).
 _SUFFIXES = ["", "-backup", "-backups", "-dev", "-staging", "-prod", "-assets", "-static",
@@ -45,20 +44,23 @@ def _all_candidates(profile) -> list:
     return sorted(out)
 
 
-def _check(url: str, timeout: int = 8):
+def _check(ctx, url: str, timeout: int = 8):
     """Return (exists, access) from a status-only GET (body never read): exists True (200 public /
     403 private), False (404 absent), or None when indeterminate (transport error or non-definitive
     HTTP code). An indeterminate probe is never recorded as a confirmed absence."""
     try:
-        req = urllib.request.Request(url, method="GET", headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return True, ("public" if getattr(r, "status", 200) == 200 else "unknown")
-    except urllib.error.HTTPError as e:                      # a definitive HTTP response from the endpoint
-        if e.code == 403:
+        _location, status = fetch.redirect_location(
+            ctx, url, timeout=timeout, source_id="horizontal.cloud_buckets",
+        )
+        if status == 403:
             return True, "private"
-        if e.code == 404:
+        if status == 404:
             return False, None                              # NoSuchBucket — definitively absent
-        return None, None                                   # other 4xx/5xx — indeterminate, not "absent"
+        if status == 200:
+            return True, "public"
+        if status:
+            return None, None                               # other HTTP status is indeterminate
+        return None, None
     except (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError, OSError):
         return None, None                                   # transport error — indeterminate, not absent
 
@@ -94,7 +96,7 @@ def _enumerate(ctx) -> set:
     for n in names:
         for prov, urlf in _PROVIDERS:
             url = urlf(n)
-            exists, access = _check(url)
+            exists, access = _check(ctx, url)
             if exists is None:                              # couldn't determine — count it, never a silent absence
                 indeterminate += 1
                 continue

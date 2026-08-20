@@ -361,7 +361,9 @@ def _js_download(ctx):
                 break                                   # checked between items, never mid-write
             attempted += 1
             try:
-                data, _final, status = fetch.scoped_get(ctx, u, max_body=MAX_JS)
+                data, _final, status = fetch.scoped_get(
+                    ctx, u, max_body=MAX_JS, source_id="crawl.js_fetch",
+                )
                 if data is None:
                     fail["not_contacted"] = fail.get("not_contacted", 0) + 1
                     continue                            # off-scope redirect / scan-box guard
@@ -1422,7 +1424,10 @@ def _sourcemap_recover_build(ctx, js_ledger, builder, obtained_js):
                 m_att += 1
                 try:
                     # shared choke point: rate pace + bounded read + off-scope-redirect guard.
-                    data, _final, status = fetch.scoped_get(ctx, m, max_body=MAX_MAP)
+                    data, _final, status = fetch.scoped_get(
+                        ctx, m, max_body=MAX_MAP,
+                        source_id="crawl.sourcemaps",
+                    )
                     if data is None:
                         m_fail["not_contacted"] = m_fail.get("not_contacted", 0) + 1
                         continue
@@ -1597,7 +1602,7 @@ def run(ctx) -> None:
         kat = ctx.run.raw_path("crawl", "katana", "katana.txt")
         # katana is network-bound, so crawl concurrency (-c) and parallel-host count (-p) come from
         # settings. The headless SPA pass below stays low: it spawns chromium.
-        cmd = ["katana", "-list", str(targets), "-jc", "-d", "2", "-kf", "all",
+        cmd = ["katana", "-duc", "-list", str(targets), "-jc", "-d", "2", "-kf", "all",
                "-c", str(settings.workers("katana", 10)),
                "-p", str(settings.concurrency("KATANA_PARALLELISM", 10)),
                "-timeout", "15", "-silent",
@@ -1645,7 +1650,7 @@ def run(ctx) -> None:
                 kh_wu = events.work_unit("crawl.katana_headless", inputs={"spa_hosts": spa},
                                          config={"depth": 2, "headless": True, "jc": True})
                 r = run_contract("crawl.katana_headless",
-                              ["katana", "-list", str(spa_f), "-headless",
+                              ["katana", "-duc", "-list", str(spa_f), "-headless",
                                          "-system-chrome", "-jc", "-d", "2", "-c", "2", "-p", "1",
                                          "-timeout", "20", "-silent"] +
                                         _katana_scope_flags(scope) +   # the same OOS exclusion on the headless pass

@@ -14,6 +14,7 @@ from . import __version__, events, secrets
 from .config import ProfileError, TargetProfile
 from .campaign import MAX_CHILDREN as _MAX_CHILDREN
 from .exit_contract import ContractGroup as _ContractGroup, json_option as _ec_json_option
+from .oos_regex import OOSRegexError, compile_oos
 from .registry import health, install_one, load_tools, tool_phases, tools_by_phase, verify_installed
 
 
@@ -65,19 +66,20 @@ _OOS_REGEX_META = re.compile(r"[\^$\\+?\[\](){}|]")
 
 
 def _to_oos_pattern(value: str) -> str:
-    """An OOS CLI argument as a validated regex string: a bare label -> subdomain prefix, a bare FQDN ->
-    anchored exact, `*.x` -> subdomain glob, an explicit regex kept as-is. Raises re.error on an invalid
-    result.
+    """Translate an OOS argument into the shared bounded hostname grammar.
+
+    Bare labels/FQDNs and ``*.x`` globs are conveniences.  An explicitly
+    patterned value is retained only when the profile/broker matcher accepts
+    the same anchors, literals, character classes, and single repetition.
     """
     if _OOS_REGEX_META.search(value):
-        re.compile(value)                                      # validate explicit regex
-        return value
-    if "." not in value:                                       # bare label -> subdomain-prefix
+        pat = value
+    elif "." not in value:                                    # bare label -> subdomain-prefix
         # a bare label matches any host under that label (^jobs\.)
         pat = "^" + re.escape(value) + r"\."
     else:
         pat = "^" + re.escape(value).replace(r"\*", ".*") + "$"    # FQDN / glob -> anchored regex
-    re.compile(pat)
+    compile_oos(pat)
     return pat
 
 
@@ -741,9 +743,12 @@ def init(name, out, projects_dir):
               help="project name, project dir, or target.yaml path")
 @click.argument("hosts", nargs=-1, required=True)
 def oos(profile_path, hosts):
-    """Add out-of-scope patterns to a project's target.yaml. A bare host becomes an anchored regex, `*.x` a
-    subdomain glob, a real regex is kept verbatim; the resulting profile must compile before anything is
-    written.
+    """Add out-of-scope patterns to a project's target.yaml.
+
+    A bare host becomes an anchored pattern and ``*.x`` a subdomain glob.
+    Explicit patterns must use the bounded hostname grammar documented in the
+    target reference; groups, alternation, lookaround, backreferences, and
+    nested/count repetitions are refused before anything is written.
     """
     import yaml
     path = Path(_resolve_profile(profile_path))
@@ -758,7 +763,7 @@ def oos(profile_path, hosts):
     for h in hosts:
         try:
             patterns.append(_to_oos_pattern(h))
-        except re.error as e:
+        except OOSRegexError as e:
             raise click.ClickException(f"invalid OOS pattern {h!r}: {e}")
 
     # structural dedup against the existing OOS list (not text/quote-style dependent)

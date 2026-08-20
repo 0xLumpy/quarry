@@ -10,12 +10,16 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import http.client
 import io
+import ipaddress
 import json
 import os
 import errno
 import re
 import secrets as _secrets
+import select
+import socket
 import stat
 import time
 import urllib.error
@@ -31,7 +35,11 @@ DEFAULT_MAX_BODY = 2 * 1024 * 1024      # 2 MB default cap
 DEFAULT_MAX_REDIRECTS = 5
 _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})   # actual navigations (304 is not a redirect)
 _SENSITIVE_HEADERS = ("authorization", "cookie", "proxy-authorization")
+_AUTHORITY_HEADERS = frozenset({
+    "host", ":authority", "proxy-authorization", "proxy-connection",
+})
 _HTTP_TOKEN_RE = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+\Z")
+_MAX_NATIVE_SEND_CHUNK = 64 * 1024
 
 
 def _preferred_fault(primary, faults):
@@ -65,6 +73,12 @@ def _response_lifetime(response, cleanup_state=None):
         primary = exc
     close_faults = []
     if response is not None:
+        transport = getattr(response, "_quarry_network_transport", None)
+        if transport is not None:
+            try:
+                transport.release()
+            except BaseException as exc:
+                close_faults.append(exc)
         try:
             response.close()
         except BaseException as exc:
@@ -83,12 +97,724 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirect)
-# Tolerates self-signed/broken TLS for CSP retrieval on internal/staging apexes. Used only by
-# scoped_headers(insecure=True); the verifying opener stays the default everywhere else.
+def _http_only_opener(http_handler, https_handler):
+    """Build an opener with no FTP/file/data handlers and no ambient proxy."""
+    opener = urllib.request.OpenerDirector()
+    for handler in (
+        urllib.request.ProxyHandler({}), urllib.request.UnknownHandler(),
+        http_handler, urllib.request.HTTPDefaultErrorHandler(),
+        _NoRedirect(), https_handler, urllib.request.HTTPErrorProcessor(),
+    ):
+        opener.add_handler(handler)
+    return opener
+
+
+_NO_REDIRECT_OPENER = _http_only_opener(
+    urllib.request.HTTPHandler(), urllib.request.HTTPSHandler(),
+)
 import ssl as _ssl  # noqa: E402
-_INSECURE_OPENER = urllib.request.build_opener(
-    _NoRedirect, urllib.request.HTTPSHandler(context=_ssl._create_unverified_context()))
+
+
+class _PinnedTransport:
+    """Literal-address connector retaining the URL host for HTTP Host and TLS SNI."""
+
+    def __init__(self, approved, *, peer_authority=None, on_attempt=None,
+                 effect_fence=None):
+        self.approved = tuple(approved)
+        self.peer_authority = peer_authority
+        self.on_attempt = on_attempt
+        self.effect_fence = effect_fence
+        self.selected_peer = None
+        self._connections = set()
+
+    def _track(self, connection):
+        if self.effect_fence is not None:
+            self.effect_fence.track_socket(connection)
+        self._connections.add(connection)
+
+    def _untrack(self, connection):
+        self._connections.discard(connection)
+        if self.effect_fence is not None:
+            self.effect_fence.untrack_socket(connection)
+
+    def _close_tracked(self, connection):
+        if self.effect_fence is None:
+            try:
+                connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                connection.close()
+            except OSError:
+                pass
+        else:
+            self.effect_fence.close_tracked_socket(connection)
+        self._connections.discard(connection)
+
+    def _replace_tracked(self, old, new):
+        if self.effect_fence is not None:
+            try:
+                self.effect_fence.replace_tracked_socket(old, new)
+            except BaseException:
+                # The fence may have been signalled after wrap_socket detached
+                # ``old`` but before this transfer.  Its replacement helper
+                # closes ``new`` in that case; do not retain either dead Python
+                # object as transport state.
+                self._connections.discard(old)
+                self._connections.discard(new)
+                raise
+        elif old not in self._connections:
+            try:
+                new.close()
+            except OSError:
+                pass
+            raise RuntimeError("native TLS socket transfer lacked authority")
+        self._connections.discard(old)
+        self._connections.add(new)
+
+    def release(self):
+        for connection in tuple(self._connections):
+            self._close_tracked(connection)
+
+    def create_connection(self, address, timeout=socket._GLOBAL_DEFAULT_TIMEOUT,
+                          source_address=None, *args, **kwargs):
+        _host, port = address
+        last = None
+        for value in self.approved:
+            connection = None
+            planned = False
+            settled = False
+            try:
+                if self.on_attempt is not None:
+                    self.on_attempt(
+                        "planned", value,
+                        "literal TCP peer admitted before connect",
+                    )
+                    planned = True
+                if self.peer_authority is not None:
+                    decision = self.peer_authority(
+                        value, int(port), socket.SOCK_STREAM, socket.IPPROTO_TCP,
+                    )
+                    if not decision.allowed:
+                        raise RuntimeError("literal peer lost network authority")
+                # `value` is already a canonical literal.  No name reaches this
+                # call, so there is no second resolver decision to rebind.
+                address = ipaddress.ip_address(value)
+                family = socket.AF_INET if address.version == 4 else socket.AF_INET6
+                connection = socket.socket(
+                    family, socket.SOCK_STREAM, socket.IPPROTO_TCP,
+                )
+                self._track(connection)
+                timeout_value = (
+                    socket.getdefaulttimeout()
+                    if timeout is socket._GLOBAL_DEFAULT_TIMEOUT else timeout
+                )
+                if timeout_value is None:
+                    timeout_value = 60.0
+                if (type(timeout_value) not in {int, float}
+                        or not 0 < timeout_value <= 60):
+                    raise ValueError("native TCP timeout is outside its bound")
+                deadline = time.monotonic() + float(timeout_value)
+                connection.setblocking(False)
+                if source_address is not None:
+                    if self.effect_fence is None:
+                        connection.bind(source_address)
+                    else:
+                        with self.effect_fence:
+                            connection.bind(source_address)
+                endpoint = ((value, port) if family == socket.AF_INET
+                            else (value, port, 0, 0))
+                if self.effect_fence is None:
+                    error = connection.connect_ex(endpoint)
+                else:
+                    with self.effect_fence:
+                        error = connection.connect_ex(endpoint)
+                if error not in {
+                        0, errno.EISCONN, errno.EINPROGRESS,
+                        errno.EALREADY, errno.EWOULDBLOCK,
+                    }:
+                    raise OSError(error, "literal peer connect failed")
+                while error not in {0, errno.EISCONN}:
+                    if ((self.effect_fence is not None
+                         and self.effect_fence.is_set())
+                            or time.monotonic() >= deadline):
+                        raise TimeoutError("literal peer connect deadline expired")
+                    _readable, writable, exceptional = select.select(
+                        (), (connection,), (connection,),
+                        min(0.05, deadline - time.monotonic()),
+                    )
+                    if not writable and not exceptional:
+                        continue
+                    error = connection.getsockopt(
+                        socket.SOL_SOCKET, socket.SO_ERROR,
+                    )
+                    if error:
+                        raise OSError(error, "literal peer connect failed")
+                peer = netguard.canonical_ip_set((connection.getpeername()[0],))
+                if len(peer) != 1 or peer[0] not in self.approved:
+                    raise OSError("connected peer was not in the approved address set")
+                if self.peer_authority is not None:
+                    decision = self.peer_authority(
+                        peer[0], int(port), socket.SOCK_STREAM, socket.IPPROTO_TCP,
+                    )
+                    if not decision.allowed:
+                        raise RuntimeError("connected peer lost network authority")
+                if self.on_attempt is not None:
+                    settled = True
+                    self.on_attempt(
+                        "settled", peer[0],
+                        "literal TCP peer connected and post-authorized",
+                    )
+                else:
+                    settled = True
+                self.selected_peer = peer[0]
+                connection.settimeout(float(timeout_value))
+                return connection
+            except BaseException as exc:
+                last = exc
+                settlement_fault = None
+                if self.on_attempt is not None and planned and not settled:
+                    try:
+                        self.on_attempt(
+                            "settled", value,
+                            "literal TCP peer connection did not settle",
+                        )
+                    except BaseException as fault:
+                        settlement_fault = fault
+                if connection is not None:
+                    self._close_tracked(connection)
+                if settlement_fault is not None:
+                    if self.effect_fence is not None:
+                        self.effect_fence.cancel()
+                    if not isinstance(exc, Exception):
+                        raise exc
+                    raise settlement_fault from exc
+                if not isinstance(exc, OSError):
+                    if self.effect_fence is not None:
+                        self.effect_fence.cancel()
+                    raise
+        raise OSError("no approved destination peer could be connected") from last
+
+    def wrap_tls(self, connection, context, *, server_hostname):
+        """Wrap a pinned peer while retaining cancellation over the live fd."""
+        if connection not in self._connections:
+            raise RuntimeError("native TLS socket lacked transport authority")
+        timeout_value = connection.gettimeout()
+        if timeout_value is None:
+            timeout_value = 60.0
+        if (type(timeout_value) not in {int, float}
+                or not 0 < timeout_value <= 60):
+            raise ValueError("native TLS timeout is outside its bound")
+        deadline = time.monotonic() + float(timeout_value)
+        wrapped = None
+        try:
+            # ``wrap_socket`` detaches ``connection`` even with handshake
+            # disabled.  Hold the shared effect fence until the live SSLSocket
+            # has replaced that detached shell in its tracked set.
+            if self.effect_fence is None:
+                wrapped = context.wrap_socket(
+                    connection, server_hostname=server_hostname,
+                    do_handshake_on_connect=False,
+                )
+                self._replace_tracked(connection, wrapped)
+            else:
+                with self.effect_fence:
+                    wrapped = context.wrap_socket(
+                        connection, server_hostname=server_hostname,
+                        do_handshake_on_connect=False,
+                    )
+                    self._replace_tracked(connection, wrapped)
+            wrapped.setblocking(False)
+            while True:
+                if ((self.effect_fence is not None
+                     and self.effect_fence.is_set())
+                        or time.monotonic() >= deadline):
+                    raise TimeoutError("native TLS handshake deadline expired")
+                want_read = want_write = False
+                try:
+                    if self.effect_fence is None:
+                        wrapped.do_handshake()
+                    else:
+                        with self.effect_fence:
+                            wrapped.do_handshake()
+                    break
+                except _ssl.SSLWantReadError:
+                    want_read = True
+                except _ssl.SSLWantWriteError:
+                    want_write = True
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("native TLS handshake deadline expired")
+                readable, writable, exceptional = select.select(
+                    (wrapped,) if want_read else (),
+                    (wrapped,) if want_write else (),
+                    (wrapped,), min(0.05, remaining),
+                )
+                if exceptional:
+                    raise OSError("native TLS handshake socket failed")
+                if not readable and not writable:
+                    continue
+            if self.effect_fence is None:
+                wrapped.settimeout(float(timeout_value))
+            else:
+                with self.effect_fence:
+                    wrapped.settimeout(float(timeout_value))
+            return wrapped
+        except BaseException:
+            target = wrapped if wrapped is not None else connection
+            self._close_tracked(target)
+            raise
+
+    def send_all(self, connection, body) -> None:
+        """Send request bytes as bounded nonblocking effects under the fence.
+
+        ``http.client`` normally calls blocking ``socket.sendall`` for request
+        headers and bodies.  Closing that socket from another thread does not
+        prove the blocked OFD write has returned.  Small nonblocking writes
+        make each peer-visible effect a short fence epoch, while cancellation
+        wakes the select loop and prevents any later epoch from entering.
+        """
+        if self.effect_fence is None:
+            connection.sendall(body)
+            return
+        view = memoryview(body)
+        timeout_value = connection.gettimeout()
+        if timeout_value is None:
+            timeout_value = 60.0
+        if (type(timeout_value) not in {int, float}
+                or not 0 < timeout_value <= 60):
+            raise ValueError("native HTTP send timeout is outside its bound")
+        deadline = time.monotonic() + float(timeout_value)
+        primary = None
+        try:
+            with self.effect_fence:
+                connection.setblocking(False)
+            while view:
+                if self.effect_fence.is_set() or time.monotonic() >= deadline:
+                    raise TimeoutError("native HTTP send deadline expired")
+                want_read = False
+                try:
+                    with self.effect_fence:
+                        written = connection.send(
+                            view[:_MAX_NATIVE_SEND_CHUNK],
+                        )
+                except (_ssl.SSLWantWriteError, BlockingIOError):
+                    written = None
+                except _ssl.SSLWantReadError:
+                    written = None
+                    want_read = True
+                if written is not None:
+                    if written <= 0:
+                        raise OSError("native HTTP request send failed")
+                    view = view[written:]
+                    continue
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("native HTTP send deadline expired")
+                readable, writable, exceptional = select.select(
+                    (connection,) if want_read else (),
+                    () if want_read else (connection,),
+                    (connection,), min(0.05, remaining),
+                )
+                if exceptional:
+                    raise OSError("native HTTP request socket failed")
+                if not readable and not writable:
+                    continue
+        except BaseException as exc:
+            primary = exc
+        finally:
+            restore_fault = None
+            if not self.effect_fence.is_set():
+                try:
+                    with self.effect_fence:
+                        connection.settimeout(float(timeout_value))
+                except BaseException as exc:
+                    restore_fault = exc
+            if primary is not None:
+                raise primary
+            if restore_fault is not None:
+                raise restore_fault
+
+    def read_into(self, connection, reader, buffer, timeout_value) -> int:
+        """Perform one HTTP/TLS file read through short nonblocking epochs."""
+        if self.effect_fence is None:
+            return reader(buffer)
+        deadline = time.monotonic() + float(timeout_value)
+        while True:
+            if self.effect_fence.is_set() or time.monotonic() >= deadline:
+                raise TimeoutError("native HTTP response read deadline expired")
+            want_write = False
+            try:
+                with self.effect_fence:
+                    observed = reader(buffer)
+            except (_ssl.SSLWantReadError, BlockingIOError):
+                observed = None
+            except _ssl.SSLWantWriteError:
+                observed = None
+                want_write = True
+            if observed is not None:
+                return observed
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("native HTTP response read deadline expired")
+            readable, writable, exceptional = select.select(
+                () if want_write else (connection,),
+                (connection,) if want_write else (),
+                (connection,), min(0.05, remaining),
+            )
+            if exceptional:
+                raise OSError("native HTTP response socket failed")
+            if not readable and not writable:
+                continue
+
+
+def _pinned_opener(approved, *, insecure=False, peer_authority=None,
+                   on_attempt=None, effect_fence=None):
+    if insecure is not False:
+        raise ValueError("native HTTPS certificate verification cannot be disabled")
+    transport = _PinnedTransport(
+        approved, peer_authority=peer_authority, on_attempt=on_attempt,
+        effect_fence=effect_fence,
+    )
+
+    class FencedRaw(io.RawIOBase):
+        def __init__(self, live, timeout_value):
+            super().__init__()
+            self.live = live
+            self.timeout_value = timeout_value
+
+        def readable(self):
+            return True
+
+        def fileno(self):
+            return self.live.fileno()
+
+        def readinto(self, buffer):
+            self._checkClosed()
+            return transport.read_into(
+                self.live, self.live.recv_into, buffer, self.timeout_value,
+            )
+
+        def close(self):
+            if not self.closed:
+                # The response buffer is not a second socket owner.  The
+                # tracked transport shuts down and closes ``live`` before the
+                # public response lifetime closes this local buffer.
+                super().close()
+
+    class FencedSocket:
+        """Adapter for every stdlib request/response socket I/O path."""
+
+        def __init__(self, live):
+            self.live = live
+
+        def sendall(self, body):
+            transport.send_all(self.live, body)
+
+        def makefile(self, mode="r", buffering=None, *args, **kwargs):
+            if mode != "rb" or args or kwargs:
+                raise ValueError("native HTTP response file mode is unsupported")
+            timeout_value = self.live.gettimeout()
+            if timeout_value is None:
+                timeout_value = 60.0
+            if (type(timeout_value) not in {int, float}
+                    or not 0 < timeout_value <= 60):
+                raise ValueError("native HTTP response timeout is outside its bound")
+            if transport.effect_fence is not None:
+                with transport.effect_fence:
+                    self.live.setblocking(False)
+            return io.BufferedReader(
+                FencedRaw(self.live, float(timeout_value)),
+                buffer_size=(io.DEFAULT_BUFFER_SIZE if buffering in {None, -1}
+                             else buffering),
+            )
+
+        def close(self):
+            # ``HTTPConnection.getresponse`` closes its connection reference
+            # before returning a Connection: close response.  The response
+            # reader and transport now own the live socket; closing it here
+            # would truncate the body or untrack TLS read-side protocol writes.
+            return None
+
+        def __getattr__(self, name):
+            return getattr(self.live, name)
+
+    class PinnedSendMixin:
+        def send(self, data):
+            if self.sock is None:
+                if self.auto_open:
+                    self.connect()
+                else:
+                    raise http.client.NotConnected()
+            live = self.sock
+            adapter = FencedSocket(live)
+            self.sock = adapter
+            try:
+                return super().send(data)
+            finally:
+                if self.sock is adapter:
+                    self.sock = live
+
+        def getresponse(self):
+            if self.sock is None:
+                raise http.client.ResponseNotReady("Idle")
+            live = self.sock
+            adapter = FencedSocket(live)
+            self.sock = adapter
+            # Keep the adapter installed: urllib's ``do_open`` explicitly
+            # calls ``h.sock.close()`` after getresponse.  That close must use
+            # the same fenced shutdown path rather than bypassing transport
+            # ownership on the live socket.
+            return super().getresponse()
+
+    class PinnedHTTPConnection(PinnedSendMixin, http.client.HTTPConnection):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self._create_connection = transport.create_connection
+
+    class PinnedHTTPSConnection(PinnedSendMixin, http.client.HTTPSConnection):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self._create_connection = transport.create_connection
+
+        def connect(self):
+            # Ambient HTTP CONNECT is not part of this transport; urllib's
+            # ProxyHandler is empty, so observing a tunnel request is a caller
+            # or stdlib authority mismatch and must fail before TCP contact.
+            if self._tunnel_host is not None:
+                raise OSError("native HTTPS tunnel authority is unavailable")
+            http.client.HTTPConnection.connect(self)
+            raw = self.sock
+            try:
+                self.sock = transport.wrap_tls(
+                    raw, self._context, server_hostname=self.host,
+                )
+            except BaseException:
+                self.sock = None
+                raise
+
+    context = _ssl.create_default_context()
+    class PinnedHTTPHandler(urllib.request.HTTPHandler):
+        def http_open(self, req):
+            return self.do_open(PinnedHTTPConnection, req)
+
+    class PinnedHTTPSHandler(urllib.request.HTTPSHandler):
+        def https_open(self, req):
+            return self.do_open(
+                PinnedHTTPSConnection, req, context=context,
+                check_hostname=True,
+            )
+
+    opener = _http_only_opener(
+        PinnedHTTPHandler(), PinnedHTTPSHandler(),
+    )
+    return opener, transport
+
+
+def _network_scope(ctx):
+    from . import network_policy
+
+    return network_policy.scope_for(getattr(ctx, "run", None))
+
+
+def _explicit_contact(scope, host, *, source_id, block_private):
+    """Resolve through the scope's literal DNS authority, never ambient NSS."""
+    from . import network_dns
+    from .network_broker import BrokerPolicy
+
+    policy_request_id = _secrets.token_hex(16)
+    broker_policy = BrokerPolicy.from_json(json.dumps(
+        scope.broker_policy(
+            request_id=policy_request_id, source_id=source_id,
+            tool="native-dns", approved_peers=(),
+        ),
+        ensure_ascii=True, sort_keys=True, separators=(",", ":"),
+    ))
+    planned: dict[tuple[str, int], list[str]] = {}
+
+    def on_event(stage, peer, port, decision, reason):
+        key = (peer, port)
+        if stage == "dns-planned":
+            request_id = _secrets.token_hex(16)
+            scope.trace_native_planned(
+                request_id=request_id, source_id=source_id,
+                host=host, answers=(peer,), approved=(peer,), denied=(),
+            )
+            planned.setdefault(key, []).append(request_id)
+            return
+        if stage != "dns-settled" or not planned.get(key):
+            raise RuntimeError("native DNS settlement lacked its durable plan")
+        request_id = planned[key][0]
+        scope.trace_native_settled(
+            request_id=request_id, source_id=source_id, host=host,
+            decision=decision, reason=reason, selected_peer=peer,
+        )
+        planned[key].pop(0)
+        if not planned[key]:
+            del planned[key]
+
+    answers, state = network_dns.resolve(
+        broker_policy, host, timeout=5.0, on_event=on_event,
+        effect_fence=scope.effect_fence,
+    )
+    if planned:
+        raise RuntimeError("native DNS authority retained an unsettled effect")
+    if state != "ok":
+        return netguard.ContactState(
+            state, [], [], answers=answers, approved=(),
+        )
+    # ``stored_ips`` is the explicit wire result above, so contact_state takes
+    # its no-resolution branch and only performs address classification.
+    return netguard.contact_state(
+        host, stored_ips=answers, block_private=block_private,
+        own_ips=scope.own_ips, control_plane_cidrs=scope.control_plane_cidrs,
+    )
+
+
+def _contact(ctx, host, *, port, source_id="native-http"):
+    if type(port) is not int or isinstance(port, bool) or not 1 <= port <= 65535:
+        raise ValueError("native contact port is invalid")
+    scope = _network_scope(ctx)
+    if scope is not None:
+        decision, reason = scope.host_allowed(host, source_id=source_id)
+        if decision != "allow":
+            request_id = _secrets.token_hex(16)
+            scope.trace_native(
+                request_id=request_id, source_id=source_id, host=host,
+                answers=(), approved=(), denied=(), decision="deny",
+                reason=reason,
+            )
+            return netguard.ContactState(
+                "scope_refused", [], [], answers=(), approved=(),
+            )
+    block_private = netguard._block_private(ctx)
+    if scope is None:
+        # Compatibility is intentionally limited to the still-unwired backend.
+        # Production active work must bind a NetworkPolicyScope before this
+        # branch is removed/enforced at runner integration.
+        result = netguard.contact_state(host, block_private=block_private)
+    else:
+        result = _explicit_contact(
+            scope, host, source_id=source_id, block_private=block_private,
+        )
+    if scope is not None and result[0] == "contact":
+        denied = []
+        for peer in result.approved:
+            decision = scope.decide_peer(
+                peer, port, socket.SOCK_STREAM, socket.IPPROTO_TCP,
+                source_id=source_id,
+            )
+            if not decision.allowed:
+                denied.append(peer)
+        # Public-provider rebinding and mixed safe/private answers refuse as a
+        # unit; no answer from that resolution is attempted.
+        if denied:
+            result = netguard.ContactState(
+                "scope_refused", denied, result[2], answers=result.answers,
+                approved=(),
+            )
+    if scope is not None and result[0] != "contact":
+        request_id = _secrets.token_hex(16)
+        scope.trace_native(
+            request_id=request_id, source_id=source_id, host=host,
+            answers=getattr(result, "answers", ()), approved=(),
+            denied=result[1], decision="deny", reason=result[0],
+        )
+    return result
+
+
+def _open_contact(ctx, host, contact, req, timeout, *, insecure=False,
+                  source_id="native-http"):
+    """Persist admission, then open through one revalidated literal peer."""
+    _validated_request_authority(req, host)
+    if (type(contact) is not netguard.ContactState or contact[0] != "contact"
+            or not contact.approved):
+        raise PermissionError("native transport has no exact approved peer set")
+    approved = contact.approved
+    scope = _network_scope(ctx)
+    request_id = _secrets.token_hex(16)
+    attempt_ids = {}
+
+    def trace_attempt(stage, peer, reason):
+        if scope is None:
+            return
+        if stage == "planned":
+            attempt_id = _secrets.token_hex(16)
+            scope.trace_native_planned(
+                request_id=attempt_id, source_id=source_id, host=host,
+                answers=(peer,), approved=(peer,), denied=(),
+            )
+            attempt_ids[peer] = attempt_id
+            return
+        attempt_id = attempt_ids.pop(peer, None)
+        if attempt_id is None:
+            raise RuntimeError("native transport attempt settlement lacked a plan")
+        scope.trace_native_settled(
+            request_id=attempt_id, source_id=source_id, host=host,
+            decision=("allow" if "connected" in reason else "deny"),
+            reason=reason, selected_peer=peer,
+        )
+    opener, transport = _pinned_opener(
+        approved, insecure=insecure,
+        peer_authority=(
+            (lambda peer, port, socket_type, protocol: scope.decide_peer(
+                peer, port, socket_type, protocol, source_id=source_id,
+            )) if scope is not None else None
+        ),
+        on_attempt=trace_attempt,
+        effect_fence=(scope.effect_fence if scope is not None else None),
+    )
+    if scope is not None:
+        # Build every effect-free TLS/opener object first.  Once this durable
+        # plan exists, every later exit is paired by the settlement below.
+        scope.trace_native_planned(
+            request_id=request_id, source_id=source_id, host=host,
+            answers=contact.answers, approved=approved, denied=(),
+        )
+    response = None
+    try:
+        status, headers, response = _open_no_follow(req, timeout, opener)
+        if transport.selected_peer is None:
+            raise OSError("transport did not prove its selected peer")
+        if scope is not None:
+            scope.trace_native_settled(
+                request_id=request_id, source_id=source_id, host=host,
+                decision="allow", reason="literal peer connected and verified",
+                selected_peer=transport.selected_peer,
+            )
+        if response is not None:
+            try:
+                setattr(response, "_quarry_network_transport", transport)
+            except BaseException:
+                transport.release()
+                raise
+        else:
+            transport.release()
+        return status, headers, response
+    except BaseException as primary:
+        cleanup_faults = []
+        try:
+            transport.release()
+        except BaseException as exc:
+            cleanup_faults.append(exc)
+        if response is not None:
+            try:
+                response.close()
+            except BaseException as exc:
+                cleanup_faults.append(exc)
+        if scope is not None:
+            try:
+                scope.trace_native_settled(
+                    request_id=request_id, source_id=source_id, host=host,
+                    decision="deny", reason="literal peer connection did not settle",
+                    selected_peer=transport.selected_peer,
+                )
+            except BaseException as trace_fault:
+                scope.effect_fence.cancel()
+                if not isinstance(primary, Exception):
+                    raise primary
+                raise trace_fault from primary
+        raise _preferred_fault(primary, cleanup_faults)
 
 
 def _pace(ctx) -> None:
@@ -130,24 +856,63 @@ def _validate_opened_response(status, headers, response) -> None:
         raise TypeError("non-redirect HTTP response has no readable body object")
 
 
+def _validated_http_url(url: str):
+    """Return a strict absolute HTTP(S) split or refuse before any resolver/I/O."""
+    if type(url) is not str or not url or not url.isascii():
+        raise ValueError("request URL must be an absolute ASCII HTTP(S) URL")
+    if any(ord(char) <= 0x20 or ord(char) == 0x7F for char in url):
+        raise ValueError("request URL contains unsafe characters")
+    try:
+        parts = urlsplit(url)
+        host = parts.hostname
+        port = parts.port
+    except ValueError as exc:
+        raise ValueError("request URL is malformed") from exc
+    if (parts.scheme not in {"http", "https"} or not parts.netloc or not host
+            or parts.username is not None or parts.password is not None
+            or "@" in parts.netloc or "\\" in parts.netloc
+            or "%" in host or normalize.canon_host_strict(host) is None):
+        raise ValueError("request URL must be an absolute HTTP(S) URL without userinfo")
+    if port is not None and not 1 <= port <= 65535:
+        raise ValueError("request URL port is invalid")
+    return parts
+
+
+def _effective_http_port(parts) -> int:
+    """Return the exact TCP authority implied by one validated URL split."""
+    return parts.port or (443 if parts.scheme == "https" else 80)
+
+
+def _validated_request_authority(req, expected_host: str):
+    """Bind an exact urllib request to the host admitted by the resolver."""
+    if type(req) is not urllib.request.Request:
+        raise TypeError("native transport requires an exact urllib Request")
+    parts = _validated_http_url(req.full_url)
+    if (type(expected_host) is not str
+            or normalize.canon_host_strict(expected_host) != expected_host
+            or parts.hostname != expected_host
+            or req.type != parts.scheme
+            or req.host != parts.netloc
+            or req.has_proxy()):
+        raise PermissionError(
+            "native request authority does not match its approved host",
+        )
+    if any(
+        type(name) is not str or name.lower() in _AUTHORITY_HEADERS
+        for name, _value in tuple(req.header_items())
+    ):
+        raise PermissionError(
+            "native request headers cannot override transport authority",
+        )
+    return parts
+
+
 def _preflight_managed_request(
     url, origin_host, *, timeout, data, method, headers, max_redirects,
 ) -> dict[str, str] | None:
     """Reject malformed managed request inputs before allocating a lease."""
-    if type(url) is not str or not url:
-        raise ValueError("managed acquisition URL must be an absolute HTTP(S) URL")
-    if (any(ord(char) <= 0x20 or ord(char) == 0x7f for char in url)
-            or not url.isascii()):
-        raise ValueError("managed acquisition URL contains unsafe request characters")
-    try:
-        parts = urlsplit(url)
-        host = parts.hostname
-        parts.port
-    except ValueError as exc:
-        raise ValueError("managed acquisition URL is malformed") from exc
-    if (parts.scheme.lower() not in {"http", "https"}
-            or not parts.netloc or not host or "@" in parts.netloc):
-        raise ValueError("managed acquisition URL must be an absolute HTTP(S) URL")
+    parts = _validated_http_url(url)
+    host = parts.hostname
     if type(method) is not str or _HTTP_TOKEN_RE.fullmatch(method) is None:
         raise ValueError("managed acquisition method must be an HTTP token")
     if data is not None and type(data) is not bytes:
@@ -165,6 +930,10 @@ def _preflight_managed_request(
             if (type(name) is not str
                     or _HTTP_TOKEN_RE.fullmatch(name) is None):
                 raise TypeError("managed acquisition header names must be HTTP tokens")
+            if name.lower() in _AUTHORITY_HEADERS:
+                raise ValueError(
+                    "managed acquisition headers cannot override transport authority",
+                )
             if type(value) is not str:
                 raise TypeError("managed acquisition header values must be text")
             try:
@@ -183,7 +952,8 @@ def _preflight_managed_request(
             frozen_headers[name] = value
     if origin_host is not None:
         if (type(origin_host) is not str
-                or normalize.canon_host_strict(origin_host) is None):
+                or normalize.canon_host_strict(origin_host) is None
+                or origin_host != parts.hostname):
             raise ValueError("managed acquisition origin host is invalid")
     if (type(timeout) not in {int, float} or isinstance(timeout, bool)
             or not 0 <= timeout < float("inf")):
@@ -201,33 +971,45 @@ def _preflight_managed_request(
     return frozen_headers
 
 
-def redirect_location(ctx, url, origin_host=None, *, timeout=20):
+def redirect_location(ctx, url, origin_host=None, *, timeout=20,
+                      source_id="native-http"):
     """One scoped, rate-paced request to `url` without following redirects; returns
     (location_header|None, status). For open-redirect probing: read where the app would send us
     without fetching the attacker-controlled target. Resolve-guards the origin as well as the caller's
     name-based scope gate, since redirect/SSRF candidates come from the gf/archive corpus. Returns
     (None, 0) for an origin that resolves to the scan box / metadata (a private origin is contacted) or
     cannot be resolved."""
-    _h = urlsplit(url).hostname
-    _st, _deny, _intel = netguard.contact_state(_h, block_private=netguard._block_private(ctx))
+    _parts = _validated_http_url(url)
+    _h = _parts.hostname
+    _contact_result = _contact(
+        ctx, _h, port=_effective_http_port(_parts), source_id=source_id,
+    )
+    _st, _deny, _intel = _contact_result
     if _intel:
         netguard.record_internal(ctx, _h, _intel)          # record a private/self lead the lookup found
     if _st != "contact":
         return None, 0
     _pace(ctx)
     req = urllib.request.Request(url, headers={"User-Agent": UA}, method="GET")
-    status, rhdrs, resp = _open_no_follow(req, timeout)   # reuse the choke point: no fd leak
+    status, rhdrs, resp = _open_contact(
+        ctx, _h, _contact_result, req, timeout, source_id=source_id,
+    )
     try:
         return (rhdrs.get("Location") if rhdrs else None), status
     finally:
         if resp is not None:
-            resp.close()
+            transport = getattr(resp, "_quarry_network_transport", None)
+            try:
+                if transport is not None:
+                    transport.release()
+            finally:
+                resp.close()
 
 
 @contextlib.contextmanager
 def _walk(ctx, url, origin_host=None, *, timeout=20, data=None, method="GET", headers=None,
           max_redirects=DEFAULT_MAX_REDIRECTS, contact_attempt=None,
-          response_cleanup=None):
+          response_cleanup=None, source_id="native-http"):
     """Walk the redirect chain with every guard and yield the terminal hop as `(resp, final, status,
     contacted)`; the response is still open, so the caller decides how the body is consumed. Shared by
     both body policies (bounded read and stream-to-disk) so one copy of the guards serves both.
@@ -236,17 +1018,29 @@ def _walk(ctx, url, origin_host=None, *, timeout=20, data=None, method="GET", he
     metadata); status is 0, nothing to read. `contacted` True with `resp` None is an empty body — a
     redirect surfaced as an HTTPError (headers only) or the redirect limit was exhausted — never
     confused with off-scope."""
-    origin = origin_host or normalize.host_of_url(url)
+    initial_parts = _validated_http_url(url)
+    if origin_host is not None and origin_host != initial_parts.hostname:
+        raise ValueError("request origin host does not match its URL authority")
+    origin = initial_parts.hostname
     hdrs = {"User-Agent": UA}
     if headers:
+        if (not isinstance(headers, Mapping)
+                or any(type(name) is not str
+                       or name.lower() in _AUTHORITY_HEADERS
+                       for name in tuple(headers))):
+            raise ValueError("request headers cannot override transport authority")
         hdrs.update(headers)
     current = url
-    cur_parts = urlsplit(url)
+    cur_parts = initial_parts
     status = 0
     for _hop in range(max_redirects + 1):
         # self-attack guard on the origin and every redirect target: never contact the scan box /
         # metadata; record a private/self lead (private space is contacted unless block_private_targets).
-        _st, _deny, _intel = netguard.contact_state(cur_parts.hostname, block_private=netguard._block_private(ctx))
+        _contact_result = _contact(
+            ctx, cur_parts.hostname, port=_effective_http_port(cur_parts),
+            source_id=source_id,
+        )
+        _st, _deny, _intel = _contact_result
         if _intel:
             netguard.record_internal(ctx, cur_parts.hostname, _intel)
         if _st != "contact":
@@ -256,7 +1050,10 @@ def _walk(ctx, url, origin_host=None, *, timeout=20, data=None, method="GET", he
         req = urllib.request.Request(current, data=data, method=method, headers=hdrs)
         if contact_attempt is not None:
             contact_attempt()
-        status, rhdrs, resp = _open_no_follow(req, timeout)
+        status, rhdrs, resp = _open_contact(
+            ctx, cur_parts.hostname, _contact_result, req, timeout,
+            source_id=source_id,
+        )
         with _response_lifetime(resp, response_cleanup):
             _validate_opened_response(status, rhdrs, resp)
             if status in _REDIRECT_STATUSES:
@@ -265,11 +1062,11 @@ def _walk(ctx, url, origin_host=None, *, timeout=20, data=None, method="GET", he
                     yield resp, current, status, True
                     return
                 nxt = urljoin(current, loc)
+                nxt_parts = _validated_http_url(nxt)
                 nhost = normalize.host_of_url(nxt)
                 if nhost != origin and not ctx.scope.active_allowed(nhost):
                     yield None, nxt, status, False       # would leave scope -> don't contact the target
                     return
-                nxt_parts = urlsplit(nxt)
                 if (nxt_parts.hostname, nxt_parts.port, nxt_parts.scheme) != \
                    (cur_parts.hostname, cur_parts.port, cur_parts.scheme):
                     hdrs = {k: v for k, v in hdrs.items() if k.lower() not in _SENSITIVE_HEADERS}
@@ -282,7 +1079,8 @@ def _walk(ctx, url, origin_host=None, *, timeout=20, data=None, method="GET", he
 
 
 def scoped_get(ctx, url, origin_host=None, *, max_body=DEFAULT_MAX_BODY, timeout=20,
-               data=None, method="GET", headers=None, max_redirects=DEFAULT_MAX_REDIRECTS):
+               data=None, method="GET", headers=None, max_redirects=DEFAULT_MAX_REDIRECTS,
+               source_id="native-http"):
     """Fetch `url` with all guards. Returns (data|None, final_url, status):
       - data is None  => the hop was not contacted: a redirect would leave scope, or the host resolves
         to the scan box / metadata (a private answer is contacted + recorded). No body is read.
@@ -294,7 +1092,7 @@ def scoped_get(ctx, url, origin_host=None, *, max_body=DEFAULT_MAX_BODY, timeout
     Reads into memory, so it is the wrong tool when the body is evidence to keep: an over-cap response
     comes back as `max_body+1` bytes to drop, losing what was fetched. Use `scoped_get_file` instead."""
     with _walk(ctx, url, origin_host, timeout=timeout, data=data, method=method, headers=headers,
-               max_redirects=max_redirects) as (resp, final, status, contacted):
+               max_redirects=max_redirects, source_id=source_id) as (resp, final, status, contacted):
         if not contacted:
             return None, final, status
         return (resp.read(max_body + 1) if resp else b""), final, status
@@ -875,7 +1673,8 @@ def _receipt_bytes(doc) -> bytes:
 
 def _scoped_get_file_legacy(ctx, url, dest, origin_host=None, *, timeout=20, data=None, method="GET",
                             headers=None, max_redirects=DEFAULT_MAX_REDIRECTS,
-                            chunk=1024 * 1024, deadline_s=300.0, policy=None, governor=None):
+                            chunk=1024 * 1024, deadline_s=300.0, policy=None, governor=None,
+                            source_id="native-http"):
     """Same guards as `scoped_get`, but the body is streamed to `dest` under `governor`'s disk policy.
 
     Returns `(Acquisition|None, final_url, status)`; None means the hop was never contacted, as in
@@ -918,7 +1717,7 @@ def _scoped_get_file_legacy(ctx, url, dest, origin_host=None, *, timeout=20, dat
                             error=f"acquisition budget exhausted at the {denied} policy; NOT contacted",
                             final=url, status=0), url, 0)
     with _walk(ctx, url, origin_host, timeout=timeout, data=data, method=method, headers=headers,
-               max_redirects=max_redirects) as (resp, final, status, contacted):
+               max_redirects=max_redirects, source_id=source_id) as (resp, final, status, contacted):
         if not contacted:
             return None, final, status
         if resp is None:                       # redirect loop / headers-only 3xx: an empty body, published
@@ -1038,7 +1837,7 @@ def _publication_fault_text(fault) -> str:
 
 def _scoped_get_file_managed(
     ctx, run, components, url, dest, origin_host, *, timeout, data, method,
-    headers, max_redirects, chunk, deadline_s, policy, governor,
+    headers, max_redirects, chunk, deadline_s, policy, governor, source_id,
 ):
     """One authority-first managed acquisition; construct its result after settlement."""
     part = dest.with_name(dest.name + ".part")
@@ -1108,6 +1907,7 @@ def _scoped_get_file_managed(
                             ctx, url, origin_host, timeout=timeout, data=data,
                             method=method, headers=headers,
                             max_redirects=max_redirects,
+                            source_id=source_id,
                             contact_attempt=transaction.mark_contact_attempted,
                             response_cleanup=response_cleanup,
                         ) as (response, final, status, did_contact):
@@ -1554,7 +2354,8 @@ def _scoped_get_file_managed(
 
 def scoped_get_file(ctx, url, dest, origin_host=None, *, timeout=20, data=None, method="GET",
                     headers=None, max_redirects=DEFAULT_MAX_REDIRECTS,
-                    chunk=1024 * 1024, deadline_s=300.0, policy=None, governor=None):
+                    chunk=1024 * 1024, deadline_s=300.0, policy=None, governor=None,
+                    source_id="native-http"):
     """Stream one guarded response through managed authority or proven legacy I/O."""
     dest = Path(dest)
     classification, run, components, reason = _classify_acquisition_destination(ctx, dest)
@@ -1563,7 +2364,7 @@ def scoped_get_file(ctx, url, dest, origin_host=None, *, timeout=20, data=None, 
             ctx, url, dest, origin_host, timeout=timeout, data=data,
             method=method, headers=headers, max_redirects=max_redirects,
             chunk=chunk, deadline_s=deadline_s, policy=policy,
-            governor=governor,
+            governor=governor, source_id=source_id,
         )
     if classification == "refused":
         return _managed_refusal(reason, url)
@@ -1578,7 +2379,7 @@ def scoped_get_file(ctx, url, dest, origin_host=None, *, timeout=20, data=None, 
         ctx, run, components, url, dest, origin_host,
         timeout=timeout, data=data, method=method, headers=headers,
         max_redirects=max_redirects, chunk=chunk, deadline_s=deadline_s,
-        policy=policy, governor=managed_governor,
+        policy=policy, governor=managed_governor, source_id=source_id,
     )
 
 
@@ -1623,19 +2424,26 @@ def discard_acquisition(ctx, acquisition):
 
 
 def scoped_headers(ctx, url, *, timeout=20, max_redirects=DEFAULT_MAX_REDIRECTS, max_body=512 * 1024,
-                   insecure=False):
+                   insecure=False, source_id="native-http"):
     """Guarded header+body fetch: resolve- + scope-guard every hop, follow only in-scope redirects,
     return (headers|None, body, final_url, status). headers is None when a hop would leave scope / hit
     the scan box (never contacted) or on a swallowed transport failure (URLError/TLS/timeout), so one
     bad request never aborts the caller's phase. A bounded body is read (for <meta http-equiv> CSP).
-    `insecure` tolerates self-signed TLS for CSP retrieval on internal/staging apexes."""
-    opener = _INSECURE_OPENER if insecure else _NO_REDIRECT_OPENER
+    ``insecure`` is retained only as a compatibility argument and any true value is refused before
+    resolution/contact; every accepted HTTPS response preserves hostname and certificate checks."""
+    if insecure is not False:
+        raise ValueError("native HTTPS certificate verification cannot be disabled")
+    initial_parts = _validated_http_url(url)
     origin = normalize.host_of_url(url)
     current = url
-    cur_parts = urlsplit(url)
+    cur_parts = initial_parts
     status = 0
     for _hop in range(max_redirects + 1):
-        _st, _deny, _intel = netguard.contact_state(cur_parts.hostname, block_private=netguard._block_private(ctx))
+        _contact_result = _contact(
+            ctx, cur_parts.hostname, port=_effective_http_port(cur_parts),
+            source_id=source_id,
+        )
+        _st, _deny, _intel = _contact_result
         if _intel:
             netguard.record_internal(ctx, cur_parts.hostname, _intel)
         if _st != "contact":
@@ -1643,7 +2451,10 @@ def scoped_headers(ctx, url, *, timeout=20, max_redirects=DEFAULT_MAX_REDIRECTS,
         _pace(ctx)
         req = urllib.request.Request(current, headers={"User-Agent": UA}, method="GET")
         try:
-            status, rhdrs, resp = _open_no_follow(req, timeout, opener)
+            status, rhdrs, resp = _open_contact(
+                ctx, cur_parts.hostname, _contact_result, req, timeout,
+                insecure=insecure, source_id=source_id,
+            )
         except (urllib.error.URLError, OSError):
             return None, b"", current, 0                  # transport failure -> swallow, caller continues
         try:
@@ -1652,13 +2463,19 @@ def scoped_headers(ctx, url, *, timeout=20, max_redirects=DEFAULT_MAX_REDIRECTS,
                 if not loc:
                     return rhdrs, b"", current, status
                 nxt = urljoin(current, loc)
+                nxt_parts = _validated_http_url(nxt)
                 if normalize.host_of_url(nxt) != origin and not ctx.scope.active_allowed(normalize.host_of_url(nxt)):
                     return None, b"", nxt, status         # redirect would leave scope -> stop
-                cur_parts, current = urlsplit(nxt), nxt
+                cur_parts, current = nxt_parts, nxt
                 continue
             body = resp.read(max_body) if resp else b""
             return rhdrs, body, current, status
         finally:
             if resp is not None:
-                resp.close()
+                transport = getattr(resp, "_quarry_network_transport", None)
+                try:
+                    if transport is not None:
+                        transport.release()
+                finally:
+                    resp.close()
     return None, b"", current, status

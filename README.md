@@ -109,7 +109,7 @@ TARGET: acme
 APEX_DOMAINS:
   - acme.com
 
-OOS:                          # regex against the full host
+OOS:                          # bounded pattern against the full canonical host
   - '^jobs\.'
 
 CIDR:                         # empty: no horizontal IP scanning

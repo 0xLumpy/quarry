@@ -13,6 +13,8 @@ from typing import Iterable
 
 import yaml
 
+from .oos_regex import OOSRegexError, compile_oos
+
 # HTTP probe set. Empty PORTS.HTTP means use this full set; populate it only to narrow or override.
 # Heavy: 90+ ports × many hosts — pair with conservative HTTP rate limits.
 FULL_HTTP_PORTS = [
@@ -325,8 +327,8 @@ class TargetProfile:
         pats = []
         for raw in self.oos:
             try:
-                pats.append(re.compile(raw, re.IGNORECASE))
-            except re.error as e:
+                pats.append(compile_oos(raw))
+            except OOSRegexError as e:
                 raise ProfileError(f"bad OOS regex {raw!r}: {e}")
         nets = []
         for c in self.cidr:

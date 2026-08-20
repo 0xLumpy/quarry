@@ -124,8 +124,11 @@ def run(ctx) -> None:
             discovered = set()
             for apex in roots:
                 for scheme in ("https", "http"):
-                    # transport-safe + self-signed OK (insecure): a bad request never aborts the phase.
-                    hdrs, body, final, st = fetch.scoped_headers(ctx, f"{scheme}://{apex}/", insecure=True)
+                    # Pinned peer plus ordinary hostname/certificate verification.
+                    hdrs, body, final, st = fetch.scoped_headers(
+                        ctx, f"{scheme}://{apex}/", insecure=False,
+                        source_id="horizontal.csp",
+                    )
                     if hdrs is None:                          # transport failure or off-scope redirect
                         failed += 1
                         continue
@@ -175,7 +178,7 @@ def run(ctx) -> None:
     # expand CIDR -> IPs
     ips_path = ctx.run.raw_path("horizontal", "mapcidr", "ips.txt")
     r = exec_tool(
-        "mapcidr", ["mapcidr", "-cidr", ",".join(prof.cidr), "-silent"],
+        "mapcidr", ["mapcidr", "-duc", "-cidr", ",".join(prof.cidr), "-silent"],
         repository=ctx.run,
         stdout=RepositoryOutput.publish(*ips_path.relative_to(ctx.run.dir).parts),
         stderr=RepositoryOutput.discard(), timeout=120,
@@ -192,7 +195,7 @@ def run(ctx) -> None:
     else:
         tls_raw = ctx.run.raw_path("horizontal", "tlsx", "san.txt")
         r = exec_tool(
-            "tlsx", ["tlsx", "-l", str(ips_file), "-san", "-cn", "-silent",
+            "tlsx", ["tlsx", "-duc", "-l", str(ips_file), "-san", "-cn", "-silent",
                      "-p", "443,8443,4443", "-resp-only"],
             repository=ctx.run,
             stdout=RepositoryOutput.publish(*tls_raw.relative_to(ctx.run.dir).parts),
@@ -210,7 +213,7 @@ def run(ctx) -> None:
     if not scope.passive_only:
         ptr_raw = ctx.run.raw_path("horizontal", "dnsx", "ptr.txt")
         r = exec_tool(
-            "dnsx", ["dnsx", "-l", str(ips_file), "-ptr", "-resp-only", "-silent"],
+            "dnsx", ["dnsx", "-duc", "-l", str(ips_file), "-ptr", "-resp-only", "-silent"],
             repository=ctx.run,
             stdout=RepositoryOutput.publish(*ptr_raw.relative_to(ctx.run.dir).parts),
             stderr=RepositoryOutput.discard(), timeout=ctx.http_timeout,
@@ -277,7 +280,7 @@ def run(ctx) -> None:
     if asn_seeds:
         asn_raw = ctx.run.raw_path("horizontal", "asnmap", "ranges.txt")
         r = exec_tool(
-            "asnmap", ["asnmap", "-silent"],
+            "asnmap", ["asnmap", "-duc", "-silent"],
             repository=ctx.run,
             stdout=RepositoryOutput.publish(*asn_raw.relative_to(ctx.run.dir).parts),
             stderr=RepositoryOutput.discard(),

@@ -160,8 +160,9 @@ def test_csp_claim_precedes_resolution_and_publishes_before_raw_ref(tmp_path, mo
         assert release.wait(5), "seal-race fixture was not released"
         return hosts
 
-    def scoped_headers(_ctx, url, *, insecure):
-        assert insecure is True
+    def scoped_headers(_ctx, url, *, insecure, source_id):
+        assert insecure is False
+        assert source_id == "horizontal.csp"
         return ({"Content-Security-Policy": "connect-src https://api.acme.example"},
                 b"", url, 200)
 

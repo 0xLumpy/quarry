@@ -32,7 +32,7 @@ def _apex_of(host: str, apexes) -> str:
 
 
 def _dnsx_cmd(ctx, list_file, flags=None):
-    cmd = ["dnsx", "-l", str(list_file), *(flags or _RECORD_FLAGS), "-json", "-silent"]
+    cmd = ["dnsx", "-duc", "-l", str(list_file), *(flags or _RECORD_FLAGS), "-json", "-silent"]
     if ctx.profile.dns_rate:                        # honor RATELIMIT.DNS (dnsx -rl = req/s)
         cmd += ["-rl", str(ctx.profile.dns_rate)]
     return cmd

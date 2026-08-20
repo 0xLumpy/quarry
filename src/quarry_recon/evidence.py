@@ -299,13 +299,29 @@ def _text_of(acq, *, limit: int | None = None) -> str | None:
     return acq.path.read_bytes().decode("utf-8", "replace")
 
 
+_NETWORK_AUTHORITY_SOURCE = {
+    "exposed-fetch": "evidence.exposed_fetch",
+    "graphql-introspect": "evidence.graphql_introspect",
+    "actuator-probe": "evidence.actuator_probe",
+    "deep-evidence": "evidence.deep_evidence",
+    "openapi": "evidence.openapi",
+    "framework-probe": "evidence.framework_probe",
+    "ssti-probe": "evidence.ssti_probe",
+}
+
+
 def acquire(ctx, url: str, dest, host: str, *, source: str, **kw):
     """The acquisition entry point for every evidence lane, so shared ownership reporting cannot be missed:
     returns `(acq|None, final, status)` and emits `evidence_durability` on a complete-but-unowned
     acquisition, `evidence_ownership` on a refusal.
     """
-    acq, final, status = fetch.scoped_get_file(ctx, url, dest, host, chunk=STREAM_CHUNK,
-                                               deadline_s=STREAM_DEADLINE_S, **kw)
+    authority_source = _NETWORK_AUTHORITY_SOURCE.get(source)
+    if authority_source is None:
+        raise ValueError("evidence acquisition source has no network authority")
+    acq, final, status = fetch.scoped_get_file(
+        ctx, url, dest, host, chunk=STREAM_CHUNK,
+        deadline_s=STREAM_DEADLINE_S, source_id=authority_source, **kw,
+    )
     if acq is None:
         return acq, final, status
     if acq.disposition in ("complete-unowned", "incomplete-unowned"):

@@ -1290,7 +1290,7 @@ def _asn_expand(s: OsintSession, profile, echo, timeout: int) -> None:
         return
     raw = s.raw_path("asnmap", "ranges.txt")
     r = exec_tool(
-        "asnmap", ["asnmap", "-silent"],
+        "asnmap", ["asnmap", "-duc", "-silent"],
         repository=s, stdout=s.output(raw), stderr=s.output(),
         stdin_data="\n".join(profile.asn), timeout=min(timeout, 120),
     )

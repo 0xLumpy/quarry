@@ -15,7 +15,7 @@ Empty sections skip cleanly — the minimum viable profile is one `APEX_DOMAINS`
 |-------|--------|
 | `TARGET` | engagement name (required) |
 | `APEX_DOMAINS` | in-scope apex roots (required). Discovery is anchored here by suffix match. `*.` is stripped to the root. |
-| `OOS` | out-of-scope patterns — **regex against the full host**. Retained passively but ineligible for planned active contact. Prefer anchored patterns; a loose one silently drops in-scope hosts. Actual-peer/connect-time enforcement is tracked separately. Add from the CLI with `quarry oos`. |
+| `OOS` | out-of-scope patterns against the full canonical host, using Quarry's bounded grammar: literals, `.`, character classes, edge anchors, and at most one single-atom `*`/`+`/`?` repetition. Groups, alternation, lookaround, backreferences, counted/nested repetition are refused. Matching names remain passive-only. Add with `quarry oos`. |
 | `CIDR` | in-scope IP ranges. Empty: no range expansion, no infra port scan. Setting it makes tlsx SAN, Caduceus, and reverse DNS *eligible* on the ranges (active runs, when the tool is installed). |
 | `ASN` | ASN seeds. **Context only** — `quarry osint` expands them to CIDR candidates, but active range scanning still needs an explicit `CIDR`. An ASN alone never triggers a scan. |
 | `ORG_NAMES` | organisation names. Anchor `quarry osint` broadening (ASRank ASN discovery, reverse-WHOIS) and seed cloud-bucket candidates. |

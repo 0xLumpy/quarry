@@ -95,7 +95,7 @@ def _run_subfinder(ctx, prof, scope) -> None:
         sf_wu = events.work_unit("vertical.subfinder", inputs={"root": apex},
                                  config={"sources": "all", "max_time_min": budget_min, "providers": providers})
         r = run_contract("vertical.subfinder",
-                         ["subfinder", "-d", apex, "-all", "-max-time", str(budget_min),
+                         ["subfinder", "-duc", "-d", apex, "-all", "-max-time", str(budget_min),
                           "-stats", "-silent"],
                          repository=ctx.run,
                          stdout=RepositoryOutput.publish(*sf_raw.relative_to(ctx.run.dir).parts),
@@ -987,7 +987,7 @@ def _wc_differentiate(ctx, _zones_all: list, *, words: list, phase: str, label: 
         hx = ctx.run.raw_path(phase, label, f"{zone}-{unit}-{attempt}.jsonl")
         # -follow-redirects so the signature is the final response: without it every candidate gets the
         # wildcard's uniform 308->https, which "differs" from the 200 baseline and floods false positives.
-        hx_cmd = ["httpx", "-l", str(cf), "-json", "-silent", "-sc", "-cl", "-title",
+        hx_cmd = ["httpx", "-duc", "-l", str(cf), "-json", "-silent", "-sc", "-cl", "-title",
                   "-favicon", "-follow-host-redirects",   # same-host only (http->https collapse)
                   "-deny", netguard.self_deny_list(),     # never hit the scan box / metadata
                   "-t", str(settings.workers("httpx", 15))]
@@ -1253,7 +1253,7 @@ def _recursive_permute(ctx, prof, scope, trusted, resolvers, wildcard_zones) -> 
         if not scope.passive_only and have("alterx"):
             perms = ctx.run.raw_path("vertical", "alterx", f"perms_{it}.txt")
             r = exec_tool(
-                "alterx", ["alterx", "-l", str(known), "-enrich", "-mode", "both", "-silent"],
+                "alterx", ["alterx", "-duc", "-l", str(known), "-enrich", "-mode", "both", "-silent"],
                 repository=ctx.run,
                 stdout=RepositoryOutput.publish(*perms.relative_to(ctx.run.dir).parts),
                 stderr=RepositoryOutput.discard(), timeout=600,
@@ -1580,7 +1580,7 @@ def run(ctx) -> None:
         # -a so each result carries the host's A records: dangling = a CNAME but no A here. Not "not in
         # resolved" — a no-A CNAME host can still get a `resolved` entity with a:[]
         r = exec_tool(
-            "dnsx", ["dnsx", "-l", str(res_hosts), "-cname", "-a", "-json", "-silent"],
+            "dnsx", ["dnsx", "-duc", "-l", str(res_hosts), "-cname", "-a", "-json", "-silent"],
             repository=ctx.run,
             stdout=RepositoryOutput.publish(*cn.relative_to(ctx.run.dir).parts),
             stderr=RepositoryOutput.discard(), timeout=ctx.http_timeout,

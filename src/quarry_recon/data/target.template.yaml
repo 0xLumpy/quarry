@@ -7,8 +7,9 @@ TARGET: example
 APEX_DOMAINS:
   - example.com
 
-# Out-of-scope patterns (regex against the full host). Collected passively, never contacted.
-# Add from the CLI: quarry oos -t <project> <host|regex>
+# Out-of-scope full-host patterns use Quarry's bounded hostname grammar: literals, `.`,
+# character classes, edge anchors, and at most one single-atom `*`/`+`/`?` repetition.
+# Collected passively, never contacted. Add with: quarry oos -t <project> <host|pattern>
 OOS:
   # - '^jobs\.'
 

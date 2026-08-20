@@ -15,7 +15,8 @@ class TestSelfAttack:
     @pytest.mark.parametrize("ip", [
         "127.0.0.1", "127.5.5.5", "::1", "::ffff:127.0.0.1",       # loopback (+ IPv4-mapped)
         "169.254.0.1", "fe80::1",                                  # link-local
-        "169.254.169.254", "169.254.170.2", "100.100.100.200", "fd00:ec2::254",  # cloud metadata
+        "169.254.169.254", "169.254.170.2", "100.100.100.200", "fd00:ec2::254",
+        "fd20:ce::254",  # cloud metadata
     ])
     def test_scan_box_and_metadata_are_self_attack(self, ip):
         assert netguard.is_self_attack_ip(ip)

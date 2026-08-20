@@ -122,9 +122,12 @@ APEX_DOMAINS:
 
 ## `OOS` — out-of-scope patterns
 
-From the program brief's exclusions. These are **regex matched against the full host**. The framework
-still retains them passively, but the scope planner makes them ineligible for active work. The separate
-connect-time boundary must prove that the actual peer honors that decision.
+From the program brief's exclusions. These are matched against the full canonical host using Quarry's
+bounded pattern grammar: literals, `.`, character classes, edge anchors, and at most one single-atom
+`*`, `+`, or `?` repetition. Groups, alternation, lookaround, backreferences, counted repetition, and
+nested repetition are refused when the profile is loaded. The framework still retains matching names
+passively, but the scope planner makes them ineligible for active work. The separate connect-time
+boundary must prove that the actual peer honors that decision.
 
 ```yaml
 OOS:
@@ -134,7 +137,8 @@ OOS:
   - '\.partner\.target\.com$'       # an OOS branch
 ```
 
-Tip: prefer anchored, specific patterns. A loose pattern can silently drop in-scope hosts.
+Tip: prefer anchored, specific patterns. `quarry oos` validates the same grammar as the profile loader
+before writing, so an unsupported imported pattern must be migrated to exact/suffix/glob-style rules.
 
 ---
 
