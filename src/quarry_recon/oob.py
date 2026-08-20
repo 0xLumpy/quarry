@@ -688,7 +688,9 @@ def close_session(proc) -> None:
     """Settle process, streams, and private claims while preserving cleanup-time cancellation."""
     faults: list[BaseException] = []
     try:
-        runner.terminate_group(proc)
+        # interactsh-client writes its resumable session from its SIGINT
+        # handler.  Keep the runner's normal bounded SIGKILL/reap fallback.
+        runner.terminate_group(proc, graceful_signal=signal.SIGINT)
     except BaseException as exc:
         faults.append(exc)
     try:

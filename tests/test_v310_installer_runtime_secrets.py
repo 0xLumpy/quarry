@@ -618,7 +618,7 @@ def test_oob_close_cancellation_still_settles_private_claims(tmp_path, monkeypat
     process._quarry_oob_claims = claims
     monkeypatch.setattr(
         oob.runner, "terminate_group",
-        lambda _process: (_ for _ in ()).throw(fault),
+        lambda _process, **_kwargs: (_ for _ in ()).throw(fault),
     )
 
     with pytest.raises(type(fault)):

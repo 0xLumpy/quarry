@@ -64,7 +64,9 @@ def _resume_argv(monkeypatch, saved_server, current_server, token):
         "session_file": "/tmp/s.session", "log": "/tmp/i.jsonl", "server": saved_server, "domain": "D.oast.pro"})
     monkeypatch.setattr(oob.subprocess, "Popen", _fake_popen)
     monkeypatch.setattr(oob, "_await_register", lambda _p, _s, _w: ("D.oast.pro", "uid"))
-    monkeypatch.setattr(oob.runner, "terminate_group", lambda _p: None)
+    monkeypatch.setattr(
+        oob.runner, "terminate_group", lambda _p, **_kwargs: None,
+    )
     resumed = oob.resume_session(object(), token=token, server=current_server, wait=0)
     assert resumed is not None
     oob.close_session(resumed[1])

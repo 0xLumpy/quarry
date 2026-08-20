@@ -92,7 +92,9 @@ def _fake_interactsh(monkeypatch, captured):
     )
     monkeypatch.setattr(oob, "_await_register", lambda _proc, _server, _wait: ("csession01.oast.pro",
                                                                                "csession01"))
-    monkeypatch.setattr(oob.runner, "terminate_group", lambda _proc: None)
+    monkeypatch.setattr(
+        oob.runner, "terminate_group", lambda _proc, **_kwargs: None,
+    )
 
     def launch(command, **kwargs):
         proc = _FakeProc()
@@ -100,6 +102,21 @@ def _fake_interactsh(monkeypatch, captured):
         return proc
 
     monkeypatch.setattr(oob.subprocess, "Popen", launch)
+
+
+def test_oob_close_uses_sigint_persistence_boundary(monkeypatch):
+    observed = {}
+    proc = _FakeProc()
+
+    def terminate(current, **kwargs):
+        observed["proc"] = current
+        observed.update(kwargs)
+
+    monkeypatch.setattr(oob.runner, "terminate_group", terminate)
+    oob.close_session(proc)
+
+    assert observed == {"proc": proc, "graceful_signal": signal.SIGINT}
+    assert proc.stdout.closed
 
 
 def test_saved_session_paths_are_run_relative_references(tmp_path):

@@ -1039,11 +1039,17 @@ def _record_partial(stage: Path, state: dict) -> None:
         pass
 
 
-def terminate_group(proc, grace: float = _TERM_GRACE) -> None:
-    """Kill a tool's whole process group (SIGTERM, bounded grace, SIGKILL) and reap it, leaving no orphan or
-    zombie. Callers MUST launch with `start_new_session=True`; `proc.pid` is used as the pgid directly because
-    `os.getpgid` fails once the leader has exited while a child still holds the group. Race-safe; non-POSIX
-    falls back to single-process terminate→kill. Shared with the OOB interactsh session."""
+def terminate_group(proc, grace: float = _TERM_GRACE, *,
+                    graceful_signal: int = signal.SIGTERM) -> None:
+    """Signal a tool's process group, then bounded-wait, SIGKILL, and reap it.
+
+    Normal tools use SIGTERM.  A caller whose documented persistence boundary is
+    SIGINT may request that signal without weakening the same hard-kill fallback.
+    Callers MUST launch with ``start_new_session=True``; ``proc.pid`` remains the
+    process-group id even after the leader exits.
+    """
+    if graceful_signal not in {signal.SIGTERM, signal.SIGINT}:
+        raise ValueError("unsupported graceful process-group signal")
     if _POSIX:
         pgid = proc.pid                                # valid while any group member lives
         def _sig(sig):
@@ -1051,7 +1057,7 @@ def terminate_group(proc, grace: float = _TERM_GRACE) -> None:
                 os.killpg(pgid, sig)
             except (ProcessLookupError, OSError):
                 pass                                   # group already gone — fine
-        _sig(signal.SIGTERM)
+        _sig(graceful_signal)
         try:
             proc.wait(timeout=grace)                   # let the group exit gracefully on TERM
         except (subprocess.TimeoutExpired, ProcessLookupError, OSError):
@@ -1064,7 +1070,7 @@ def terminate_group(proc, grace: float = _TERM_GRACE) -> None:
         return
     # non-POSIX: no process groups — best-effort single-process TERM -> KILL, reaping after each
     try:
-        proc.terminate()
+        proc.send_signal(graceful_signal)
         proc.wait(timeout=grace)
     except subprocess.TimeoutExpired:
         try:
