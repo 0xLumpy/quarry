@@ -3295,6 +3295,40 @@ def _semantic_identity(
         )
 
 
+def _semantic_thresholds(
+    _gate: dict, bodies: Mapping[str, bytes], **context: object,
+) -> None:
+    expected = context["thresholds"]
+    body = bodies["threshold-reconciliation"]
+    observed = read_threshold_manifest(
+        body,
+        require_ready=True,
+        trust_policy=context["policy"],
+        trusted_policy_digest=context["trusted_policy_digest"],
+    )
+    if observed != expected or body != canonical_json_line(expected):
+        raise evidence.EvidenceError(
+            "threshold-reconciliation artifact is not the exact threshold manifest"
+        )
+
+
+def _semantic_support(
+    _gate: dict, bodies: Mapping[str, bytes], **context: object,
+) -> None:
+    expected = context["support"]
+    body = bodies["support-reconciliation"]
+    observed = read_support_matrix(
+        body,
+        require_ready=True,
+        trust_policy=context["policy"],
+        trusted_policy_digest=context["trusted_policy_digest"],
+    )
+    if observed != expected or body != canonical_json_line(expected):
+        raise evidence.EvidenceError(
+            "support-reconciliation artifact is not the exact support matrix"
+        )
+
+
 def _semantic_taxonomy(
     gate: dict, bodies: Mapping[str, bytes], **context: object,
 ) -> None:
@@ -3381,6 +3415,8 @@ def _semantic_taxonomy(
 SEMANTIC_VERIFIERS = MappingProxyType({
     "A-IDENTITY": _semantic_identity,
     "A-TAXONOMY": _semantic_taxonomy,
+    "A-THRESHOLDS": _semantic_thresholds,
+    "A-SUPPORT": _semantic_support,
     "C-NETWORK-BOUNDARY": _semantic_network_boundary,
     "C-NET-DENY": _semantic_network_denial,
     "C-FAULT-DISK": _semantic_resource_fault,
@@ -3394,7 +3430,7 @@ SEMANTIC_VERIFIERS = MappingProxyType({
 def _validate_supporting_artifacts(
     gate: dict, bodies: Mapping[str, bytes], *, identity: dict, report: dict,
     resolver: ArtifactResolver, scope: dict, support: dict, thresholds: dict,
-    policy: dict, input_bodies: Mapping[str, bytes],
+    policy: dict, trusted_policy_digest: str, input_bodies: Mapping[str, bytes],
 ) -> None:
     gate_id = gate["gate_id"]
     verifier = SEMANTIC_VERIFIERS.get(gate_id)
@@ -3412,6 +3448,7 @@ def _validate_supporting_artifacts(
         support=support,
         thresholds=thresholds,
         policy=policy,
+        trusted_policy_digest=trusted_policy_digest,
         input_bodies=input_bodies,
     )
 
@@ -3798,6 +3835,7 @@ def aggregate_records(
                     support=support,
                     thresholds=thresholds,
                     policy=policy,
+                    trusted_policy_digest=trusted_policy_digest,
                     input_bodies=input_bodies,
                 )
             summaries.append({

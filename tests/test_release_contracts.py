@@ -325,6 +325,10 @@ def _supporting_bodies(
         bodies["identity-verification"] = contracts.canonical_json_line(identity)
     elif gate_id == "A-TAXONOMY":
         bodies["classification-manifest"] = _taxonomy_body(environment, toolchain)
+    elif gate_id == "A-THRESHOLDS":
+        bodies["threshold-reconciliation"] = contracts.canonical_json_line(thresholds)
+    elif gate_id == "A-SUPPORT":
+        bodies["support-reconciliation"] = contracts.canonical_json_line(support)
     elif gate_id == "C-PACKAGE-BUILD":
         bodies["sdist"] = _synthetic_sdist()
         bodies["wheel"] = _synthetic_wheel()
@@ -1469,7 +1473,10 @@ class TestIncompleteSemanticRegistry:
     def test_production_aggregation_refuses_unimplemented_obligation_semantics(self, tmp_path):
         assert set(contracts.SEMANTIC_VERIFIERS) == (
             set(contracts.RESOURCE_SEMANTIC_GATES)
-            | {"A-IDENTITY", "A-TAXONOMY", "C-NETWORK-BOUNDARY", "C-NET-DENY"}
+            | {
+                "A-IDENTITY", "A-TAXONOMY", "A-THRESHOLDS", "A-SUPPORT",
+                "C-NETWORK-BOUNDARY", "C-NET-DENY",
+            }
         )
         assert "C-PERF-PHASE-FAIRNESS" not in contracts.SEMANTIC_VERIFIERS
         arguments = _scenario(tmp_path)
@@ -2042,6 +2049,18 @@ class TestArtifactsAndAggregation:
                 "wrong-commit",
                 "exact candidate identity",
             ),
+            (
+                "A-THRESHOLDS",
+                "threshold-reconciliation",
+                "wrong-limit",
+                "exact threshold manifest",
+            ),
+            (
+                "A-SUPPORT",
+                "support-reconciliation",
+                "wrong-python",
+                "exact support matrix",
+            ),
             ("C-PACKAGE-BUILD", "wheel", "invalid-wheel", "readable ZIP archive"),
             ("C-SBOM", "sbom", "missing-dependency", "declared direct dependency"),
             (
@@ -2085,6 +2104,22 @@ class TestArtifactsAndAggregation:
             document = json.loads(body)
             if mutation == "wrong-commit":
                 document["git_commit"] = "3" * 40
+            elif mutation == "wrong-limit":
+                next(
+                    row for row in document["thresholds"]
+                    if row["gate_id"] == "B-COVERAGE" and row["class"] == "absolute"
+                )["limit"] += 1
+            elif mutation == "wrong-python":
+                next(
+                    row for row in document["environments"]
+                    if row["lane"] == "H0-hermetic" and row["python"] == "3.12.13"
+                )["python"] = "3.13.13"
+            if mutation in {"wrong-limit", "wrong-python"}:
+                _sign_contract_review(
+                    document,
+                    arguments["trust_policy"],
+                    approved_at=document["approval"]["approved_at"],
+                )
             elif mutation == "unresolved-result":
                 document["records"][0]["result_digest"] = _digest("0")
             elif mutation == "missing-dependency":
