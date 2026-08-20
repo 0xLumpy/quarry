@@ -22,10 +22,12 @@
     {"$ref": "#/$defs/schema_validation_report"},
     {"$ref": "#/$defs/docs_policy_parity_report"},
     {"$ref": "#/$defs/manifest_invariant_report"},
-    {"$ref": "#/$defs/manifest_corrupt_fixture_matrix"}
+    {"$ref": "#/$defs/manifest_corrupt_fixture_matrix"},
+    {"$ref": "#/$defs/quality_report"}
   ],
   "properties": {
     "artifact_type": {"$ref": "#/$defs/token"},
+    "bindings": {"items": {"$ref": "#/$defs/quality_binding"}, "type": "array"},
     "assertion": {"$ref": "#/$defs/assertion"},
     "baseline_digest": {"$ref": "#/$defs/digest"},
     "benchmark_digest": {"$ref": "#/$defs/digest"},
@@ -71,8 +73,11 @@
     "name": {"$ref": "#/$defs/token"},
     "node_results": {"items": {"$ref": "#/$defs/manifest_node_result"}, "type": "array"},
     "observed": {"$ref": "#/$defs/manifest_observed"},
+    "observations": {"items": {"$ref": "#/$defs/quality_observation"}, "type": "array"},
     "package": {"$ref": "#/$defs/package"},
     "raw_trials_digest": {"$ref": "#/$defs/digest"},
+    "quality_policy_digest": {"$ref": "#/$defs/digest"},
+    "quality_violations": {"$ref": "#/$defs/count"},
     "records": {"items": {"$ref": "#/$defs/machine_record"}, "minItems": 1, "type": "array"},
     "registry_digest": {"$ref": "#/$defs/digest"},
     "release": {"const": "0.3.10"},
@@ -90,6 +95,8 @@
     "test_results": {"items": {"$ref": "#/$defs/docs_policy_test_result"}, "type": "array"},
     "test_sources": {"items": {"$ref": "#/$defs/manifest_test_source"}, "type": "array"},
     "test_source_digest": {"$ref": "#/$defs/digest"},
+    "threshold_manifest_digest": {"$ref": "#/$defs/digest"},
+    "toolchain": {"items": {"$ref": "#/$defs/tool"}, "type": "array"},
     "trials": {"items": {"$ref": "#/$defs/trial"}, "maxItems": 1000, "minItems": 1, "type": "array"},
     "warmup_runs": {"$ref": "#/$defs/count"}
   },
@@ -423,6 +430,30 @@
       "additionalProperties": false,
       "properties": {"artifact_type": {"const": "publication-subjects"}, "candidate_identity_digest": {"$ref": "#/$defs/digest"}, "gate_id": {"const": "E-ARTIFACTS"}, "release": {"const": "0.3.10"}, "schema_version": {"const": "quarry.gate-artifact.v1"}, "subjects": {"items": {"$ref": "#/$defs/publication_subject"}, "minItems": 5, "type": "array", "uniqueItems": true}},
       "required": ["artifact_type", "candidate_identity_digest", "gate_id", "release", "schema_version", "subjects"],
+      "type": "object"
+    },
+    "quality_binding": {
+      "additionalProperties": false,
+      "properties": {"digest": {"$ref": "#/$defs/digest"}, "name": {"$ref": "#/$defs/token"}, "path": {"$ref": "#/$defs/text"}},
+      "required": ["digest", "name", "path"],
+      "type": "object"
+    },
+    "quality_observation": {
+      "additionalProperties": false,
+      "properties": {"argv": {"items": {"$ref": "#/$defs/text"}, "minItems": 1, "type": "array"}, "breached": {"type": "boolean"}, "budget": {"$ref": "#/$defs/count"}, "config": {"$ref": "#/$defs/quality_binding"}, "expected_exit_code": {"type": "integer", "minimum": 0, "maximum": 255}, "id": {"enum": ["formatting", "lint", "type", "docs", "dead-code", "complexity"]}, "observed_count": {"$ref": "#/$defs/count"}, "output": {"$ref": "#/$defs/build_output"}, "output_kind": {"const": "canonical-findings"}, "result_digest": {"$ref": "#/$defs/digest"}, "sources": {"items": {"$ref": "#/$defs/text"}, "minItems": 1, "type": "array"}, "tool": {"$ref": "#/$defs/token"}, "version": {"$ref": "#/$defs/text"}, "exit_code": {"type": "integer", "minimum": 0, "maximum": 255}},
+      "required": ["argv", "breached", "budget", "config", "expected_exit_code", "exit_code", "id", "observed_count", "output", "output_kind", "result_digest", "sources", "tool", "version"],
+      "type": "object"
+    },
+    "quality_observation_formatting": {"allOf": [{"$ref": "#/$defs/quality_observation"}, {"properties": {"id": {"const": "formatting"}}}]},
+    "quality_observation_lint": {"allOf": [{"$ref": "#/$defs/quality_observation"}, {"properties": {"id": {"const": "lint"}}}]},
+    "quality_observation_type": {"allOf": [{"$ref": "#/$defs/quality_observation"}, {"properties": {"id": {"const": "type"}}}]},
+    "quality_observation_docs": {"allOf": [{"$ref": "#/$defs/quality_observation"}, {"properties": {"id": {"const": "docs"}}}]},
+    "quality_observation_dead_code": {"allOf": [{"$ref": "#/$defs/quality_observation"}, {"properties": {"id": {"const": "dead-code"}}}]},
+    "quality_observation_complexity": {"allOf": [{"$ref": "#/$defs/quality_observation"}, {"properties": {"id": {"const": "complexity"}}}]},
+    "quality_report": {
+      "additionalProperties": false,
+      "properties": {"artifact_type": {"const": "quality-report"}, "bindings": {"items": {"$ref": "#/$defs/quality_binding"}, "minItems": 5, "maxItems": 5, "type": "array"}, "candidate_identity_digest": {"$ref": "#/$defs/digest"}, "environment": {"$ref": "#/$defs/environment"}, "evidence_finished_at": {"$ref": "#/$defs/text"}, "evidence_instance_id": {"$ref": "#/$defs/token"}, "evidence_started_at": {"$ref": "#/$defs/text"}, "gate_id": {"const": "B-QUALITY"}, "name": {"const": "quality-report"}, "observations": {"items": false, "prefixItems": [{"$ref": "#/$defs/quality_observation_formatting"}, {"$ref": "#/$defs/quality_observation_lint"}, {"$ref": "#/$defs/quality_observation_type"}, {"$ref": "#/$defs/quality_observation_docs"}, {"$ref": "#/$defs/quality_observation_dead_code"}, {"$ref": "#/$defs/quality_observation_complexity"}], "minItems": 6, "maxItems": 6, "type": "array"}, "quality_policy_digest": {"$ref": "#/$defs/digest"}, "quality_violations": {"$ref": "#/$defs/count"}, "release": {"const": "0.3.10"}, "schema_version": {"const": "quarry.gate-artifact.v1"}, "selection": {"$ref": "#/$defs/docs_policy_selection"}, "threshold_manifest_digest": {"$ref": "#/$defs/digest"}, "toolchain": {"items": {"$ref": "#/$defs/tool"}, "minItems": 3, "type": "array", "uniqueItems": true}},
+      "required": ["artifact_type", "bindings", "candidate_identity_digest", "environment", "evidence_finished_at", "evidence_instance_id", "evidence_started_at", "gate_id", "name", "observations", "quality_policy_digest", "quality_violations", "release", "schema_version", "selection", "threshold_manifest_digest", "toolchain"],
       "type": "object"
     },
     "resources": {

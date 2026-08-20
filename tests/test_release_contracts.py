@@ -505,6 +505,69 @@ def _supporting_bodies(
                 if row["name"] == "docs-parity-tests"
             ),
         })
+    elif gate_id == "B-QUALITY":
+        instance = evidence_instances[0]
+        policy_body = (ROOT / contracts.QUALITY_POLICY_PATH).read_bytes()
+        quality_policy = contracts.read_quality_policy(policy_body)
+        bindings = {row["name"]: row for row in scope["input_bindings"]}
+        selected_bindings = [
+            "docs-parity-tests", "package-metadata", "quality-policy",
+            "verification-job-map", "verification-workflow-ci",
+        ]
+        retained = []
+        for check in quality_policy["checks"]:
+            findings = [] if check["id"] in {"type", "docs"} else [
+                ["src/quarry_recon/quality.py", "Q000", 1, 1],
+            ]
+            output = evidence.canonical_json_bytes(findings)
+            retained.append({
+                "argv": check["argv"],
+                "breached": False,
+                "budget": check["budget"],
+                "config": {
+                    "digest": check["config"]["digest"],
+                    "name": "quality-config",
+                    "path": check["config"]["path"],
+                },
+                "expected_exit_code": check["expected_exit_code"],
+                "exit_code": 0 if not findings else check["expected_exit_code"],
+                "id": check["id"],
+                "observed_count": len(findings),
+                "output": "base64:" + base64.b64encode(output).decode("ascii"),
+                "output_kind": "canonical-findings",
+                "result_digest": contracts.raw_sha256(output),
+                "sources": check["sources"],
+                "tool": check["tool"],
+                "version": check["version"],
+            })
+        quality_selection = {
+            "collected": 6, "deselected": 0, "failed": 0, "passed": 6,
+            "selected": 6, "skipped": 0, "xfailed": 0, "xpassed": 0,
+        }
+        bodies["quality-report"] = contracts.canonical_json_line({
+            "artifact_type": "quality-report",
+            "bindings": [
+                {"digest": bindings[name]["digest"], "name": name, "path": bindings[name]["path"]}
+                for name in selected_bindings
+            ],
+            "candidate_identity_digest": evidence.canonical_digest(identity),
+            "environment": instance["environment"],
+            "evidence_finished_at": instance["finished_at"],
+            "evidence_instance_id": instance["id"],
+            "evidence_started_at": instance["started_at"],
+            "gate_id": gate_id,
+            "name": "quality-report",
+            "observations": retained,
+            "quality_policy_digest": contracts.raw_sha256(policy_body),
+            "quality_violations": 0,
+            "release": "0.3.10",
+            "schema_version": contracts.GATE_ARTIFACT_SCHEMA,
+            "selection": quality_selection,
+            "threshold_manifest_digest": contracts.raw_sha256(
+                contracts.canonical_json_line(thresholds)
+            ),
+            "toolchain": toolchain,
+        })
     elif gate_id == "B-MANIFEST":
         instance = evidence_instances[0]
         cases_body = (ROOT / contracts.MANIFEST_PATHS["manifest-evidence-cases"]).read_bytes()
@@ -1073,7 +1136,11 @@ def _ready_contracts(
     )
     corpus = _read("release/evidence/corpus-selection-v1.json", contracts.read_corpus_manifest)
     no_live = _read("release/evidence/no-live-rule-v1.json", contracts.read_no_live_rule)
-    support["tools"] = [{"digest": _digest("a"), "name": "pytest", "version": "8.3.5"}]
+    support["tools"] = [
+        {"digest": _digest("b"), "name": "mypy", "version": "2.3.1"},
+        {"digest": _digest("a"), "name": "pytest", "version": "9.1.1"},
+        {"digest": _digest("c"), "name": "ruff", "version": "0.16.3"},
+    ]
     support["template_sets"] = [
         {"digest": _digest("b"), "name": "synthetic-templates", "version": "1"},
     ]
@@ -1086,9 +1153,10 @@ def _ready_contracts(
         "runner_image": _digest("5"),
     })
     for row in thresholds["thresholds"]:
-        row["limit"] = (
-            0 if row["metric"] in resource_contract._ZERO_INVARIANTS else 1
-        )
+        row["limit"] = 0 if (
+            row["gate_id"] == "B-QUALITY" or
+            row["metric"] in resource_contract._ZERO_INVARIANTS
+        ) else 1
         if row["class"] == "regression":
             row["baseline_digest"] = _digest("c")
     corpus["sources"][-1]["fixture_digest"] = _digest("f")
@@ -1149,7 +1217,10 @@ def _identity(scope: dict, policy: dict) -> dict:
             "name": name,
             "path": path,
         })
-    inputs.extend(copy.deepcopy(scope["input_bindings"]))
+    inputs.extend(
+        copy.deepcopy(row) for row in scope["input_bindings"]
+        if row["name"] not in evidence.DEFAULT_IDENTITY_INPUTS
+    )
     inputs.extend([
         {
             "digest": contracts.raw_sha256(contracts.canonical_json_line(policy)),
@@ -1249,6 +1320,10 @@ def _scenario(tmp_path: Path, *, approved_at: str = "2026-08-01T00:00:00Z"):
         gate_finished_at = f"2026-08-14T10:{phase_minute}:02Z"
         artifacts = []
         instances = []
+        gate_toolchain = (
+            supported_toolchain if gate_id in {"B-QUALITY", "C-TOOLS"}
+            else [tool for tool in supported_toolchain if tool["name"] == "pytest"]
+        )
         if not is_live:
             if gate_id == "B-HERMETIC-ALL":
                 instance_specs = [
@@ -1306,6 +1381,11 @@ def _scenario(tmp_path: Path, *, approved_at: str = "2026-08-01T00:00:00Z"):
                         ), "skipped": 0,
                         "xfailed": 0, "xpassed": 0,
                     }
+                if gate_id == "B-QUALITY":
+                    selection = {
+                        "collected": 6, "deselected": 0, "failed": 0, "passed": 6,
+                        "selected": 6, "skipped": 0, "xfailed": 0, "xpassed": 0,
+                    }
                 instances.append({
                     "artifacts": [],
                     "assertions": [assertion],
@@ -1315,7 +1395,7 @@ def _scenario(tmp_path: Path, *, approved_at: str = "2026-08-01T00:00:00Z"):
                     "lane": environment["lane"],
                     "selection": selection,
                     "started_at": gate_started_at,
-                    "toolchain": supported_toolchain,
+                    "toolchain": gate_toolchain,
                 })
 
             benchmark = next(
@@ -1376,7 +1456,7 @@ def _scenario(tmp_path: Path, *, approved_at: str = "2026-08-01T00:00:00Z"):
                 environment=instances[0]["environment"],
                 evidence_instance_id=instances[0]["id"],
                 evidence_instances=instances,
-                toolchain=supported_toolchain,
+                toolchain=gate_toolchain,
                 indexed=indexed,
                 policy=policy,
             )
@@ -1446,7 +1526,7 @@ def _scenario(tmp_path: Path, *, approved_at: str = "2026-08-01T00:00:00Z"):
                 name: sum(instance["selection"][name] for instance in instances)
                 for name in selection
             }
-        if gate_id == "B-DOCS-POLICY":
+        if gate_id in {"B-DOCS-POLICY", "B-QUALITY"}:
             selection = copy.deepcopy(instances[0]["selection"])
         if gate_id == "B-MANIFEST":
             selection = copy.deepcopy(instances[0]["selection"])
@@ -1484,7 +1564,7 @@ def _scenario(tmp_path: Path, *, approved_at: str = "2026-08-01T00:00:00Z"):
             "signature": None,
             "started_at": gate_started_at,
             "status": status,
-            "toolchain": supported_toolchain if not is_live else [],
+            "toolchain": gate_toolchain if not is_live else [],
         }
         _resign_gate(gate, identity, policy)
         records.append(gate)
@@ -1768,7 +1848,7 @@ class TestCommittedContracts:
             "synthetic_corpus_disclosure_attestation", "aggregator_conformance_report",
             "h0_test_report", "h0_isolation_self_test", "schema_validation_report",
             "docs_policy_parity_report",
-            "manifest_invariant_report", "manifest_corrupt_fixture_matrix",
+            "manifest_invariant_report", "manifest_corrupt_fixture_matrix", "quality_report",
         ]
         discriminators = []
         for name in variant_names:
@@ -2008,7 +2088,7 @@ class TestIncompleteSemanticRegistry:
             set(contracts.RESOURCE_SEMANTIC_GATES)
             | {
                 "A-IDENTITY", "A-EVIDENCE-SCHEMA", "A-TAXONOMY", "A-CORPUS", "A-THRESHOLDS", "A-SUPPORT",
-                "B-HERMETIC-ALL", "B-SCHEMA", "B-DOCS-POLICY", "B-MANIFEST",
+                "B-HERMETIC-ALL", "B-SCHEMA", "B-DOCS-POLICY", "B-MANIFEST", "B-QUALITY",
                 "C-PACKAGE-BUILD", "C-PACKAGE-INSTALL", "C-NETWORK-BOUNDARY", "C-NET-DENY",
                 *contracts.V310_05_SEMANTIC_GATES,
             }
@@ -2017,7 +2097,7 @@ class TestIncompleteSemanticRegistry:
         arguments = _scenario(tmp_path)
         with pytest.raises(
             evidence.EvidenceError,
-            match="B-QUALITY has no registered obligation-specific semantic verifier",
+            match="B-COVERAGE has no registered obligation-specific semantic verifier",
         ):
             contracts.aggregate_records(**arguments)
 

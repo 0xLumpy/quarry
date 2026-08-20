@@ -56,6 +56,7 @@ PUBLICATION_SUBJECTS_SCHEMA = GATE_ARTIFACT_SCHEMA
 AGGREGATE_SCHEMA = "quarry.release-aggregate.v1"
 APPROVAL_SCHEMA = "quarry.detached-release-approval.v1"
 MANIFEST_EVIDENCE_CASES_SCHEMA = "quarry.manifest-evidence-cases.v1"
+QUALITY_POLICY_SCHEMA = "quarry.quality-policy.v1"
 
 RELEASE = evidence.RELEASE_SCOPE
 LANE_ORDER = (
@@ -402,6 +403,7 @@ SCHEMA_PATHS = {
     "support-matrix-schema": "release/evidence/schemas/support-matrix-v1.schema.json",
     "threshold-benchmark-schema": "release/evidence/schemas/threshold-benchmark-v1.schema.json",
     "trust-policy-schema": "release/evidence/schemas/trust-policy-v1.schema.json",
+    "quality-policy-schema": "release/evidence/schemas/quality-policy-v1.schema.json",
 }
 SCHEMA_VERSIONS = {
     "aggregate-schema": AGGREGATE_SCHEMA,
@@ -421,6 +423,7 @@ SCHEMA_VERSIONS = {
     "support-matrix-schema": SUPPORT_MATRIX_SCHEMA,
     "threshold-benchmark-schema": THRESHOLD_MANIFEST_SCHEMA,
     "trust-policy-schema": TRUST_POLICY_SCHEMA,
+    "quality-policy-schema": QUALITY_POLICY_SCHEMA,
 }
 MANIFEST_PATHS = {
     "aggregator-conformance-manifest": "release/evidence/aggregator-conformance-v1.json",
@@ -429,6 +432,7 @@ MANIFEST_PATHS = {
     "support-matrix": "release/evidence/support-matrix-v1.json",
     "threshold-benchmark": "release/evidence/threshold-benchmark-v1.json",
     "manifest-evidence-cases": "release/evidence/manifest-evidence-cases-v1.json",
+    "quality-policy": "release/evidence/quality-policy-v1.json",
 }
 SCHEMA_VALIDATION_FIXTURE_MANIFEST_PATH = "release/evidence/schema-validation-fixtures-v1.json"
 SCHEMA_VALIDATION_FIXTURE_PATHS = {
@@ -455,6 +459,8 @@ SCOPE_INPUT_PATHS = {
     **RUN_MANIFEST_INPUT_PATHS,
     **RUNNER_INPUT_PATHS,
     "release-contracts-tests": "tests/test_release_contracts.py",
+    "quality-contract-tests": "tests/test_quality_contract.py",
+    "package-metadata": "pyproject.toml",
     "docs-parity-tests": "tests/test_docs_parity.py",
     "docs-policy-readme": "README.md",
     "docs-policy-oob": "docs/oob.md",
@@ -527,6 +533,58 @@ _DOCS_POLICY_MATERIALS = (
     "docs-policy-nuclei-runtime",
     "docs-policy-private-reach-runtime",
 )
+
+QUALITY_POLICY_PATH = "release/evidence/quality-policy-v1.json"
+_QUALITY_CHECK_IDS = ("formatting", "lint", "type", "docs", "dead-code", "complexity")
+_QUALITY_SOURCE_ROSTER = ("src", "tests", "scripts")
+_QUALITY_MYPY_SOURCES = (
+    "src/quarry_recon/report_truth.py",
+    "src/quarry_recon/release_v310_05.py",
+    "src/quarry_recon/release_v310_08.py",
+    "src/quarry_recon/repository_identity.py",
+)
+
+
+def _quality_policy_contract() -> tuple[dict[str, object], ...]:
+    """Return the exact, ordered B-QUALITY non-regression checks."""
+    ruff_config = {"path": "pyproject.toml"}
+    return (
+        {"id": "formatting", "argv": ["ruff", "format", "--check", "--output-format", "json", *_QUALITY_SOURCE_ROSTER], "tool": "ruff", "version": "0.16.3", "sources": list(_QUALITY_SOURCE_ROSTER), "config": ruff_config, "expected_exit_code": 1, "budget": 266},
+        {"id": "lint", "argv": ["ruff", "check", *_QUALITY_SOURCE_ROSTER, "--select", "E4,E7,E9,F", "--output-format", "json"], "tool": "ruff", "version": "0.16.3", "sources": list(_QUALITY_SOURCE_ROSTER), "config": ruff_config, "expected_exit_code": 1, "budget": 832},
+        {"id": "type", "argv": ["mypy", "--no-incremental", "--follow-imports=skip", *_QUALITY_MYPY_SOURCES], "tool": "mypy", "version": "2.3.1", "sources": list(_QUALITY_MYPY_SOURCES), "config": ruff_config, "expected_exit_code": 0, "budget": 0},
+        {"id": "docs", "argv": ["pytest", *_DOCS_POLICY_TEST_ROSTER], "tool": "pytest", "version": "9.1.1", "sources": ["tests/test_docs_parity.py"], "config": {"path": "tests/test_docs_parity.py"}, "expected_exit_code": 0, "budget": 0},
+        {"id": "dead-code", "argv": ["ruff", "check", *_QUALITY_SOURCE_ROSTER, "--select", "F401,F841,F811,B018", "--output-format", "json"], "tool": "ruff", "version": "0.16.3", "sources": list(_QUALITY_SOURCE_ROSTER), "config": ruff_config, "expected_exit_code": 1, "budget": 126},
+        {"id": "complexity", "argv": ["ruff", "check", *_QUALITY_SOURCE_ROSTER, "--select", "C90", "--config", "lint.mccabe.max-complexity=50", "--output-format", "json"], "tool": "ruff", "version": "0.16.3", "sources": list(_QUALITY_SOURCE_ROSTER), "config": ruff_config, "expected_exit_code": 1, "budget": 12},
+    )
+
+
+def validate_quality_policy(document: object) -> dict:
+    """Validate the policy that freezes B-QUALITY's command and budget roster."""
+    doc = _object(document, "quality policy", {"checks", "release", "schema_version"})
+    _schema(doc, QUALITY_POLICY_SCHEMA, "quality policy")
+    checks = _array(doc["checks"], "quality policy.checks")
+    if len(checks) != len(_QUALITY_CHECK_IDS):
+        raise evidence.EvidenceError("quality policy must contain exactly six checks")
+    expected = _quality_policy_contract()
+    for index, (check, contract) in enumerate(zip(checks, expected, strict=True)):
+        item = _object(check, f"quality policy.checks[{index}]", {
+            "argv", "budget", "config", "expected_exit_code", "id", "sources", "tool", "version",
+        })
+        config = _object(item["config"], f"quality policy.checks[{index}].config", {"digest", "path"})
+        _digest(config["digest"], "quality policy config digest")
+        _path(config["path"], "quality policy config path")
+        if {key: item[key] for key in ("id", "argv", "tool", "version", "sources", "expected_exit_code", "budget")} != {
+            key: contract[key] for key in ("id", "argv", "tool", "version", "sources", "expected_exit_code", "budget")
+        } or config["path"] != contract["config"]["path"]:
+            raise evidence.EvidenceError("quality policy check command, tool, source roster or budget is not frozen")
+        _integer(item["budget"], "quality policy budget")
+        if type(item["expected_exit_code"]) is not int or not 0 <= item["expected_exit_code"] <= 255:
+            raise evidence.EvidenceError("quality policy expected exit code is invalid")
+    return doc
+
+
+def read_quality_policy(data: bytes) -> dict:
+    return validate_quality_policy(_canonical_reader(data, "quality policy"))
 
 _MANIFEST_TEST_SOURCES = (
     "manifest-run-contract-tests",
@@ -4321,6 +4379,159 @@ def _semantic_docs_policy(
         raise evidence.EvidenceError("docs-policy report and signed gate counts do not reconcile")
 
 
+def _semantic_quality(
+    gate: dict, bodies: Mapping[str, bytes], **context: object,
+) -> None:
+    """Recompute the frozen six-check B-QUALITY non-regression report."""
+    if gate["gate_id"] != "B-QUALITY":  # pragma: no cover - registry invariant
+        raise evidence.EvidenceError("quality verifier received the wrong gate")
+    identity = context["identity"]
+    report = context["report"]
+    scope = context["scope"]
+    thresholds = context["thresholds"]
+    inputs = context["input_bodies"]
+    if not all(isinstance(value, dict) for value in (identity, report, scope, thresholds)) or not isinstance(inputs, Mapping):
+        raise evidence.EvidenceError("quality verifier requires accepted release context")
+    signed = next((item for item in gate["artifacts"] if item["name"] == "quality-report"), None)
+    if (signed is None or signed["media_type"] != "application/json" or
+            signed["digest"] != raw_sha256(bodies["quality-report"])):
+        raise evidence.EvidenceError("quality report does not match its exact signed artifact digest")
+    doc = _object(
+        _artifact_document(bodies["quality-report"], "B-QUALITY", "quality-report"),
+        "quality report", {
+            "artifact_type", "bindings", "candidate_identity_digest", "environment",
+            "evidence_finished_at", "evidence_instance_id", "evidence_started_at", "gate_id",
+            "name", "observations", "quality_policy_digest", "quality_violations", "release",
+            "schema_version", "selection", "threshold_manifest_digest", "toolchain",
+        },
+    )
+    expected_identity = {
+        "artifact_type": "quality-report",
+        "candidate_identity_digest": evidence.canonical_digest(identity),
+        "gate_id": "B-QUALITY", "name": "quality-report", "release": RELEASE,
+        "schema_version": GATE_ARTIFACT_SCHEMA,
+    }
+    if any(doc[key] != value for key, value in expected_identity.items()):
+        raise evidence.EvidenceError("quality report has the wrong candidate, gate, release or name")
+    instances = report["instances"]
+    if len(instances) != 1 or instances[0]["lane"] != "H0-hermetic":
+        raise evidence.EvidenceError("quality report requires one exact signed H0 evidence instance")
+    instance = instances[0]
+    if (doc["evidence_instance_id"] != instance["id"] or
+            doc["environment"] != instance["environment"] or
+            doc["evidence_started_at"] != instance["started_at"] or
+            doc["evidence_finished_at"] != instance["finished_at"]):
+        raise evidence.EvidenceError("quality report does not bind its exact signed H0 instance")
+    if doc["toolchain"] != instance["toolchain"]:
+        raise evidence.EvidenceError("quality report does not bind the signed toolchain identity")
+
+    bindings = {item["name"]: item for item in scope["input_bindings"]}
+    binding_names = (
+        "docs-parity-tests", "package-metadata", "quality-policy",
+        "verification-job-map", "verification-workflow-ci",
+    )
+    expected_bindings = []
+    for name in binding_names:
+        binding = bindings.get(name)
+        body = inputs.get(name)
+        if binding is None or type(body) is not bytes or raw_sha256(body) != binding["digest"]:
+            raise evidence.EvidenceError("quality report input is absent or drifted from the frozen scope")
+        expected_bindings.append({"digest": binding["digest"], "name": name, "path": binding["path"]})
+    if doc["bindings"] != expected_bindings:
+        raise evidence.EvidenceError("quality report does not bind the exact policy/package/workflow/job-map/docs-test roster")
+    policy_body = inputs["quality-policy"]
+    policy = read_quality_policy(policy_body)
+    if doc["quality_policy_digest"] != raw_sha256(policy_body):
+        raise evidence.EvidenceError("quality report does not bind the exact frozen quality policy")
+    threshold_rows = [row for row in thresholds["thresholds"] if row["gate_id"] == "B-QUALITY"]
+    expected_threshold = {
+        "baseline_digest": None, "class": "absolute", "gate_id": "B-QUALITY", "limit": 0,
+        "metric": "quality_violations", "operator": "at_most", "statistic": "maximum", "unit": "count",
+    }
+    if threshold_rows != [expected_threshold] or doc["threshold_manifest_digest"] != raw_sha256(canonical_json_line(thresholds)):
+        raise evidence.EvidenceError("quality report does not bind the accepted zero-violation threshold policy")
+
+    observations = _array(doc["observations"], "quality report.observations")
+    if len(observations) != 6:
+        raise evidence.EvidenceError("quality report must retain exactly six observations")
+    toolchain = {item["name"]: item for item in instance["toolchain"]}
+    breaches = 0
+    for index, (observation, check) in enumerate(zip(observations, policy["checks"], strict=True)):
+        item = _object(observation, f"quality report.observations[{index}]", {
+            "argv", "breached", "budget", "config", "expected_exit_code", "exit_code", "id",
+            "observed_count", "output", "output_kind", "result_digest", "sources", "tool",
+            "version",
+        })
+        config = _object(item["config"], "quality report observation config", {"digest", "name", "path"})
+        expected_config = {
+            "digest": check["config"]["digest"], "name": "quality-config", "path": check["config"]["path"],
+        }
+        if config != expected_config or {key: item[key] for key in (
+                "argv", "budget", "expected_exit_code", "id", "sources", "tool", "version"
+        )} != {key: check[key] for key in ("argv", "budget", "expected_exit_code", "id", "sources", "tool", "version")}:
+            raise evidence.EvidenceError("quality observation check, command, tool, config, source roster or budget is not frozen")
+        config_body = inputs.get("package-metadata" if config["path"] == "pyproject.toml" else "docs-parity-tests")
+        if type(config_body) is not bytes or raw_sha256(config_body) != config["digest"]:
+            raise evidence.EvidenceError("quality observation config does not match its frozen source bytes")
+        if type(item["exit_code"]) is not int or not 0 <= item["exit_code"] <= 255:
+            raise evidence.EvidenceError("quality observation exit code is invalid")
+        output = _bounded_base64(item["output"], "quality observation canonical findings", maximum=_BUILD_LOG_OUTPUT_BYTES)
+        if item["result_digest"] != raw_sha256(output):
+            raise evidence.EvidenceError("quality observation result digest does not match retained canonical findings")
+        observed = _integer(item["observed_count"], "quality observation observed count")
+        if item["output_kind"] != "canonical-findings":
+            raise evidence.EvidenceError("quality observation output representation is not the frozen evidence form")
+        try:
+            machine_output = evidence.load_json_bytes(output, maximum=_BUILD_LOG_OUTPUT_BYTES)
+        except evidence.EvidenceError as exc:
+            raise evidence.EvidenceError("quality observation canonical findings are not parseable JSON") from exc
+        if type(machine_output) is not list:
+            raise evidence.EvidenceError("quality observation canonical findings are not an array")
+        if output != evidence.canonical_json_bytes(machine_output):
+            raise evidence.EvidenceError("quality observation canonical findings are not canonical bytes")
+        if check["id"] in {"type", "docs"}:
+            if machine_output:
+                raise evidence.EvidenceError("zero-result quality observation retains unexpected findings")
+        else:
+            normalized = []
+            for finding in machine_output:
+                if type(finding) is not list or len(finding) != 4:
+                    raise evidence.EvidenceError("quality finding must be a normalized path/code/row/column tuple")
+                path, code, row, column = finding
+                _path(path, "quality finding path")
+                _token(code, "quality finding code")
+                if (_integer(row, "quality finding row") == 0 or
+                        _integer(column, "quality finding column") == 0):
+                    raise evidence.EvidenceError("quality finding row and column must be positive")
+                if not any(path == root or path.startswith(root + "/") for root in check["sources"]):
+                    raise evidence.EvidenceError("quality finding lies outside the frozen source roster")
+                normalized.append((path, code, row, column))
+            if normalized != sorted(normalized) or len(normalized) != len(set(normalized)):
+                raise evidence.EvidenceError("quality normalized findings must be sorted and unique")
+        actual_count = len(machine_output)
+        expected_exit = 0 if actual_count == 0 else check["expected_exit_code"]
+        if item["exit_code"] != expected_exit:
+            raise evidence.EvidenceError("quality observation exit code does not match its retained finding count")
+        if observed != actual_count:
+            raise evidence.EvidenceError("quality observation count does not match retained machine output")
+        breached = observed > check["budget"]
+        if type(item["breached"]) is not bool or item["breached"] != breached:
+            raise evidence.EvidenceError("quality observation breach outcome does not match its budget")
+        if breached:
+            breaches += 1
+        signed_tool = toolchain.get(check["tool"])
+        if signed_tool is None or signed_tool["version"] != check["version"]:
+            raise evidence.EvidenceError("quality observation tool identity is absent from the signed toolchain")
+    if doc["quality_violations"] != breaches or breaches != 0:
+        raise evidence.EvidenceError("quality report breach count must satisfy the accepted zero threshold")
+    expected_selection = {
+        "collected": 6, "deselected": 0, "failed": 0, "passed": 6, "selected": 6,
+        "skipped": 0, "xfailed": 0, "xpassed": 0,
+    }
+    if doc["selection"] != expected_selection or instance["selection"] != expected_selection or gate["selection"] != expected_selection:
+        raise evidence.EvidenceError("quality signed selection must contain exactly the six passing checks")
+
+
 def _semantic_manifest(
     gate: dict, bodies: Mapping[str, bytes], **context: object,
 ) -> None:
@@ -4950,6 +5161,7 @@ SEMANTIC_VERIFIERS = MappingProxyType({
     "B-SCHEMA": _semantic_schema_validation,
     "B-DOCS-POLICY": _semantic_docs_policy,
     "B-MANIFEST": _semantic_manifest,
+    "B-QUALITY": _semantic_quality,
     "C-PACKAGE-BUILD": _semantic_package_build,
     "C-NETWORK-BOUNDARY": _semantic_network_boundary,
     "C-NET-DENY": _semantic_network_denial,
