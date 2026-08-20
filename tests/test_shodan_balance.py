@@ -27,6 +27,17 @@ MEASURED = {"plan": "dev", "query_credits": 85, "scan_credits": 100, "monitored_
                                                "monitored_ips": 16}}
 
 
+def _patch_provider(monkeypatch, response):
+    """Mock the scoped provider boundary (never process-wide urllib)."""
+    def scoped(_ctx, url, **_kwargs):
+        value = response()
+        if isinstance(value, tuple):
+            return value
+        body = value.read()
+        return body, url, getattr(value, "status", 200)
+    monkeypatch.setattr(probe.fetch, "scoped_public_provider_get", scoped)
+
+
 class TestSpendableArithmetic:
     def test_spendable_is_remaining_minus_reserve(self):
         b = shodan_balance(MEASURED, reserve=10)
@@ -165,8 +176,7 @@ class TestReserveKnob:
 
 class TestNoSecretLeaks:
     def test_the_key_never_reaches_the_reason(self, monkeypatch):
-        monkeypatch.setattr(probe.urllib.request, "urlopen",
-                            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom KEY-123456")))
+        _patch_provider(monkeypatch, lambda: (_ for _ in ()).throw(RuntimeError("boom KEY-123456")))
         monkeypatch.setattr(secrets, "load", lambda: {"shodan": "KEY-123456"})
         b = probe._read_shodan_balance("KEY-123456")
         assert "KEY-123456" not in (b.reason or "")
@@ -264,14 +274,13 @@ class TestLiveRead:
                 self._eof = True
                 return json.dumps(MEASURED).encode()
 
-        monkeypatch.setattr(probe.urllib.request, "urlopen", lambda *a, **k: _R())
+        _patch_provider(monkeypatch, lambda: _R())
         monkeypatch.setattr(probe.settings, "performance", lambda: {})
         b = probe._read_shodan_balance("KEY")
         assert b.remaining == 85 and b.allowance == 100 and b.spendable == 85
 
     def test_a_failed_read_is_unknown_not_a_crash(self, monkeypatch):
-        monkeypatch.setattr(probe.urllib.request, "urlopen",
-                            lambda *a, **k: (_ for _ in ()).throw(OSError("dns dead")))
+        _patch_provider(monkeypatch, lambda: (_ for _ in ()).throw(OSError("dns dead")))
         b = probe._read_shodan_balance("KEY")
         assert isinstance(b, ShodanBalance) and not b.known
 
@@ -339,8 +348,7 @@ class TestReadOutcomeSurvives:
 
     def _read(self, monkeypatch, exc):
         monkeypatch.setattr(probe.settings, "performance", lambda: {"SHODAN_CREDIT_RESERVE": 10})
-        monkeypatch.setattr(probe.urllib.request, "urlopen",
-                            lambda *a, **k: (_ for _ in ()).throw(exc))
+        _patch_provider(monkeypatch, lambda: (_ for _ in ()).throw(exc))
         return probe._read_shodan_balance("KEY")
 
     def test_a_bad_key_is_visible_as_auth(self, monkeypatch):
@@ -378,7 +386,7 @@ class TestReadOutcomeSurvives:
                 return b"<html>not json</html>"
 
         monkeypatch.setattr(probe.settings, "performance", lambda: {})
-        monkeypatch.setattr(probe.urllib.request, "urlopen", lambda *a, **k: _R())
+        _patch_provider(monkeypatch, lambda: _R())
         b = probe._read_shodan_balance("KEY")
         assert b.read_error == "parse" and not b.known
 
@@ -397,7 +405,7 @@ class TestReadOutcomeSurvives:
                 return json.dumps(MEASURED).encode()
 
         monkeypatch.setattr(probe.settings, "performance", lambda: {})
-        monkeypatch.setattr(probe.urllib.request, "urlopen", lambda *a, **k: _R())
+        _patch_provider(monkeypatch, lambda: _R())
         assert probe._read_shodan_balance("KEY").read_error is None
 
     def test_the_read_error_reaches_telemetry(self, tmp_path, monkeypatch):
@@ -428,8 +436,7 @@ class TestProvenRefusalBlocksSpending:
     def _read(self, monkeypatch, exc, reserve=None):
         monkeypatch.setattr(probe.settings, "performance",
                             lambda: {} if reserve is None else {"SHODAN_CREDIT_RESERVE": reserve})
-        monkeypatch.setattr(probe.urllib.request, "urlopen",
-                            lambda *a, **k: (_ for _ in ()).throw(exc))
+        _patch_provider(monkeypatch, lambda: (_ for _ in ()).throw(exc))
         return probe._read_shodan_balance("KEY")
 
     def _http(self, code, body):
@@ -494,7 +501,7 @@ class TestProvenRefusalBlocksSpending:
                 return body.encode()
 
         monkeypatch.setattr(probe.settings, "performance", lambda: {})
-        monkeypatch.setattr(probe.urllib.request, "urlopen", lambda *a, **k: _R())
+        _patch_provider(monkeypatch, lambda: _R())
         b = probe._read_shodan_balance("KEY")
         assert b.read_error == "parse" and not b.known
 
@@ -514,7 +521,7 @@ class TestProvenRefusalBlocksSpending:
                 return b'{"query_credits": 85, "usage_limits": "broken"}'
 
         monkeypatch.setattr(probe.settings, "performance", lambda: {})
-        monkeypatch.setattr(probe.urllib.request, "urlopen", lambda *a, **k: _R())
+        _patch_provider(monkeypatch, lambda: _R())
         b = probe._read_shodan_balance("KEY")
         assert b.read_error is None and b.remaining == 85 and b.may_spend is True
 
@@ -528,8 +535,7 @@ class TestAReadFailureIsNotMaskedByTheReserve:
     def _read(self, monkeypatch, exc, reserve=10):
         monkeypatch.setattr(probe.settings, "performance",
                             lambda: {"SHODAN_CREDIT_RESERVE": reserve})
-        monkeypatch.setattr(probe.urllib.request, "urlopen",
-                            lambda *a, **k: (_ for _ in ()).throw(exc))
+        _patch_provider(monkeypatch, lambda: (_ for _ in ()).throw(exc))
         return probe._read_shodan_balance("KEY")
 
     def test_transport_failure_plus_reserve_carries_both(self, monkeypatch):
@@ -554,7 +560,7 @@ class TestAReadFailureIsNotMaskedByTheReserve:
                 return b"<html>not json</html>"
 
         monkeypatch.setattr(probe.settings, "performance", lambda: {"SHODAN_CREDIT_RESERVE": 10})
-        monkeypatch.setattr(probe.urllib.request, "urlopen", lambda *a, **k: _R())
+        _patch_provider(monkeypatch, lambda: _R())
         b = probe._read_shodan_balance("KEY")
         assert b.read_error == "parse" and b.stop_kind == SHODAN_UNKNOWN_WITH_RESERVE
 

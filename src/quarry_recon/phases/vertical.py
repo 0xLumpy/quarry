@@ -13,7 +13,6 @@ import re as _re
 import shutil
 import urllib.parse
 import urllib.error
-import urllib.request
 from dataclasses import replace
 from pathlib import Path
 
@@ -143,20 +142,20 @@ CENSYS_ORG_REQUIRED = ("This endpoint requires an organization ID for API access
 
 def _provider_get(ctx, url, *, source_id, timeout, max_body, headers=None, method="GET", data=None):
     """One bounded public-provider request through the run-bound pinned transport."""
-    if ctx is None or fetch._network_scope(ctx) is None:  # compatibility seam for unbound parser/unit tests
-        request = urllib.request.Request(url, data=data, method=method, headers=headers)
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            return read_bounded(response, max_body, provider=source_id, bound=f"{source_id}_READ_LIMIT"), \
-                   int(getattr(response, "status", 200) or 200)
     response_headers = {}
-    body, final, status = fetch.scoped_get(
+    body, final, status = fetch.scoped_public_provider_get(
         ctx, url, timeout=timeout, max_body=max_body, headers=headers, method=method, data=data,
-        source_id=source_id, response_headers=response_headers,
+        source_id=source_id, response_headers=response_headers, max_redirects=0,
     )
     if body is None:
         raise RuntimeError("public-provider request refused by the run network scope")
     if not 200 <= status < 300:
-        raise urllib.error.HTTPError(final, status, f"HTTP {status}", response_headers, io.BytesIO(body))
+        # Cursors and accidental query credentials belong to request identity,
+        # never to a provider error that may be recorded by the caller.
+        safe_final = urllib.parse.urlunsplit(
+            urllib.parse.urlsplit(final)._replace(query="", fragment=""),
+        )
+        raise urllib.error.HTTPError(safe_final, status, f"HTTP {status}", response_headers, io.BytesIO(body))
     # ``scoped_get`` returns at most one byte beyond this cap; convert that sentinel into the same
     # typed bounded-read error the old response stream produced.
     return read_bounded(io.BytesIO(body), max_body, provider=source_id,

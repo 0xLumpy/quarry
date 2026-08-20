@@ -4,9 +4,11 @@ Byte ceilings default OFF; the always-on host guard is the free-space reserve (f
 """
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import threading
+import urllib.request
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -16,6 +18,68 @@ from quarry_recon import budget, contract, fetch, settings, shodan_sched
 from quarry_recon.phases import probe
 
 pytestmark = pytest.mark.offline
+
+
+def _patch_provider(monkeypatch, opener):
+    """Route a legacy request fake through the pinned provider wrapper seam."""
+    def request(url, *, data=None, method="GET", headers=None):
+        return urllib.request.Request(url, data=data, method=method, headers=headers or {})
+
+    @contextlib.contextmanager
+    def response_for(req, timeout):
+        owner = opener(req, timeout=timeout)
+        response = owner.__enter__() if hasattr(owner, "__enter__") else owner
+        try:
+            yield response
+        finally:
+            if hasattr(owner, "__exit__"):
+                owner.__exit__(None, None, None)
+            elif hasattr(response, "close"):
+                response.close()
+
+    @contextlib.contextmanager
+    def fake_walk(ctx, url, origin_host=None, *, timeout=20, data=None, method="GET",
+                  headers=None, max_redirects=5, source_id="native-http", **_kwargs):
+        req = request(url, data=data, method=method, headers=headers)
+        with response_for(req, timeout) as response:
+            yield response, url, getattr(response, "status", 200), True
+
+    def scoped_get(ctx, url, origin_host=None, *, max_body=2 * 1024 * 1024, timeout=20,
+                   data=None, method="GET", headers=None, response_headers=None, **_kwargs):
+        req = request(url, data=data, method=method, headers=headers)
+        with response_for(req, timeout) as response:
+            if response_headers is not None:
+                response_headers.update(getattr(response, "headers", {}) or {})
+            return response.read(max_body + 1), url, getattr(response, "status", 200)
+
+    def scoped_get_file(ctx, url, dest, origin_host=None, *, timeout=20, data=None,
+                        method="GET", headers=None, max_redirects=0, chunk=1024 * 1024,
+                        deadline_s=300.0, policy=None, governor=None, source_id="native-http",
+                        response_headers=None, metadata_url=None):
+        from quarry_recon import fetch
+        result = fetch._scoped_get_file_legacy(
+            ctx, url, dest, origin_host, timeout=timeout, data=data, method=method,
+            headers=headers, max_redirects=max_redirects, chunk=chunk, deadline_s=deadline_s,
+            policy=policy, governor=governor, source_id=source_id,
+            response_headers=response_headers, metadata_url=metadata_url,
+        )
+        receipt = Path(dest).with_name(Path(dest).name + fetch._RECEIPT_SUFFIX)
+        if receipt.exists():
+            doc = json.loads(receipt.read_text())
+            doc.setdefault("kind", "acquisition")
+            receipt.write_text(json.dumps(doc))
+        acquisition, _final, _status = result
+        if acquisition is not None and not acquisition.complete and acquisition.truncation is not None:
+            raise contract.AcquisitionTruncated(
+                acquisition.error or "acquisition truncated",
+                bytes_written=acquisition.bytes, partial=acquisition.partial,
+                limit_kind=acquisition.truncation.kind, limit_bytes=acquisition.truncation.limit,
+            )
+        return result
+
+    monkeypatch.setattr(fetch, "_walk", fake_walk)
+    monkeypatch.setattr(fetch, "scoped_public_provider_get", scoped_get)
+    monkeypatch.setattr(fetch, "scoped_public_provider_get_file", scoped_get_file)
 
 
 @pytest.fixture(autouse=True)
@@ -247,7 +311,7 @@ class TestAdmitBeforeContact:
         assert acq.contacted is False and acq.disposition == "budget-invalid" and status == 0
 
     def test_a_paid_shodan_open_is_refused_before_spending(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(probe.urllib.request, "urlopen",
+        _patch_provider(monkeypatch,
                             lambda *a, **k: pytest.fail("an exhausted budget must not open the paid request"))
         monkeypatch.setattr(probe, "default_governor",
                             lambda: contract.DiskGovernor(run_max=5, run_streamed=5, reserve_bytes=0))
@@ -371,7 +435,7 @@ class TestReceiptTruncationIsTyped:
 
 class TestPaidShodanTruncationOwnership:
     def test_probe_reports_the_partial_bytes_not_zero(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(probe.urllib.request, "urlopen", lambda req, timeout=20: _CM(_Infinite()))
+        _patch_provider(monkeypatch, lambda req, timeout=20: _CM(_Infinite()))
         monkeypatch.setattr(probe, "default_governor",
                             lambda: contract.DiskGovernor(response_max=4096, reserve_bytes=0))
         sink = tmp_path / "raw" / "page.json"
@@ -384,7 +448,7 @@ class TestPaidShodanTruncationOwnership:
 
     def test_a_truncated_paid_page_carries_its_sha256(self, tmp_path, monkeypatch):
         import hashlib
-        monkeypatch.setattr(probe.urllib.request, "urlopen", lambda req, timeout=20: _CM(_Infinite()))
+        _patch_provider(monkeypatch, lambda req, timeout=20: _CM(_Infinite()))
         monkeypatch.setattr(probe, "default_governor",
                             lambda: contract.DiskGovernor(response_max=4096, reserve_bytes=0))
         _rows, _total, err = probe._shodan_page("K", "ssl", "acme.com", 1, sink=tmp_path / "raw" / "p.json")
@@ -398,7 +462,7 @@ class TestPaidShodanTruncationOwnership:
         def _raise_http(req, timeout=20):
             raise urllib.error.HTTPError("https://api.shodan.io/x", 500, "server error", {},
                                          io.BytesIO(b"E" * 100000))
-        monkeypatch.setattr(probe.urllib.request, "urlopen", _raise_http)
+        _patch_provider(monkeypatch, _raise_http)
         monkeypatch.setattr(probe, "default_governor",
                             lambda: contract.DiskGovernor(response_max=4096, reserve_bytes=0))
         _rows, _total, err = probe._shodan_page("K", "ssl", "acme.com", 1, sink=tmp_path / "raw" / "p.json")
@@ -407,7 +471,7 @@ class TestPaidShodanTruncationOwnership:
 
     def test_a_paid_publish_failure_reports_the_evidence_not_zeros(self, tmp_path, monkeypatch):
         import hashlib
-        monkeypatch.setattr(probe.urllib.request, "urlopen", lambda req, timeout=20: _CM(io.BytesIO(b"P" * 24)))
+        _patch_provider(monkeypatch, lambda req, timeout=20: _CM(io.BytesIO(b"P" * 24)))
         monkeypatch.setattr(probe, "default_governor", lambda: contract.DiskGovernor(reserve_bytes=0))
         monkeypatch.setattr(contract._os, "replace", lambda src, dst: (_ for _ in ()).throw(OSError("no")))
         _rows, _total, err = probe._shodan_page("K", "ssl", "acme.com", 1, sink=tmp_path / "raw" / "p.json")

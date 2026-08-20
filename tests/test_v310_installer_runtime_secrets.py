@@ -1220,6 +1220,18 @@ class _ShodanResponse:
         return False
 
 
+def _patch_provider(monkeypatch, responses, seen=None):
+    def scoped(_ctx, url, **_kwargs):
+        if seen is not None:
+            seen.append((
+                _kwargs.get("method", "GET"), url,
+                dict(_kwargs.get("headers") or {}), _kwargs.get("timeout"),
+            ))
+        response = responses() if callable(responses) else responses.pop(0)
+        return response.read(), url, getattr(response, "status", 200)
+    monkeypatch.setattr(vertical.fetch, "scoped_public_provider_get", scoped)
+
+
 def test_shodan_dns_adapter_is_in_process_strict_and_bounded(monkeypatch):
     canary = "V310SHODANKEY00000000000000000000"
     pages = [
@@ -1228,31 +1240,27 @@ def test_shodan_dns_adapter_is_in_process_strict_and_bounded(monkeypatch):
     ]
     requests = []
 
-    def urlopen(request, timeout):
-        assert timeout == 9
-        requests.append((request.get_method(), request.full_url, dict(request.header_items())))
+    def responses():
         return pages.pop(0)
 
-    monkeypatch.setattr(vertical.urllib.request, "urlopen", urlopen)
+    _patch_provider(monkeypatch, responses, requests)
     result = vertical._shodan_domain("Acme.Example", canary, timeout=9, max_pages=5)
 
     assert result == {"www.acme.example", "api.acme.example", "mail.acme.example"}
     assert result.pages == 2 and not result.partial and result.cursor is None
-    assert [url for _method, url, _headers in requests] == [
+    assert [url for _method, url, _headers, _timeout in requests] == [
         f"https://api.shodan.io/dns/domain/Acme.Example?key={canary}&page=1",
         f"https://api.shodan.io/dns/domain/Acme.Example?key={canary}&page=2",
     ]
+    assert all(timeout == 9 for _method, _url, _headers, timeout in requests)
 
 
 def test_shodan_dns_failures_never_serialize_the_query_credential(monkeypatch):
     canary = "V310SHODANKEY00000000000000000000"
 
-    monkeypatch.setattr(
-        vertical.urllib.request, "urlopen",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+    _patch_provider(monkeypatch, lambda: (_ for _ in ()).throw(
             OSError(f"request failed for ?key={canary}"),
-        ),
-    )
+        ))
     with pytest.raises(RuntimeError) as caught:
         vertical._shodan_domain("acme.example", canary)
     assert canary not in str(caught.value) and canary not in repr(caught.value)

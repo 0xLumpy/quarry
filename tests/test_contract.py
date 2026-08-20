@@ -218,16 +218,12 @@ class TestProviderSchemaDrift:
     """review#3: a 200 with an error/schema-drift body must RAISE (-> run_provider FAILED), never be laundered
     into a clean EMPTY that C10b would skip after a real failure."""
 
-    class _Resp:
-        def __init__(self, body): self._b = body
-        def __enter__(self): return self
-        def __exit__(self, *a): return False
-        def read(self, n=None): return self._b
-
     def _patch(self, monkeypatch, body):
-        import urllib.request
         from quarry_recon.phases import vertical
-        monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=30: self._Resp(body))
+        monkeypatch.setattr(
+            vertical.fetch, "scoped_public_provider_get",
+            lambda _ctx, url, **_kwargs: (body, url, 200),
+        )
         return vertical
 
     def test_crtsh_non_list_root_raises(self, monkeypatch):

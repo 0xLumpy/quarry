@@ -10,10 +10,13 @@ Hitting the page cap with a live cursor is TRUNCATION → a PARTIAL ProviderResu
 PARTIAL + a coverage gap (never a clean SUCCESS). cloud._check separates definitive absence (404) from an
 INDETERMINATE probe (transport/other) and emits STRUCTURED, every-run coverage the verdict can see.
 """
+import contextlib
 import io
 import json
+import pathlib
 import socket
 import urllib.error
+import urllib.request
 
 import pytest
 
@@ -21,6 +24,65 @@ from quarry_recon import contract, events
 from quarry_recon.contract import ProviderResult
 
 pytestmark = pytest.mark.offline
+
+
+def _patch_provider(monkeypatch, opener):
+    """Route a legacy request fake through the pinned provider wrapper seam."""
+    from quarry_recon import fetch
+
+    def request(url, *, data=None, method="GET", headers=None):
+        return urllib.request.Request(url, data=data, method=method, headers=headers or {})
+
+    @contextlib.contextmanager
+    def response_for(req, timeout):
+        owner = opener(req, timeout=timeout)
+        response = owner.__enter__() if hasattr(owner, "__enter__") else owner
+        try:
+            yield response
+        finally:
+            if hasattr(owner, "__exit__"):
+                owner.__exit__(None, None, None)
+            elif hasattr(response, "close"):
+                response.close()
+
+    @contextlib.contextmanager
+    def fake_walk(ctx, url, origin_host=None, *, timeout=20, data=None, method="GET",
+                  headers=None, max_redirects=5, source_id="native-http", **_kwargs):
+        req = request(url, data=data, method=method, headers=headers)
+        with response_for(req, timeout) as response:
+            yield response, url, getattr(response, "status", 200), True
+
+    def scoped_get(ctx, url, origin_host=None, *, max_body=fetch.DEFAULT_MAX_BODY,
+                   timeout=20, data=None, method="GET", headers=None, response_headers=None,
+                   **_kwargs):
+        req = request(url, data=data, method=method, headers=headers)
+        with response_for(req, timeout) as response:
+            if response_headers is not None:
+                response_headers.update(getattr(response, "headers", {}) or {})
+            return response.read(max_body + 1), url, getattr(response, "status", 200)
+
+    def scoped_get_file(ctx, url, dest, origin_host=None, *, timeout=20, data=None,
+                        method="GET", headers=None, max_redirects=0, chunk=1024 * 1024,
+                        deadline_s=300.0, policy=None, governor=None, source_id="native-http",
+                        response_headers=None, metadata_url=None):
+        # Keep the production stream/receipt/governor implementation in the path; only its
+        # transport walk is replaced with the scripted response.
+        result = fetch._scoped_get_file_legacy(
+            ctx, url, dest, origin_host, timeout=timeout, data=data, method=method,
+            headers=headers, max_redirects=max_redirects, chunk=chunk, deadline_s=deadline_s,
+            policy=policy, governor=governor, source_id=source_id,
+            response_headers=response_headers, metadata_url=metadata_url,
+        )
+        receipt = pathlib.Path(dest).with_name(pathlib.Path(dest).name + fetch._RECEIPT_SUFFIX)
+        if receipt.exists():
+            doc = json.loads(receipt.read_text())
+            doc.setdefault("kind", "acquisition")
+            receipt.write_text(json.dumps(doc))
+        return result
+
+    monkeypatch.setattr(fetch, "_walk", fake_walk)
+    monkeypatch.setattr(fetch, "scoped_public_provider_get", scoped_get)
+    monkeypatch.setattr(fetch, "scoped_public_provider_get_file", scoped_get_file)
 
 
 class _Resp:
@@ -58,7 +120,7 @@ class TestCertspotterPagination:
             after = req.full_url.split("after=")[1].split("&")[0] if "after=" in req.full_url else None
             assert "limit=" not in req.full_url                # no undocumented limit param
             return _Resp(json.dumps(pages[after]).encode())
-        monkeypatch.setattr(vertical.urllib.request, "urlopen", fake)
+        _patch_provider(monkeypatch, fake)
         return vertical
 
     def test_follows_after_until_empty_array(self, monkeypatch):
@@ -79,7 +141,7 @@ class TestCertspotterPagination:
         def fake(req, timeout=30):
             n["i"] += 1
             return _Resp(json.dumps([{"id": str(n["i"]), "dns_names": [f"h{n['i']}.acme.com"]}]).encode())
-        monkeypatch.setattr(vertical.urllib.request, "urlopen", fake)
+        _patch_provider(monkeypatch, fake)
         r = vertical._certspotter("acme.com", max_pages=3)
         assert isinstance(r, ProviderResult) and r.partial and r.pages == 3 and n["i"] == 3
 
@@ -178,7 +240,7 @@ class TestCensysPagination:
             if seen is not None:
                 seen.append(tok)
             return _Resp(json.dumps(pages[tok]).encode())
-        monkeypatch.setattr(vertical.urllib.request, "urlopen", fake)
+        _patch_provider(monkeypatch, fake)
         return vertical
 
     def test_follows_page_token_until_absent(self, monkeypatch):
@@ -201,7 +263,7 @@ class TestCensysPagination:
             n["i"] += 1
             return _Resp(json.dumps({"result": {"hits": [{"certificate_v1": {"resource": {"names": [f"h{n['i']}.acme.com"]}}}],
                                                 "links": {"next": f"t{n['i']}"}}}).encode())
-        monkeypatch.setattr(vertical.urllib.request, "urlopen", fake)
+        _patch_provider(monkeypatch, fake)
         r = vertical._censys({"token": "t", "org": "o"}, "acme.com", max_pages=4)
         assert isinstance(r, ProviderResult) and r.partial and r.pages == 4
 
@@ -235,7 +297,7 @@ class TestCensysPagination:
         def fake(req, timeout=30):
             captured.update(json.loads(req.data.decode()))
             return _Resp(json.dumps({"result": {"hits": [{"certificate_v1": {"resource": {"names": ["a.acme.com"]}}}]}}).encode())
-        monkeypatch.setattr(vertical.urllib.request, "urlopen", fake)
+        _patch_provider(monkeypatch, fake)
         vertical._censys({"token": "t", "org": "o"}, "acme.com", max_pages=1)
         assert captured.get("fields") == ["cert.names"]       # request only the field we parse
 
@@ -257,7 +319,7 @@ class TestCensysPagination:
             if n["i"] == 1:
                 return _Resp(json.dumps({"result": {"hits": [{"certificate_v1": {"resource": {"names": ["a.acme.com"]}}}], "links": {"next": "t1"}}}).encode())
             raise urllib.error.HTTPError("u", 429, "rate", {}, None)   # page 2 fails
-        monkeypatch.setattr(vertical.urllib.request, "urlopen", fake)
+        _patch_provider(monkeypatch, fake)
         r = vertical._censys({"token": "t", "org": "o"}, "acme.com", max_pages=5)
         assert isinstance(r, ProviderResult) and r.partial and "a.acme.com" in r and r.error_class == "rate_limit"
 
@@ -267,7 +329,7 @@ class TestCensysPagination:
 
         def fake(req, timeout=30):
             raise urllib.error.HTTPError("u", 403, "forbidden", {}, None)
-        monkeypatch.setattr(vertical.urllib.request, "urlopen", fake)
+        _patch_provider(monkeypatch, fake)
         with pytest.raises(urllib.error.HTTPError):
             vertical._censys({"token": "t", "org": "o"}, "acme.com", max_pages=5)
 
@@ -692,7 +754,7 @@ class TestShodanPivot:
 
         def auth_fail(req, timeout=20):
             raise urllib.error.HTTPError("u", 401, "unauthorized", {}, None)
-        monkeypatch.setattr(probe.urllib.request, "urlopen", _with_balance(auth_fail))
+        _patch_provider(monkeypatch, _with_balance(auth_fail))
         ctx, _ = self._ctx(tmp_path)
         # review-r3#4: ALL pivots fail with no results -> RAISE (run_provider records FAILED + classified),
         # never a silent clean EMPTY. Coverage is still emitted before the raise.
@@ -711,7 +773,7 @@ class TestShodanPivot:
         from quarry_recon.phases import probe
         from quarry_recon import contract
         monkeypatch.setattr(probe.settings, "raw", lambda k, d=None: 1)
-        monkeypatch.setattr(probe.urllib.request, "urlopen", _with_balance(lambda req, timeout=20: (_ for _ in ()).throw(urllib.error.HTTPError("u", 429, "rate", {}, None))))
+        _patch_provider(monkeypatch, _with_balance(lambda req, timeout=20: (_ for _ in ()).throw(urllib.error.HTTPError("u", 429, "rate", {}, None))))
         ctx, _ = self._ctx(tmp_path)
         out = contract.run_provider("probe.favicon", lambda: probe._shodan_pivot(
             ctx, "k", ["h1"], "http.favicon.hash", "favicon-shodan", "probe.favicon", "{}"))
@@ -728,7 +790,7 @@ class TestShodanPivot:
             if "h_bad" in req.full_url:
                 raise urllib.error.HTTPError("u", 429, "rate", {}, None)
             return _Resp(json.dumps({"total": 1, "matches": [{"hostnames": ["real.acme.com"]}]}).encode())
-        monkeypatch.setattr(probe.urllib.request, "urlopen", _with_balance(mixed))
+        _patch_provider(monkeypatch, _with_balance(mixed))
         ctx, _ = self._ctx(tmp_path)
         r = probe._shodan_pivot(ctx, "k", ["h_good", "h_bad"], "http.favicon.hash", "favicon-shodan", "probe.favicon", "{}")
         assert isinstance(r, ProviderResult) and r.partial and r.error_class == "rate_limit" and "real.acme.com" in r
@@ -741,7 +803,7 @@ class TestShodanPivot:
             # total 150 but page 1 only returns 100 -> truncated at 1 page (credit-bounded)
             return _Resp(json.dumps({"total": 150,
                                      "matches": [{"hostnames": [f"h{i}.acme.com"]} for i in range(100)]}).encode())
-        monkeypatch.setattr(probe.urllib.request, "urlopen", _with_balance(big))
+        _patch_provider(monkeypatch, _with_balance(big))
         ctx, added = self._ctx(tmp_path)
         probe._shodan_pivot(ctx, "k", ["hashX"], "http.favicon.hash", "favicon-shodan", "probe.favicon", "{}")
         # B1.4: our page budget is counted in PAGES (total 150 = 2 pages, we bought 1). Still a CAP —
@@ -754,7 +816,7 @@ class TestShodanPivot:
         # response HAD it. Gating found on the new-key return made a clean rerun a false EMPTY.
         from quarry_recon.phases import probe
         monkeypatch.setattr(probe.settings, "raw", lambda k, d=None: 1)
-        monkeypatch.setattr(probe.urllib.request, "urlopen", _with_balance(lambda req, timeout=20: _Resp(json.dumps({"total": 1, "matches": [{"hostnames": ["seen.acme.com"]}]}).encode())))
+        _patch_provider(monkeypatch, _with_balance(lambda req, timeout=20: _Resp(json.dumps({"total": 1, "matches": [{"hostnames": ["seen.acme.com"]}]}).encode())))
         ctx, added = self._ctx(tmp_path)
         monkeypatch.setattr(ctx.run, "add", lambda e, r: False)   # store already has it (dedup -> False)
         found = probe._shodan_pivot(ctx, "k", ["hX"], "http.favicon.hash", "favicon-shodan", "probe.favicon", "{}")
@@ -766,7 +828,7 @@ class TestShodanPivot:
         from quarry_recon.phases import probe
         monkeypatch.setattr(probe.settings, "raw", lambda k, d=None: 1)
         big = [{"hostnames": [f"h{i}.acme.com"], "pad": "x" * 4096} for i in range(1000)]   # > 2 MiB serialized
-        monkeypatch.setattr(probe.urllib.request, "urlopen", _with_balance(lambda req, timeout=20: _Resp(json.dumps({"total": 1000, "matches": big}).encode())))
+        _patch_provider(monkeypatch, _with_balance(lambda req, timeout=20: _Resp(json.dumps({"total": 1000, "matches": big}).encode())))
         ctx, _ = self._ctx(tmp_path)
         found = probe._shodan_pivot(ctx, "k", ["hX"], "http.favicon.hash", "favicon-shodan", "probe.favicon", "{}")
         # B1.4: evidence is now ONE ARTIFACT PER PAGE, published by the coordinator and content-bound in
@@ -803,7 +865,7 @@ class TestShodanPivot:
         def big(req, timeout=20):
             ms = [{"hostnames": ["real.acme.com"]}] + [{"hostnames": [f"junk{i}.example.org"]} for i in range(99)]
             return _Resp(json.dumps({"total": 5000, "matches": ms}).encode())   # total>200, once dropped everything
-        monkeypatch.setattr(probe.urllib.request, "urlopen", _with_balance(big))
+        _patch_provider(monkeypatch, _with_balance(big))
         ctx, added = self._ctx(tmp_path)
         found = probe._shodan_pivot(ctx, "k", ["hashX"], "http.favicon.hash", "favicon-shodan", "probe.favicon", "{}")
         assert "real.acme.com" in found                       # in-scope kept despite the huge total
@@ -825,7 +887,7 @@ class TestShodanPivot:
             return _Resp(json.dumps({"total": 0, "matches": []}).encode())
 
         monkeypatch.setattr(probe.settings, "raw", lambda k, d=None: 1)
-        monkeypatch.setattr(probe.urllib.request, "urlopen", _with_balance(counted, credits=1000))
+        _patch_provider(monkeypatch, _with_balance(counted, credits=1000))
         ctx, _ = self._ctx(tmp_path)
         probe._shodan_pivot(ctx, "k", [f"h{i}" for i in range(30)], "http.favicon.hash",
                             "favicon-shodan", "probe.favicon", "{}")
@@ -843,7 +905,7 @@ class TestShodanPivot:
         monkeypatch.setattr(probe.settings, "concurrency", lambda k, d=None: 0)
         monkeypatch.setattr(probe.secrets, "shodan", lambda: key)
         monkeypatch.setattr(secrets, "shodan", lambda: key)
-        monkeypatch.setattr(probe.urllib.request, "urlopen", _with_balance(responder, credits=credits))
+        _patch_provider(monkeypatch, _with_balance(responder, credits=credits))
         ctx, _added = self._ctx(tmp_path)
         ctx.run.read = lambda e: ([{"favicon": "F1"}] if e == "live"
                                   else [{"sha1": "C1"}] if e == "certificate" else [])
@@ -917,7 +979,7 @@ class TestShodanPivot:
         monkeypatch.setattr(probe.settings, "concurrency", lambda k, d=None: 0)
         monkeypatch.setattr(probe.secrets, "shodan", lambda: "KEY")
         monkeypatch.setattr(secrets, "shodan", lambda: "KEY")
-        monkeypatch.setattr(probe.urllib.request, "urlopen", _with_balance(
+        _patch_provider(monkeypatch, _with_balance(
             lambda req, timeout=20: _Resp(json.dumps({"total": 1, "matches": []}).encode())))
         ctx, _ = self._ctx(tmp_path)
         ctx.run.read = lambda e: [{"favicon": "F1"}] if e == "live" else []   # no certificates
@@ -944,7 +1006,7 @@ class TestShodanPivot:
 
         from quarry_recon.phases import probe
         monkeypatch.setattr(probe.settings, "concurrency", lambda k, d=None: 0)
-        monkeypatch.setattr(probe.urllib.request, "urlopen", _with_balance(one_credit, credits=1))
+        _patch_provider(monkeypatch, _with_balance(one_credit, credits=1))
         ctx, _ = self._ctx(tmp_path)
         r = probe._shodan_pivot(ctx, "k", ["hX"], "http.favicon.hash", "favicon-shodan",
                                 "probe.favicon", "{}")
@@ -964,7 +1026,7 @@ class TestShodanPivot:
         events.configure(run.dir)
         monkeypatch.setattr(probe.settings, "concurrency", lambda k, d=None: 0)
         monkeypatch.setattr(probe, "_shodan_reserve_setting", lambda: (5, True))   # withhold 5 of 6
-        monkeypatch.setattr(probe.urllib.request, "urlopen", _with_balance(
+        _patch_provider(monkeypatch, _with_balance(
             lambda req, timeout=20: _Resp(json.dumps({"total": 500, "matches": []}).encode()),
             credits=6))
         ctx.run = run
@@ -982,7 +1044,7 @@ class TestShodanPivot:
     def _oos_run(self, monkeypatch, tmp_path, hosts, *, pivots=("hX",)):
         from quarry_recon.phases import probe
         monkeypatch.setattr(probe.settings, "concurrency", lambda k, d=None: 0)
-        monkeypatch.setattr(probe.urllib.request, "urlopen", _with_balance(
+        _patch_provider(monkeypatch, _with_balance(
             lambda req, timeout=20: _Resp(json.dumps(
                 {"total": len(hosts), "matches": [{"hostnames": [h]} for h in hosts]}).encode()),
             credits=50))
@@ -997,7 +1059,7 @@ class TestShodanPivot:
         contains a dot, while null and 123 vanished before any counter moved."""
         from quarry_recon.phases import probe
         for bad in ([{"x": "a.evil.com"}], [None], [123], ["ok.evil.com", None]):
-            monkeypatch.setattr(probe.urllib.request, "urlopen", _with_balance(
+            _patch_provider(monkeypatch, _with_balance(
                 lambda req, timeout=20, b=bad: _Resp(json.dumps(
                     {"total": 1, "matches": [{"hostnames": b}]}).encode())))
             ms, total, err = probe._shodan_page("k", "http.favicon.hash", "hX", 1,
@@ -1019,7 +1081,7 @@ class TestShodanPivot:
         entity — so "what became a subdomain" is directly observable."""
         from quarry_recon.phases import probe
         monkeypatch.setattr(probe.settings, "concurrency", lambda k, d=None: 0)
-        monkeypatch.setattr(probe.urllib.request, "urlopen", _with_balance(
+        _patch_provider(monkeypatch, _with_balance(
             lambda req, timeout=20: _Resp(json.dumps(
                 {"total": len(hosts), "matches": [{"hostnames": [h]} for h in hosts]}).encode()),
             credits=50))
@@ -1224,7 +1286,7 @@ class TestShodanPivot:
             return _Resp(json.dumps({"total": 50, "matches": []}).encode())
 
         monkeypatch.setattr(probe.settings, "concurrency", lambda k, d=None: 0)
-        monkeypatch.setattr(probe.urllib.request, "urlopen", route)
+        _patch_provider(monkeypatch, route)
         ctx, added = self._ctx(tmp_path)
         probe._shodan_pivot(ctx, "k", list(pivots), "http.favicon.hash", "favicon-shodan",
                             "probe.favicon", "{}")
@@ -1259,7 +1321,7 @@ class TestShodanPivot:
         monkeypatch.setattr(probe.settings, "concurrency", lambda k, d=None: 0)
         monkeypatch.setattr(probe.secrets, "shodan", lambda: "KEY")
         monkeypatch.setattr(secrets, "shodan", lambda: "KEY")
-        monkeypatch.setattr(probe.urllib.request, "urlopen", route)
+        _patch_provider(monkeypatch, route)
         ctx, _ = self._ctx(tmp_path)
         ctx.run.read = lambda e: ([{"favicon": "F1"}, {"favicon": "F2"}] if e == "live"
                                   else [{"sha1": "C1"}, {"sha1": "C2"}] if e == "certificate" else [])
@@ -1465,7 +1527,7 @@ class TestShodanPivot:
         monkeypatch.setattr(probe.settings, "concurrency", lambda k, d=None: 0)
         monkeypatch.setattr(probe.secrets, "shodan", lambda: "KEY")
         monkeypatch.setattr(secrets, "shodan", lambda: "KEY")
-        monkeypatch.setattr(probe.urllib.request, "urlopen", route)
+        _patch_provider(monkeypatch, route)
         ctx, _ = self._ctx(tmp_path)
         ctx.run.read = lambda e: ([{"favicon": "F1"}] if e == "live"
                                   else [{"sha1": "C1"}] if e == "certificate" else [])
@@ -1504,7 +1566,7 @@ class TestShodanPivot:
         monkeypatch.setattr(probe.settings, "concurrency", lambda k, d=None: 0)
         monkeypatch.setattr(probe.secrets, "shodan", lambda: "KEY")
         monkeypatch.setattr(secrets, "shodan", lambda: "KEY")
-        monkeypatch.setattr(probe.urllib.request, "urlopen", _with_balance(
+        _patch_provider(monkeypatch, _with_balance(
             lambda req, timeout=20: _Resp(json.dumps({"total": 1, "matches": []}).encode())))
         monkeypatch.setattr(probe, "_size_pivots",
                             lambda *a, **k: (_ for _ in ()).throw(RuntimeError("setup exploded")))
@@ -1659,7 +1721,7 @@ class TestShodanPivot:
                                      "matches": [{"hostnames": [f"p{page}h{i}.acme.com"]}
                                                  for i in range(n)]}).encode())
 
-        monkeypatch.setattr(probe.urllib.request, "urlopen", _with_balance(counted, credits=10))
+        _patch_provider(monkeypatch, _with_balance(counted, credits=10))
         ctx, _ = self._ctx(tmp_path)
         probe._shodan_pivot(ctx, "k", ["hX"], "http.favicon.hash", "favicon-shodan", "probe.favicon",
                             "{}")
@@ -1683,7 +1745,7 @@ class TestShodanPivot:
         monkeypatch.setattr(probe.settings, "concurrency", lambda k, d=None: 0)
         monkeypatch.setattr(secrets, "shodan", lambda: "KEY")
         monkeypatch.setattr(probe.secrets, "shodan", lambda: "KEY")
-        monkeypatch.setattr(probe.urllib.request, "urlopen", _with_balance(counted, credits=2))
+        _patch_provider(monkeypatch, _with_balance(counted, credits=2))
         ctx, _added = self._ctx(tmp_path)
         ctx.run.read = lambda e: ([{"favicon": "F1"}] if e == "live"
                                   else [{"sha1": "C1"}] if e == "certificate" else [])
@@ -1707,7 +1769,7 @@ class TestShodanPivot:
         monkeypatch.setattr(probe.settings, "concurrency", lambda k, d=None: 0)
         monkeypatch.setattr(probe.secrets, "shodan", lambda: "KEY")
         monkeypatch.setattr(secrets, "shodan", lambda: "KEY")
-        monkeypatch.setattr(probe.urllib.request, "urlopen", _with_balance(counted, credits=1))
+        _patch_provider(monkeypatch, _with_balance(counted, credits=1))
         ctx, _added = self._ctx(tmp_path)
         ctx.run.read = lambda e: ([{"favicon": "F1"}] if e == "live"
                                   else [{"sha1": "C1"}] if e == "certificate" else [])
@@ -1727,7 +1789,7 @@ class TestShodanPivot:
         # crash and never a laundered clean empty.
         from quarry_recon.phases import probe
         monkeypatch.setattr(probe.settings, "raw", lambda k, d=None: 1)
-        monkeypatch.setattr(probe.urllib.request, "urlopen", _with_balance(lambda req, timeout=20: _Resp(json.dumps(body).encode())))
+        _patch_provider(monkeypatch, _with_balance(lambda req, timeout=20: _Resp(json.dumps(body).encode())))
         ctx, added = self._ctx(tmp_path)
         with pytest.raises(ValueError):
             probe._shodan_pivot(ctx, "k", ["hashX"], "http.favicon.hash", "favicon-shodan", "probe.favicon", "{}")
@@ -1746,7 +1808,7 @@ class TestShodanPivot:
             if page == 1:
                 return _Resp(json.dumps({"total": 500, "matches": [{"hostnames": [f"h{i}.acme.com"]} for i in range(100)]}).encode())
             raise urllib.error.HTTPError("u", 429, "rate", {}, None)   # page 2 fails
-        monkeypatch.setattr(probe.urllib.request, "urlopen", _with_balance(paged))
+        _patch_provider(monkeypatch, _with_balance(paged))
         # B1.4: the adapter fetches ONE page and never raises — it hands the coordinator a classified
         # error instead, and the coordinator decides what that costs.
         ms, total, err = probe._shodan_page("k", "http.favicon.hash", "hX", 1, sink=tmp_path / "p1.json")
@@ -1779,7 +1841,7 @@ class TestShodanPivot:
             if "h_bad" in req.full_url:
                 raise urllib.error.HTTPError("u", 429, "rate", {}, None)
             return _Resp(json.dumps({"total": 1, "matches": [{"hostnames": ["real.acme.com"]}]}).encode())
-        monkeypatch.setattr(probe.urllib.request, "urlopen", _with_balance(mixed))
+        _patch_provider(monkeypatch, _with_balance(mixed))
         ctx, _ = self._ctx(tmp_path)
         contract.run_provider("probe.favicon", lambda: probe._shodan_pivot(
             ctx, "k", ["h_good", "h_bad"], "http.favicon.hash", "favicon-shodan", "probe.favicon", "{}"),
@@ -1799,7 +1861,7 @@ class TestShodanPivot:
             page = int(req.full_url.split("page=")[1])
             ms = [{"hostnames": [f"p{page}h{i}.acme.com"]} for i in range(100 if page == 1 else 50)]
             return _Resp(json.dumps({"total": 150, "matches": ms}).encode())
-        monkeypatch.setattr(probe.urllib.request, "urlopen", _with_balance(paged))
+        _patch_provider(monkeypatch, _with_balance(paged))
         ctx, added = self._ctx(tmp_path)
         n = probe._shodan_pivot(ctx, "k", ["hashX"], "http.favicon.hash", "favicon-shodan", "probe.favicon", "{}")
         assert calls["n"] == 2 and len(n) == 150                   # both pages read, all 150 hosts ingested
@@ -1815,7 +1877,7 @@ class TestShodanPivot:
         monkeypatch.setattr(probe.secrets, "shodan", lambda: "KEY")
         monkeypatch.setattr(secrets, "shodan", lambda: "KEY")
         body = json.dumps({"total": 1, "matches": [{"hostnames": [hostname]}]}).encode()
-        monkeypatch.setattr(probe.urllib.request, "urlopen",
+        _patch_provider(monkeypatch,
                             _with_balance(lambda req, timeout=20: _Resp(body), credits=100))
         if save_raises:
             real_save = budget.Ledger.save
@@ -1877,7 +1939,7 @@ class TestShodanPivot:
             monkeypatch.setattr(probe.secrets, "shodan", lambda: "KEY")
             monkeypatch.setattr(secrets, "shodan", lambda: "KEY")
             body = json.dumps({"total": 1, "matches": [{"hostnames": ["a.acme.com"]}]}).encode()
-            monkeypatch.setattr(probe.urllib.request, "urlopen",
+            _patch_provider(monkeypatch,
                                 _with_balance(lambda req, timeout=20: _Resp(body), credits=100))
             for target, attr, value in kw.get("patches", ()):
                 monkeypatch.setattr(target, attr, value)
@@ -1901,7 +1963,7 @@ class TestShodanPivot:
         monkeypatch.setattr(probe.secrets, "shodan", lambda: "KEY")
         monkeypatch.setattr(secrets, "shodan", lambda: "KEY")
         body = json.dumps({"total": 1, "matches": [{"hostnames": ["a.acme.com"]}]}).encode()
-        monkeypatch.setattr(probe.urllib.request, "urlopen",
+        _patch_provider(monkeypatch,
                             _with_balance(lambda req, timeout=20: _Resp(body), credits=100))
         # review-B1.7a#9: patch `_append`, never `record`. `record` updates the in-memory ownership map
         # and THEN appends, and that order is the whole point of the durability handshake — replacing it
@@ -2026,7 +2088,7 @@ class TestShodanPivot:
                                             io.BytesIO(b"<html>bad key</html>"))
             return _Resp(body)
 
-        monkeypatch.setattr(probe.urllib.request, "urlopen", urlopen)
+        _patch_provider(monkeypatch, urlopen)
         ctx, _ = self._ctx(tmp_path)
         ctx.run.read = lambda e: [{"favicon": "F1"}] if e == "live" else []
         probe._shodan_pivots(ctx)
@@ -2052,7 +2114,7 @@ class TestShodanPivot:
         monkeypatch.setattr(probe.secrets, "shodan", lambda: "KEY")
         monkeypatch.setattr(secrets, "shodan", lambda: "KEY")
         body = json.dumps({"total": 1, "matches": [{"hostnames": ["a.acme.com"]}]}).encode()
-        monkeypatch.setattr(probe.urllib.request, "urlopen",
+        _patch_provider(monkeypatch,
                             _with_balance(lambda req, timeout=20: _Resp(body), credits=100))
         ctx, _ = self._ctx(tmp_path)
         ctx.run.read = lambda e: [{"favicon": "F1"}] if e == "live" else []
@@ -2078,7 +2140,7 @@ class TestShodanPivot:
             raise urllib.error.HTTPError(str(req.full_url), 401, "unauthorized", {},
                                         io.BytesIO(b"<html>bad key</html>"))
 
-        monkeypatch.setattr(probe.urllib.request, "urlopen", refused)
+        _patch_provider(monkeypatch, refused)
         ctx, _ = self._ctx(tmp_path)
         ctx.run.read = lambda e: [{"favicon": "F1"}] if e == "live" else []
         probe._shodan_pivots(ctx)
@@ -2105,7 +2167,7 @@ class TestShodanPivot:
         monkeypatch.setattr(probe.secrets, "shodan", lambda: "KEY")
         monkeypatch.setattr(secrets, "shodan", lambda: "KEY")
         body = json.dumps({"total": 1, "matches": [{"hostnames": ["a.acme.com"]}]}).encode()
-        monkeypatch.setattr(probe.urllib.request, "urlopen",
+        _patch_provider(monkeypatch,
                             _with_balance(lambda req, timeout=20: _Resp(body), credits=100))
         ctx, added = self._ctx(tmp_path)
         ctx.run.read = lambda e: ([{"favicon": "F1"}] if e == "live"
@@ -2176,7 +2238,7 @@ class TestShodanPivot:
                                             io.BytesIO(quota_body))
             return _Resp(page1)
 
-        monkeypatch.setattr(probe.urllib.request, "urlopen", _with_balance(responder, credits=100))
+        _patch_provider(monkeypatch, _with_balance(responder, credits=100))
         real_save = budget.Ledger.save
         monkeypatch.setattr(budget.Ledger, "save",
                             lambda self: (_ for _ in ()).throw(OSError("store exploded"))

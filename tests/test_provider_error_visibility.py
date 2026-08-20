@@ -8,6 +8,7 @@ surfaced nowhere — was Cloudflare's `<title>Just a moment...</title>`, served 
 """
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import urllib.error
@@ -17,6 +18,60 @@ from pathlib import Path
 import pytest
 
 pytestmark = pytest.mark.offline
+
+
+def _patch_provider(monkeypatch, opener):
+    """Route a legacy request fake through the pinned provider wrapper seam."""
+    from quarry_recon import fetch
+
+    @contextlib.contextmanager
+    def response_for(req, timeout):
+        owner = opener(req, timeout=timeout)
+        response = owner.__enter__() if hasattr(owner, "__enter__") else owner
+        try:
+            yield response
+        finally:
+            if hasattr(owner, "__exit__"):
+                owner.__exit__(None, None, None)
+            elif hasattr(response, "close"):
+                response.close()
+
+    def scoped_get(ctx, url, origin_host=None, *, max_body=fetch.DEFAULT_MAX_BODY,
+                   timeout=20, data=None, method="GET", headers=None, response_headers=None,
+                   **_kwargs):
+        req = urllib.request.Request(url, data=data, method=method, headers=headers or {})
+        with response_for(req, timeout) as response:
+            if response_headers is not None:
+                response_headers.update(getattr(response, "headers", {}) or {})
+            return response.read(max_body + 1), url, getattr(response, "status", 200)
+
+    @contextlib.contextmanager
+    def fake_walk(ctx, url, origin_host=None, *, timeout=20, data=None, method="GET",
+                  headers=None, max_redirects=5, source_id="native-http", **_kwargs):
+        req = urllib.request.Request(url, data=data, method=method, headers=headers or {})
+        with response_for(req, timeout) as response:
+            yield response, url, getattr(response, "status", 200), True
+
+    def scoped_get_file(ctx, url, dest, origin_host=None, *, timeout=20, data=None,
+                        method="GET", headers=None, max_redirects=0, chunk=1024 * 1024,
+                        deadline_s=300.0, policy=None, governor=None, source_id="native-http",
+                        response_headers=None, metadata_url=None):
+        result = fetch._scoped_get_file_legacy(
+            ctx, url, dest, origin_host, timeout=timeout, data=data, method=method,
+            headers=headers, max_redirects=max_redirects, chunk=chunk, deadline_s=deadline_s,
+            policy=policy, governor=governor, source_id=source_id,
+            response_headers=response_headers, metadata_url=metadata_url,
+        )
+        receipt = Path(dest).with_name(Path(dest).name + fetch._RECEIPT_SUFFIX)
+        if receipt.exists():
+            doc = json.loads(receipt.read_text())
+            doc.setdefault("kind", "acquisition")
+            receipt.write_text(json.dumps(doc))
+        return result
+
+    monkeypatch.setattr(fetch, "_walk", fake_walk)
+    monkeypatch.setattr(fetch, "scoped_public_provider_get", scoped_get)
+    monkeypatch.setattr(fetch, "scoped_public_provider_get_file", scoped_get_file)
 
 from quarry_recon import contract
 from quarry_recon.phases import probe
@@ -100,7 +155,7 @@ class TestQuarryIdentifiesItselfToShodan:
         def fake_urlopen(req, timeout=None):
             seen.append(dict(getattr(req, "headers", {}) or {}))
             raise urllib.error.URLError("no network in this test")
-        monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+        _patch_provider(monkeypatch, fake_urlopen)
         return seen
 
     def test_it_is_not_a_browser(self):
@@ -163,7 +218,7 @@ class TestOurOwnCeilingIsNotTheProvidersFault:
             return False
 
     def _serve(self, monkeypatch, payload: bytes):
-        monkeypatch.setattr(urllib.request, "urlopen",
+        _patch_provider(monkeypatch,
                             lambda req, timeout=None: self._Response(payload))
 
     def test_a_PAID_page_has_no_byte_ceiling_at_all(self):
@@ -209,7 +264,7 @@ class TestOurOwnCeilingIsNotTheProvidersFault:
 
             def __exit__(self, *a):
                 return False
-        monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: _Dies())
+        _patch_provider(monkeypatch, lambda req, timeout=None: _Dies())
         sink = tmp_path / "page.json"
         _rows, _total, err = probe._shodan_page("K", "http.favicon.hash", "1", 1, sink=sink)
         assert isinstance(err, contract.IncompleteAcquisition)

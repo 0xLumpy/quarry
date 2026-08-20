@@ -6,9 +6,11 @@ read as an external LIMIT, never as a failure and never as a clean zero.
 The Whoxy payloads below are MEASURED against the live API (2026-07-27), not invented — including the
 detail that makes the whole class of bug possible: Whoxy reports a spent account inside an HTTP **200**.
 """
+import contextlib
 import pathlib
 import json
 import urllib.error
+import urllib.request
 
 import pytest
 
@@ -22,6 +24,63 @@ from quarry_recon.contract import (PROVIDER_ENTITLEMENT, PROVIDER_FORBIDDEN, PRO
 from quarry_recon.runner import Status
 
 pytestmark = pytest.mark.offline
+
+
+def _patch_provider(monkeypatch, opener):
+    """Route a legacy request fake through the pinned provider wrapper seam."""
+    from quarry_recon import fetch
+
+    def request(url, *, data=None, method="GET", headers=None):
+        return urllib.request.Request(url, data=data, method=method, headers=headers or {})
+
+    @contextlib.contextmanager
+    def response_for(req, timeout):
+        owner = opener(req, timeout=timeout)
+        response = owner.__enter__() if hasattr(owner, "__enter__") else owner
+        try:
+            yield response
+        finally:
+            if hasattr(owner, "__exit__"):
+                owner.__exit__(None, None, None)
+            elif hasattr(response, "close"):
+                response.close()
+
+    @contextlib.contextmanager
+    def fake_walk(ctx, url, origin_host=None, *, timeout=20, data=None, method="GET",
+                  headers=None, max_redirects=5, source_id="native-http", **_kwargs):
+        req = request(url, data=data, method=method, headers=headers)
+        with response_for(req, timeout) as response:
+            yield response, url, getattr(response, "status", 200), True
+
+    def scoped_get(ctx, url, origin_host=None, *, max_body=fetch.DEFAULT_MAX_BODY,
+                   timeout=20, data=None, method="GET", headers=None, response_headers=None,
+                   **_kwargs):
+        req = request(url, data=data, method=method, headers=headers)
+        with response_for(req, timeout) as response:
+            if response_headers is not None:
+                response_headers.update(getattr(response, "headers", {}) or {})
+            return response.read(max_body + 1), url, getattr(response, "status", 200)
+
+    def scoped_get_file(ctx, url, dest, origin_host=None, *, timeout=20, data=None,
+                        method="GET", headers=None, max_redirects=0, chunk=1024 * 1024,
+                        deadline_s=300.0, policy=None, governor=None, source_id="native-http",
+                        response_headers=None, metadata_url=None):
+        result = fetch._scoped_get_file_legacy(
+            ctx, url, dest, origin_host, timeout=timeout, data=data, method=method,
+            headers=headers, max_redirects=max_redirects, chunk=chunk, deadline_s=deadline_s,
+            policy=policy, governor=governor, source_id=source_id,
+            response_headers=response_headers, metadata_url=metadata_url,
+        )
+        receipt = pathlib.Path(dest).with_name(pathlib.Path(dest).name + fetch._RECEIPT_SUFFIX)
+        if receipt.exists():
+            doc = json.loads(receipt.read_text())
+            doc.setdefault("kind", "acquisition")
+            receipt.write_text(json.dumps(doc))
+        return result
+
+    monkeypatch.setattr(fetch, "_walk", fake_walk)
+    monkeypatch.setattr(fetch, "scoped_public_provider_get", scoped_get)
+    monkeypatch.setattr(fetch, "scoped_public_provider_get_file", scoped_get_file)
 
 
 @pytest.fixture(autouse=True)
@@ -1556,7 +1615,7 @@ class TestRealShodanLaneUnderQuota:
         events.configure(run.dir)
         # route_balance=False lets a test refuse the BALANCE read itself, which the wrapper would
         # otherwise answer — the failure mode that made this test pass for the wrong reason.
-        monkeypatch.setattr(urllib.request, "urlopen",
+        _patch_provider(monkeypatch,
                             _with_balance(responder, credits=credits) if route_balance else responder)
         ctx = self._ctx(tmp_path, run)
         try:
@@ -1710,7 +1769,7 @@ class TestRealShodanLaneUnderQuota:
         run = Run.create(tmp_path, "t")
         events.reset()
         events.configure(run.dir)
-        monkeypatch.setattr(urllib.request, "urlopen",
+        _patch_provider(monkeypatch,
                             _with_balance(responder, credits=credits) if route_balance else responder)
         ctx = self._ctx(tmp_path, run)
         try:
@@ -1838,8 +1897,7 @@ class TestLaterPagePositionAccounting:
         # `0` must reach the lane as 0 = unbounded, which `concurrency()` would floor to 1.
         monkeypatch.setattr(probe.settings, "raw", lambda k, d=None: max_pages)
         routed = _with_balance(responder)
-        monkeypatch.setattr(urllib.request, "urlopen", routed)
-        monkeypatch.setattr(probe.urllib.request, "urlopen", routed)
+        _patch_provider(monkeypatch, routed)
         ctx = type("C", (), {"run": run, "scope": _Scope(), "http_timeout": 20,
                              "echo": staticmethod(lambda m: None)})()
         try:
@@ -2277,7 +2335,7 @@ class TestAPaidErrorResponseIsKeptWhole:
         from quarry_recon.phases import probe
 
         body = b"X" * 716_800
-        monkeypatch.setattr(probe.urllib.request, "urlopen", self._raise_http_error(body))
+        _patch_provider(monkeypatch, self._raise_http_error(body))
         sink = tmp_path / "page.json"
         rows, total, err = probe._shodan_page("K", "http.favicon.hash", "1", 1, sink=sink)
         assert (rows, total) == ([], None) and err is not None
@@ -2290,7 +2348,7 @@ class TestAPaidErrorResponseIsKeptWhole:
         from quarry_recon.phases import probe
 
         body = b'{"error": "Insufficient query credits"}'
-        monkeypatch.setattr(probe.urllib.request, "urlopen", self._raise_http_error(body))
+        _patch_provider(monkeypatch, self._raise_http_error(body))
         sink = tmp_path / "page.json"
         _rows, _total, err = probe._shodan_page("K", "http.favicon.hash", "1", 1, sink=sink)
         assert pathlib.Path(err.raw_path).read_bytes() == body
@@ -2318,7 +2376,7 @@ class TestAnErrorResponseIsNotAnOrphan:
         def _open(req, timeout=20):
             raise urllib.error.HTTPError(req.full_url, 429, "Too Many", {}, io.BytesIO(b"slow down"))
 
-        monkeypatch.setattr(probe.urllib.request, "urlopen", _open)
+        _patch_provider(monkeypatch, _open)
         probe._shodan_page("K", pivot.facet, pivot.value, 1, sink=sink)
 
         class _Ledger:
@@ -2355,7 +2413,7 @@ class TestAnErrorResponseIsNotAnOrphan:
         def _open(req, timeout=20):
             return _Truncated(req.full_url, 500, "Server Error", {}, None)
 
-        monkeypatch.setattr(probe.urllib.request, "urlopen",
+        _patch_provider(monkeypatch,
                             lambda req, timeout=20: (_ for _ in ()).throw(_open(req)))
         _rows, _total, err = probe._shodan_page("K", "http.favicon.hash", "1", 1,
                                                 sink=tmp_path / "page.json")
@@ -2380,7 +2438,7 @@ class TestAnErrorResponseIsNotAnOrphan:
         def _open(req, timeout=20):
             raise _Err(req.full_url, 401, "Unauthorized", {}, io.BytesIO(b"nope"))
 
-        monkeypatch.setattr(probe.urllib.request, "urlopen", _open)
+        _patch_provider(monkeypatch, _open)
         probe._shodan_page("K", "http.favicon.hash", "1", 1, sink=tmp_path / "page.json")
         assert closed, ("the response must be closed by the lane: stamping `body_text` makes "
                         "`capture_error_body` skip its own read, and its close with it")

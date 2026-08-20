@@ -1110,6 +1110,43 @@ def scoped_get(ctx, url, origin_host=None, *, max_body=DEFAULT_MAX_BODY, timeout
         return (resp.read(max_body + 1) if resp else b""), final, status
 
 
+def _bound_public_provider_scope(ctx, url, source_id):
+    """Require the policy-bound transport for one declared provider authority.
+
+    Provider credentials and provider-supplied cursors must never make an
+    unbound library call fall back to urllib's process-wide resolver/proxy
+    configuration.  ``_contact`` remains the single admission point for the
+    actual request; this preflight makes absence of that authority a refusal
+    before any ambient transport can be selected.
+    """
+    scope = _network_scope(ctx)
+    if scope is None:
+        raise PermissionError("public-provider HTTP requires a bound NetworkPolicyScope")
+    parts = _validated_http_url(url)
+    decision, reason = scope.host_allowed(parts.hostname, source_id=source_id)
+    if decision != "allow":
+        raise PermissionError(f"public-provider HTTP authority refused: {reason}")
+    return scope
+
+
+def scoped_public_provider_get(ctx, url, origin_host=None, *, max_body=DEFAULT_MAX_BODY,
+                               timeout=20, data=None, method="GET", headers=None,
+                               max_redirects=0, source_id="native-http",
+                               response_headers=None):
+    """Bound fetch for one registry-declared, fixed public-provider endpoint.
+
+    Redirects default to zero because provider APIs here have fixed declared
+    authorities.  Any explicit redirect is still surfaced as its normal HTTP
+    status; it is never followed under inherited authority.
+    """
+    _bound_public_provider_scope(ctx, url, source_id)
+    return scoped_get(
+        ctx, url, origin_host, max_body=max_body, timeout=timeout, data=data,
+        method=method, headers=headers, max_redirects=max_redirects,
+        source_id=source_id, response_headers=response_headers,
+    )
+
+
 class Acquisition:
     """What a streamed fetch got; the artifact is on disk either way.
 
@@ -2415,6 +2452,23 @@ def scoped_get_file(ctx, url, dest, origin_host=None, *, timeout=20, data=None, 
             acquisition.final = metadata_url
         return acquisition, metadata_url, status
     return result
+
+
+def scoped_public_provider_get_file(
+        ctx, url, dest, origin_host=None, *, timeout=20, data=None, method="GET",
+        headers=None, max_redirects=0, chunk=1024 * 1024, deadline_s=300.0,
+        policy=None, governor=None, source_id="native-http", response_headers=None,
+        metadata_url=None,
+):
+    """Stream one fixed public-provider response with mandatory bound authority."""
+    _bound_public_provider_scope(ctx, url, source_id)
+    return scoped_get_file(
+        ctx, url, dest, origin_host, timeout=timeout, data=data, method=method,
+        headers=headers, max_redirects=max_redirects, chunk=chunk,
+        deadline_s=deadline_s, policy=policy, governor=governor,
+        source_id=source_id, response_headers=response_headers,
+        metadata_url=metadata_url,
+    )
 
 
 def discard_acquisition(ctx, acquisition):

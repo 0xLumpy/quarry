@@ -21,7 +21,6 @@ import re as _re
 import time as _time
 import urllib.parse
 import urllib.error
-import urllib.request
 from pathlib import Path
 
 from .. import (budget, contract, events, fetch, netguard, normalize, nuclei_policy, pace,
@@ -287,19 +286,20 @@ def _read_bounded(r, limit: "int | None" = None) -> bytes:
 
 def _shodan_get(ctx, url, *, source_id, timeout, max_body):
     """One guarded Shodan GET, retaining the status/body/header error shape callers already classify."""
-    if ctx is None or fetch._network_scope(ctx) is None:  # compatibility seam for unbound parser/unit tests
-        req = urllib.request.Request(url, headers={"User-Agent": SHODAN_UA})
-        with urllib.request.urlopen(req, timeout=timeout) as response:
-            return _read_bounded(response, max_body), int(getattr(response, "status", 200) or 200)
     response_headers = {}
-    body, final, status = fetch.scoped_get(
+    body, final, status = fetch.scoped_public_provider_get(
         ctx, url, timeout=timeout, max_body=max_body, headers={"User-Agent": SHODAN_UA},
-        source_id=source_id, response_headers=response_headers,
+        source_id=source_id, response_headers=response_headers, max_redirects=0,
     )
     if body is None:
         raise RuntimeError("Shodan request refused by the run network scope")
     if not 200 <= status < 300:
-        raise urllib.error.HTTPError(final, status, f"HTTP {status}", response_headers, io.BytesIO(body))
+        # The request URL holds the API key.  Error carriers can reach provider
+        # telemetry, so retain only the fixed endpoint identity.
+        safe_final = urllib.parse.urlunsplit(
+            urllib.parse.urlsplit(final)._replace(query="", fragment=""),
+        )
+        raise urllib.error.HTTPError(safe_final, status, f"HTTP {status}", response_headers, io.BytesIO(body))
     # ``scoped_get`` deliberately returns one sentinel byte over its ceiling; keep the prior typed
     # bounded-read failure instead of parsing that sentinel as provider JSON.
     return _read_bounded(io.BytesIO(body), max_body), status
@@ -419,34 +419,33 @@ def _shodan_page(key, facet, v, page, *, sink, ctx=None, source_id="probe.favico
     size = 0
     digest = None
     try:
-        if ctx is None or fetch._network_scope(ctx) is None:  # compatibility seam; bound runs stream guarded
-            req = urllib.request.Request(url, headers={"User-Agent": SHODAN_UA})
-            with urllib.request.urlopen(req, timeout=20) as response:
-                size, digest = stream_to_file(response, sink, governor=gov)
-        else:
-            response_headers = {}
-            parsed_url = urllib.parse.urlsplit(url)
-            metadata_url = urllib.parse.urlunsplit(
-                (parsed_url.scheme, parsed_url.netloc, parsed_url.path, "", ""),
+        response_headers = {}
+        parsed_url = urllib.parse.urlsplit(url)
+        metadata_url = urllib.parse.urlunsplit(
+            (parsed_url.scheme, parsed_url.netloc, parsed_url.path, "", ""),
+        )
+        acquisition, final, status = fetch.scoped_public_provider_get_file(
+            ctx, url, sink, timeout=20, headers={"User-Agent": SHODAN_UA}, governor=gov,
+            source_id=source_id, response_headers=response_headers,
+            # Request identity keeps the full query (including the key); retained acquisition/result
+            # metadata must never serialize it.
+            metadata_url=metadata_url, max_redirects=0,
+        )
+        if acquisition is None:
+            raise RuntimeError("Shodan request refused by the run network scope")
+        size, digest = acquisition.bytes, acquisition.sha256
+        if not acquisition.complete:
+            raise IncompleteAcquisition(acquisition.error or "Shodan page acquisition incomplete",
+                                        bytes_written=acquisition.bytes, partial=acquisition.partial)
+        if not 200 <= status < 300:
+            # The body is retained at ``sink`` by the guarded streaming transport.  Keep its old
+            # error-artifact placement below, and preserve the status for provider classification.
+            # Never retain the API-key query in the exception object.
+            safe_final = urllib.parse.urlunsplit(
+                urllib.parse.urlsplit(final)._replace(query="", fragment=""),
             )
-            acquisition, final, status = fetch.scoped_get_file(
-                ctx, url, sink, timeout=20, headers={"User-Agent": SHODAN_UA}, governor=gov,
-                source_id=source_id, response_headers=response_headers,
-                # Request identity keeps the full query (including the key); retained acquisition/result
-                # metadata must never serialize it.
-                metadata_url=metadata_url, max_redirects=0,
-            )
-            if acquisition is None:
-                raise RuntimeError("Shodan request refused by the run network scope")
-            size, digest = acquisition.bytes, acquisition.digest
-            if not acquisition.complete:
-                raise IncompleteAcquisition(acquisition.error or "Shodan page acquisition incomplete",
-                                            bytes_written=acquisition.bytes, partial=acquisition.partial)
-            if not 200 <= status < 300:
-                # The body is retained at ``sink`` by the guarded streaming transport.  Keep its old
-                # error-artifact placement below, and preserve the status for provider classification.
-                raise urllib.error.HTTPError(final, status, f"HTTP {status}", response_headers,
-                                             sink.open("rb"))
+            raise urllib.error.HTTPError(safe_final, status, f"HTTP {status}", response_headers,
+                                         sink.open("rb"))
         if size > SHODAN_PARSE_LIMIT:
             raise ShodanPageTooLargeToParse(
                 f"shodan: page is {size} bytes, beyond SHODAN_PARSE_LIMIT ({SHODAN_PARSE_LIMIT}) — the "
