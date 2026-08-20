@@ -38,6 +38,7 @@ ARTIFACT_INDEX_SCHEMA = "quarry.release-artifact-index.v1"
 TRUST_POLICY_SCHEMA = "quarry.release-trust-policy.v1"
 SIGNATURE_ENVELOPE_SCHEMA = "quarry.release-signature-envelope.v1"
 EVIDENCE_REPORT_SCHEMA = "quarry.gate-evidence-report.v1"
+CONFORMANCE_MANIFEST_SCHEMA = "quarry.aggregator-conformance-manifest.v1"
 GATE_ARTIFACT_SCHEMA = "quarry.gate-artifact.v1"
 SUPPORTING_ARTIFACT_SCHEMA = GATE_ARTIFACT_SCHEMA
 PACKAGE_INVENTORY_SCHEMA = GATE_ARTIFACT_SCHEMA
@@ -378,6 +379,7 @@ SCHEMA_PATHS = {
     "corpus-selection-schema": "release/evidence/schemas/corpus-selection-v1.schema.json",
     "detached-approval-schema": "release/evidence/schemas/detached-approval-v1.schema.json",
     "gate-artifact-schema": "release/evidence/schemas/gate-artifact-v1.schema.json",
+    "aggregator-conformance-manifest-schema": "release/evidence/schemas/aggregator-conformance-manifest-v1.schema.json",
     "gate-evidence-report-schema": "release/evidence/schemas/gate-evidence-report-v1.schema.json",
     "no-live-rule-schema": "release/evidence/schemas/no-live-rule-v1.schema.json",
     "network-boundary-trace-schema": "release/evidence/schemas/network-boundary-trace-v1.schema.json",
@@ -395,6 +397,7 @@ SCHEMA_VERSIONS = {
     "corpus-selection-schema": CORPUS_MANIFEST_SCHEMA,
     "detached-approval-schema": APPROVAL_SCHEMA,
     "gate-artifact-schema": GATE_ARTIFACT_SCHEMA,
+    "aggregator-conformance-manifest-schema": CONFORMANCE_MANIFEST_SCHEMA,
     "gate-evidence-report-schema": EVIDENCE_REPORT_SCHEMA,
     "no-live-rule-schema": NO_LIVE_RULE_SCHEMA,
     "network-boundary-trace-schema": NETWORK_BOUNDARY_TRACE_SCHEMA,
@@ -407,6 +410,7 @@ SCHEMA_VERSIONS = {
     "trust-policy-schema": TRUST_POLICY_SCHEMA,
 }
 MANIFEST_PATHS = {
+    "aggregator-conformance-manifest": "release/evidence/aggregator-conformance-v1.json",
     "corpus-selection": "release/evidence/corpus-selection-v1.json",
     "no-live-rule": "release/evidence/no-live-rule-v1.json",
     "support-matrix": "release/evidence/support-matrix-v1.json",
@@ -422,6 +426,7 @@ SCOPE_INPUT_PATHS = {
     **MANIFEST_PATHS,
     **RUN_MANIFEST_INPUT_PATHS,
     **RUNNER_INPUT_PATHS,
+    "release-contracts-tests": "tests/test_release_contracts.py",
     "release-contracts-validator": "src/quarry_recon/release_contracts.py",
     "resource-gate-report-validator": "src/quarry_recon/resource_contract.py",
 }
@@ -545,6 +550,82 @@ def _canonical_reader(data: bytes, name: str) -> object:
 def canonical_json_line(document: object) -> bytes:
     """Return the sole file representation for v1 contract/evidence JSON."""
     return evidence.canonical_json_bytes(document) + b"\n"
+
+
+_CONFORMANCE_CASES = (
+    ("positive-aggregate-verify", "positive", None),
+    ("missing-record", "error", "missing-record"),
+    ("duplicate-gate", "error", "duplicate-gate"),
+    ("wrong-candidate", "error", "wrong-candidate"),
+    ("malformed-schema", "error", "malformed-schema"),
+    ("invalid-signature", "error", "invalid-signature"),
+    ("expired-disposition", "error", "expired-disposition"),
+    ("unexpected-skip", "error", "unexpected-skip"),
+    ("conflicting-result", "error", "conflicting-result"),
+)
+_CONFORMANCE_TEST_PATH = "tests/test_release_contracts.py"
+_CONFORMANCE_TEST_NODEID = (
+    "tests/test_release_contracts.py::TestArtifactsAndAggregation::"
+    "test_evidence_schema_manifest_and_report_reconcile_actual_public_cases"
+)
+
+
+def conformance_error_digest(code: str) -> str:
+    """Address one stable public conformance failure code canonically."""
+    _token(code, "conformance error code")
+    return evidence.canonical_digest({"error_code": code})
+
+
+def normalized_conformance_error_digest(exc: BaseException) -> str:
+    """Normalize the stable public refusal families used by the golden vectors."""
+    if not isinstance(exc, evidence.EvidenceError):
+        raise evidence.EvidenceError("conformance outcome is not a release evidence refusal")
+    message = str(exc)
+    if message.startswith("aggregate record inventory mismatch"):
+        code = "duplicate-gate" if "duplicate ['" in message else "missing-record"
+    elif "does not match the exact candidate identity" in message:
+        code = "wrong-candidate"
+    elif message.startswith("unsupported gate schema"):
+        code = "malformed-schema"
+    elif message.startswith("ed25519 signature"):
+        code = "invalid-signature"
+    elif "scope rule expired" in message:
+        code = "expired-disposition"
+    elif "not_applicable gate needs" in message:
+        code = "unexpected-skip"
+    elif message == "release aggregate status conflicts with the selected disposition":
+        code = "conflicting-result"
+    else:
+        raise evidence.EvidenceError("conformance refusal has no registered normalized error code")
+    return conformance_error_digest(code)
+
+
+def validate_aggregator_conformance_manifest(document: object) -> dict:
+    """Validate the candidate-independent, fixed v1 conformance roster."""
+    doc = _object(document, "aggregator conformance manifest", {
+        "cases", "release", "schema_version",
+    })
+    _schema(doc, CONFORMANCE_MANIFEST_SCHEMA, "aggregator conformance manifest")
+    cases = _array(doc["cases"], "aggregator conformance manifest.cases")
+    expected = [
+        {
+            "id": case_id,
+            "kind": kind,
+            "error_code": error_code,
+            "test_nodeid": _CONFORMANCE_TEST_NODEID,
+            "test_path": _CONFORMANCE_TEST_PATH,
+        }
+        for case_id, kind, error_code in _CONFORMANCE_CASES
+    ]
+    if cases != expected:
+        raise evidence.EvidenceError("aggregator conformance manifest has the wrong case roster or order")
+    return doc
+
+
+def read_aggregator_conformance_manifest(data: bytes) -> dict:
+    return validate_aggregator_conformance_manifest(
+        _canonical_reader(data, "aggregator conformance manifest")
+    )
 
 
 def _schema(document: dict, expected: str, name: str) -> None:
@@ -3481,11 +3562,105 @@ def _semantic_taxonomy(
         )
 
 
+def _semantic_evidence_schema(
+    gate: dict, bodies: Mapping[str, bytes], **context: object,
+) -> None:
+    """Reconcile the fixed public aggregator vectors without aggregating again."""
+    if gate["gate_id"] != "A-EVIDENCE-SCHEMA":  # pragma: no cover - registry invariant
+        raise evidence.EvidenceError("evidence-schema verifier received the wrong gate")
+    inputs = context["input_bodies"]
+    if not isinstance(inputs, Mapping):  # pragma: no cover - aggregate invariant
+        raise evidence.EvidenceError("evidence-schema verifier requires frozen scope inputs")
+    try:
+        manifest_body = inputs["aggregator-conformance-manifest"]
+    except KeyError as exc:  # pragma: no cover - frozen scope inventory invariant
+        raise evidence.EvidenceError("evidence-schema verifier is missing its golden manifest") from exc
+    manifest = read_aggregator_conformance_manifest(manifest_body)
+    scope = context["scope"]
+    if not isinstance(scope, dict):  # pragma: no cover - aggregate invariant
+        raise evidence.EvidenceError("evidence-schema verifier requires the accepted release scope")
+    binding = next(
+        (row for row in scope["input_bindings"]
+         if row["name"] == "aggregator-conformance-manifest"),
+        None,
+    )
+    if binding is None or raw_sha256(manifest_body) != binding["digest"]:
+        raise evidence.EvidenceError("aggregator conformance manifest does not match its frozen scope binding")
+
+    doc = _object(
+        _artifact_document(bodies["conformance-report"], "A-EVIDENCE-SCHEMA", "conformance-report"),
+        "aggregator conformance report",
+        {
+            "artifact_type", "candidate_identity_digest", "cases", "gate_evidence_counts",
+            "gate_id", "manifest_digest", "release", "schema_version", "test_nodeid",
+            "test_source_digest",
+        },
+    )
+    if (doc["artifact_type"] != "aggregator-conformance-report" or
+            doc["schema_version"] != GATE_ARTIFACT_SCHEMA or doc["release"] != RELEASE or
+            doc["gate_id"] != "A-EVIDENCE-SCHEMA"):
+        raise evidence.EvidenceError("aggregator conformance report has unsupported identity")
+    identity = context["identity"]
+    if not isinstance(identity, dict):  # pragma: no cover - aggregate invariant
+        raise evidence.EvidenceError("evidence-schema verifier requires the candidate identity")
+    if doc["candidate_identity_digest"] != evidence.canonical_digest(identity):
+        raise evidence.EvidenceError("aggregator conformance report is bound to the wrong candidate")
+    if doc["manifest_digest"] != raw_sha256(manifest_body):
+        raise evidence.EvidenceError("aggregator conformance report names the wrong golden manifest")
+    test_binding = next(
+        (row for row in scope["input_bindings"] if row["name"] == "release-contracts-tests"),
+        None,
+    )
+    if (test_binding is None or test_binding["path"] != _CONFORMANCE_TEST_PATH or
+            doc["test_source_digest"] != test_binding["digest"] or
+            doc["test_nodeid"] != _CONFORMANCE_TEST_NODEID):
+        raise evidence.EvidenceError("aggregator conformance report does not bind the exact conformance test source/node")
+    cases = _array(doc["cases"], "aggregator conformance report.cases")
+    expected_cases = manifest["cases"]
+    if len(cases) != len(expected_cases):
+        raise evidence.EvidenceError("aggregator conformance report does not contain the exact case roster")
+    for observed, expected in zip(cases, expected_cases, strict=True):
+        item = _object(observed, "aggregator conformance report.case", {
+            "aggregate_digests", "error_digest", "id", "status",
+        })
+        if (item["id"] != expected["id"] or item["status"] != "pass" or
+                expected["test_path"] != _CONFORMANCE_TEST_PATH or
+                expected["test_nodeid"] != doc["test_nodeid"]):
+            raise evidence.EvidenceError("aggregator conformance report case roster or order disagrees with the manifest")
+        digests = _array(item["aggregate_digests"], "aggregator conformance report aggregate digests")
+        if expected["kind"] == "positive":
+            if len(digests) != 2:
+                raise evidence.EvidenceError("positive conformance case requires two aggregate digests")
+            if any(_digest(value, "conformance aggregate digest") != value for value in digests) or \
+                    digests[0] != digests[1] or item["error_digest"] is not None:
+                raise evidence.EvidenceError("positive conformance case has unequal or invalid aggregate digests")
+        elif (digests or item["error_digest"] !=
+              conformance_error_digest(expected["error_code"])):
+            raise evidence.EvidenceError("negative conformance case has the wrong normalized error digest")
+
+    counts = _object(doc["gate_evidence_counts"], "aggregator conformance report gate evidence counts", {
+        "gate_evidence_artifacts", "gate_records",
+    })
+    expected_counts = {
+        "gate_records": len(SELECTED_RECORD_SLOTS),
+        "gate_evidence_artifacts": len(SELECTED_RECORD_SLOTS) - len(LIVE_GATES),
+    }
+    if counts != expected_counts:
+        raise evidence.EvidenceError("aggregator conformance report gate evidence counts are not exact")
+    resolver = context["resolver"]
+    if not isinstance(resolver, ArtifactResolver):  # pragma: no cover - aggregate invariant
+        raise evidence.EvidenceError("evidence-schema verifier requires the artifact resolver")
+    observed_gate_evidence = sum(name == "gate-evidence" for _gate, name in resolver.keys())
+    if observed_gate_evidence != counts["gate_evidence_artifacts"]:
+        raise evidence.EvidenceError("aggregator conformance report gate evidence count does not reconcile")
+
+
 # Only obligation-owned parsers whose complete supporting graph is recomputed
 # are promoted.  In particular C-PERF-PHASE-FAIRNESS stays fail-closed until a
 # typed per-obligation roster can be reconciled with C-POLICY-TRACE.
 SEMANTIC_VERIFIERS = MappingProxyType({
     "A-IDENTITY": _semantic_identity,
+    "A-EVIDENCE-SCHEMA": _semantic_evidence_schema,
     "A-TAXONOMY": _semantic_taxonomy,
     "A-CORPUS": _semantic_corpus,
     "A-THRESHOLDS": _semantic_thresholds,

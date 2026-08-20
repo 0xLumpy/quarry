@@ -181,7 +181,7 @@ nomination commit is not promotion and closes none of these gates.
 |---|---|---|---|
 | `A-IDENTITY` | Candidate is one exact commit; source-tree digest, dirty state, submodule/input identities and schema versions agree, and both package-version sources equal the nominated release | Candidate identity record; dirty candidates fail collection and a release/package-version mismatch blocks this gate | `open` — the v1 collector/schema and private exact-commit development runner exist, but no trusted release runtime or accepted nominated-candidate record exists |
 | `A-TAXONOMY` | Every test/job maps to exactly one primary lane; incompatible markers and unmarked tests fail collection | Classification manifest plus collected/selected/deselected counts | `open` — exact-one enforcement, the formal job map and a candidate-bound collect-only diagnostic exist, but no accepted nominated-candidate classification gate record exists |
-| `A-EVIDENCE-SCHEMA` | Gate records validate against a versioned schema and the aggregator conforms deterministically to committed golden vectors | Schemas plus a hermetic aggregator-conformance/golden-vector result and its canonical digest; this is not the candidate release aggregate | `open` — v1 structural schemas/readers exist; artifact verification, signature trust and the deterministic aggregator remain unimplemented |
+| `A-EVIDENCE-SCHEMA` | Gate records validate against a versioned schema and the aggregator conforms deterministically to the committed fixed conformance manifest | The candidate-independent manifest plus a candidate-bound report that binds its exact test source/node, paired positive aggregate digests, normalized refusal digests, and gate-evidence counts; this is not the candidate release aggregate | `open` — the v1 manifest/report schema and semantic reconciliation exist, but an accepted nominated-candidate report has not been collected |
 | `A-CORPUS` | The selected corpus has a frozen synthetic fixture identity and a candidate-independent disclosure attestation; private aliases/two-pass attestations are required only when a private source is selected | Public fixture and disclosure-attestation digests; private attestations remain private | `open` — design exists; attestations/fixtures are not claimed |
 | `A-THRESHOLDS` | Versioned correctness, quality, resource, and regression thresholds exist for the release scope | Reviewed threshold manifest | `open` — numeric performance/coverage baselines are not yet accepted |
 | `A-SUPPORT` | Supported OS, architecture, Python, and tool/template matrices are finite and versioned | Support matrix digest | `open` — package metadata alone is not a finite tested matrix |
@@ -568,13 +568,19 @@ artifacts must be content-addressed; the eventual
 aggregate must include their digests and reject an artifact that cannot be
 opened and rehashed.
 
-The aggregator must have hermetic conformance tests and committed golden vectors
-for every status, missing record, duplicate gate, wrong candidate, malformed
-schema, invalid signature, expired disposition, unexpected skip, and
-conflicting result. The conformance run emits a result and canonical digest;
-that evidence closes `A-EVIDENCE-SCHEMA` only and is not a candidate release
-aggregate. A candidate aggregate output instead contains the ordered
-scope-selected gate set, decision, reasons, and aggregate digest.
+`A-EVIDENCE-SCHEMA` has a committed, candidate-independent fixed conformance
+manifest. It names the exact public pytest node that exercises the positive
+aggregate/verify path and the missing-record, duplicate-gate, wrong-candidate,
+malformed-schema, invalid-signature, expired-disposition, unexpected-skip, and
+conflicting-result refusals. The manifest contains neither a candidate
+aggregate digest nor a scope digest. Its candidate-bound conformance-report
+artifact rehashes that manifest, binds the exact test source/node, records two
+equal positive canonical aggregate digests, normalized expected error digests,
+and exact gate-evidence counts. Semantic verification reconciles those facts
+without running the aggregator. This evidence closes `A-EVIDENCE-SCHEMA` only;
+it is not a candidate release aggregate. A candidate aggregate output instead
+contains the ordered scope-selected gate set, decision, reasons, and aggregate
+digest.
 
 ## Current Phase 0 closure order
 

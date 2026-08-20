@@ -341,6 +341,35 @@ def _supporting_bodies(
     bodies: dict[str, bytes] = {}
     if gate_id == "A-IDENTITY":
         bodies["identity-verification"] = contracts.canonical_json_line(identity)
+    elif gate_id == "A-EVIDENCE-SCHEMA":
+        manifest_body = (ROOT / "release/evidence/aggregator-conformance-v1.json").read_bytes()
+        manifest = contracts.read_aggregator_conformance_manifest(manifest_body)
+        positive_digest = evidence.canonical_digest({"conformance": "positive-aggregate-verify"})
+        bodies["conformance-report"] = contracts.canonical_json_line({
+            "artifact_type": "aggregator-conformance-report",
+            "candidate_identity_digest": evidence.canonical_digest(identity),
+            "cases": [{
+                "aggregate_digests": [positive_digest, positive_digest]
+                if case["kind"] == "positive" else [],
+                "error_digest": None if case["kind"] == "positive" else
+                contracts.conformance_error_digest(case["error_code"]),
+                "id": case["id"],
+                "status": "pass",
+            } for case in manifest["cases"]],
+            "gate_evidence_counts": {
+                "gate_evidence_artifacts": len(contracts.SELECTED_RECORD_SLOTS) - len(contracts.LIVE_GATES),
+                "gate_records": len(contracts.SELECTED_RECORD_SLOTS),
+            },
+            "gate_id": gate_id,
+            "manifest_digest": contracts.raw_sha256(manifest_body),
+            "release": "0.3.10",
+            "schema_version": contracts.GATE_ARTIFACT_SCHEMA,
+            "test_nodeid": contracts._CONFORMANCE_TEST_NODEID,
+            "test_source_digest": next(
+                row["digest"] for row in scope["input_bindings"]
+                if row["name"] == "release-contracts-tests"
+            ),
+        })
     elif gate_id == "A-TAXONOMY":
         bodies["classification-manifest"] = _taxonomy_body(environment, toolchain)
     elif gate_id == "A-CORPUS":
@@ -1307,6 +1336,7 @@ class TestCommittedContracts:
             "machine_report", "package_inventory", "benchmark_baseline",
             "benchmark_trials", "benchmark_invalidations", "benchmark_report", "sbom",
             "provenance", "publication_subjects", "synthetic_corpus_disclosure_attestation",
+            "aggregator_conformance_report",
         ]
         discriminators = []
         for name in variant_names:
@@ -1499,7 +1529,7 @@ class TestIncompleteSemanticRegistry:
         assert set(contracts.SEMANTIC_VERIFIERS) == (
             set(contracts.RESOURCE_SEMANTIC_GATES)
             | {
-                "A-IDENTITY", "A-TAXONOMY", "A-CORPUS", "A-THRESHOLDS", "A-SUPPORT",
+                "A-IDENTITY", "A-EVIDENCE-SCHEMA", "A-TAXONOMY", "A-CORPUS", "A-THRESHOLDS", "A-SUPPORT",
                 "C-NETWORK-BOUNDARY", "C-NET-DENY",
             }
         )
@@ -1507,7 +1537,7 @@ class TestIncompleteSemanticRegistry:
         arguments = _scenario(tmp_path)
         with pytest.raises(
             evidence.EvidenceError,
-            match="A-EVIDENCE-SCHEMA has no registered obligation-specific semantic verifier",
+            match="B-HERMETIC-ALL has no registered obligation-specific semantic verifier",
         ):
             contracts.aggregate_records(**arguments)
 
@@ -1552,6 +1582,79 @@ class TestArtifactsAndAggregation:
                 policy=arguments["trust_policy"],
                 trusted_policy_digest=arguments["trusted_policy_digest"],
             )
+
+    def test_evidence_schema_manifest_and_report_reconcile_actual_public_cases(self, tmp_path):
+        arguments = _scenario(tmp_path)
+        manifest_body = (ROOT / "release/evidence/aggregator-conformance-v1.json").read_bytes()
+        manifest = contracts.read_aggregator_conformance_manifest(manifest_body)
+        assert [case["id"] for case in manifest["cases"]] == [
+            "positive-aggregate-verify", "missing-record", "duplicate-gate", "wrong-candidate",
+            "malformed-schema", "invalid-signature", "expired-disposition", "unexpected-skip",
+            "conflicting-result",
+        ]
+        aggregate = contracts.aggregate_records(**arguments)
+        assert contracts.verify_aggregate(aggregate, **_verification_arguments(arguments)) == aggregate
+
+        def malformed_schema(value):
+            value["records"][0]["schema_version"] = "quarry.release-gate.v0"
+
+        def invalid_signature(value):
+            value["records"][0]["signature"]["value"] = "base64:" + "A" * 86 + "=="
+
+        def unexpected_skip(value):
+            gate = _gate(value, "A-IDENTITY")
+            gate["status"] = "not_applicable"
+            gate["not_applicable_rule"] = None
+
+        def wrong_candidate(value):
+            _gate(value, "A-IDENTITY")["candidate"]["git_commit"] = "0" * 40
+
+        def expired_disposition(value):
+            gate = _gate(value, "D-AUTHORIZATION")
+            gate["not_applicable_rule"]["expires_at"] = "2026-08-13T00:00:00Z"
+
+        def conflicting_result(**value):
+            forged = copy.deepcopy(aggregate)
+            forged["records"][0]["status"] = "not_applicable"
+            contracts.verify_aggregate(forged, **_verification_arguments(value))
+
+        cases = {
+            "missing-record": (lambda value: value["records"].pop(), contracts.aggregate_records),
+            "duplicate-gate": (lambda value: value["records"].append(copy.deepcopy(value["records"][0])), contracts.aggregate_records),
+            "wrong-candidate": (wrong_candidate, contracts.aggregate_records),
+            "malformed-schema": (malformed_schema, contracts.aggregate_records),
+            "invalid-signature": (invalid_signature, contracts.aggregate_records),
+            "expired-disposition": (expired_disposition, contracts.aggregate_records),
+            "unexpected-skip": (unexpected_skip, contracts.aggregate_records),
+            "conflicting-result": (lambda value: None, conflicting_result),
+        }
+        for case_id, (mutate, public_api) in cases.items():
+            broken = copy.deepcopy(arguments)
+            mutate(broken)
+            with pytest.raises(evidence.EvidenceError) as raised:
+                public_api(**broken)
+            assert contracts.normalized_conformance_error_digest(raised.value) == \
+                contracts.conformance_error_digest(case_id)
+
+    @pytest.mark.parametrize("mutation, match", [
+        (lambda report: report["cases"].reverse(), "roster or order"),
+        (lambda report: report.__setitem__("manifest_digest", _digest("0")), "wrong golden manifest"),
+        (lambda report: report.__setitem__("candidate_identity_digest", _digest("1")), "wrong candidate"),
+        (lambda report: report["cases"][0].__setitem__("aggregate_digests", [_digest("2"), _digest("3")]), "unequal"),
+        (lambda report: report["cases"][1].__setitem__("error_digest", _digest("4")), "normalized error digest"),
+    ])
+    def test_evidence_schema_report_adversaries_fail_closed(self, tmp_path, mutation, match):
+        arguments = _scenario(tmp_path)
+        gate = _gate(arguments, "A-EVIDENCE-SCHEMA")
+        indexed = next(row for row in arguments["artifact_index"]["artifacts"]
+                       if row["gate_id"] == gate["gate_id"] and row["name"] == "conformance-report")
+        report = json.loads((arguments["artifact_root"] / indexed["path"]).read_bytes())
+        mutation(report)
+        _rewrite_supporting_artifact(
+            arguments, gate["gate_id"], "conformance-report", contracts.canonical_json_line(report),
+        )
+        with pytest.raises(evidence.EvidenceError, match=match):
+            contracts.aggregate_records(**arguments)
 
     def test_artifact_index_rehashes_and_rejects_conflicts_and_symlinks(self, tmp_path):
         scope, _support, _thresholds, _corpus, _no_live, _bodies = _ready_contracts()

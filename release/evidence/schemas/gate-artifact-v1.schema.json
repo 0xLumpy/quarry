@@ -12,7 +12,8 @@
     {"$ref": "#/$defs/sbom"},
     {"$ref": "#/$defs/provenance"},
     {"$ref": "#/$defs/publication_subjects"},
-    {"$ref": "#/$defs/synthetic_corpus_disclosure_attestation"}
+    {"$ref": "#/$defs/synthetic_corpus_disclosure_attestation"},
+    {"$ref": "#/$defs/aggregator_conformance_report"}
   ],
   "properties": {
     "artifact_type": {"$ref": "#/$defs/token"},
@@ -21,6 +22,7 @@
     "benchmark_digest": {"$ref": "#/$defs/digest"},
     "builder": {"$ref": "#/$defs/builder"},
     "candidate_identity_digest": {"$ref": "#/$defs/digest"},
+    "cases": {"items": {"$ref": "#/$defs/conformance_case"}, "type": "array"},
     "components": {"items": {"$ref": "#/$defs/component"}, "type": "array"},
     "checks": {"$ref": "#/$defs/disclosure_checks"},
     "corpus_gate_id": {"const": "C-CORPUS-SYNTHETIC"},
@@ -29,9 +31,11 @@
     "fixture_digest": {"$ref": "#/$defs/digest"},
     "fixture_schema_digest": {"$ref": "#/$defs/digest"},
     "gate_id": {"$ref": "#/$defs/gate"},
+    "gate_evidence_counts": {"$ref": "#/$defs/conformance_counts"},
     "invalidations": {"items": {"$ref": "#/$defs/invalidation"}, "type": "array"},
     "materials": {"items": {"$ref": "#/$defs/named_digest"}, "type": "array"},
     "measurements": {"items": {"$ref": "#/$defs/measurement"}, "type": "array"},
+    "manifest_digest": {"$ref": "#/$defs/digest"},
     "metrics": {"items": {"$ref": "#/$defs/baseline_metric"}, "type": "array"},
     "name": {"$ref": "#/$defs/token"},
     "package": {"$ref": "#/$defs/package"},
@@ -43,10 +47,18 @@
     "subjects": {"items": {"type": "object"}, "type": "array"},
     "synthetic_value_inventory_digest": {"$ref": "#/$defs/digest"},
     "trial_invalidations_digest": {"$ref": "#/$defs/digest"},
+    "test_nodeid": {"type": "string"},
+    "test_source_digest": {"$ref": "#/$defs/digest"},
     "trials": {"items": {"$ref": "#/$defs/trial"}, "maxItems": 1000, "minItems": 1, "type": "array"},
     "warmup_runs": {"$ref": "#/$defs/count"}
   },
   "$defs": {
+    "aggregator_conformance_report": {
+      "additionalProperties": false,
+      "properties": {"artifact_type": {"const": "aggregator-conformance-report"}, "candidate_identity_digest": {"$ref": "#/$defs/digest"}, "cases": {"items": {"$ref": "#/$defs/conformance_case"}, "minItems": 9, "maxItems": 9, "type": "array"}, "gate_evidence_counts": {"$ref": "#/$defs/conformance_counts"}, "gate_id": {"const": "A-EVIDENCE-SCHEMA"}, "manifest_digest": {"$ref": "#/$defs/digest"}, "release": {"const": "0.3.10"}, "schema_version": {"const": "quarry.gate-artifact.v1"}, "test_nodeid": {"minLength": 1, "type": "string"}, "test_source_digest": {"$ref": "#/$defs/digest"}},
+      "required": ["artifact_type", "candidate_identity_digest", "cases", "gate_evidence_counts", "gate_id", "manifest_digest", "release", "schema_version", "test_nodeid", "test_source_digest"],
+      "type": "object"
+    },
     "assertion": {
       "additionalProperties": false,
       "properties": {"id": {"$ref": "#/$defs/token"}, "reason": {"type": "null"}, "status": {"const": "pass"}},
@@ -95,6 +107,8 @@
       "required": ["content_digest", "declared_requirement", "license", "name", "relationship", "version"],
       "type": "object"
     },
+    "conformance_case": {"additionalProperties": false, "properties": {"aggregate_digests": {"items": {"$ref": "#/$defs/digest"}, "maxItems": 2, "type": "array"}, "error_digest": {"oneOf": [{"$ref": "#/$defs/digest"}, {"type": "null"}]}, "id": {"$ref": "#/$defs/token"}, "status": {"const": "pass"}}, "required": ["aggregate_digests", "error_digest", "id", "status"], "type": "object"},
+    "conformance_counts": {"additionalProperties": false, "properties": {"gate_evidence_artifacts": {"$ref": "#/$defs/count"}, "gate_records": {"$ref": "#/$defs/count"}}, "required": ["gate_evidence_artifacts", "gate_records"], "type": "object"},
     "count": {"maximum": 9223372036854775807, "minimum": 0, "type": "integer"},
     "disclosure_checks": {
       "additionalProperties": false,

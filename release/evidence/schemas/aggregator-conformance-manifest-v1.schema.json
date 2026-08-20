@@ -1,0 +1,27 @@
+{
+  "$id": "urn:quarry:schema:aggregator-conformance-manifest:v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "cases": {"items": {"$ref": "#/$defs/case"}, "minItems": 9, "maxItems": 9, "type": "array", "uniqueItems": true},
+    "release": {"const": "0.3.10"},
+    "schema_version": {"const": "quarry.aggregator-conformance-manifest.v1"}
+  },
+  "$defs": {
+    "case": {
+      "additionalProperties": false,
+      "properties": {
+        "error_code": {"oneOf": [{"pattern": "^[a-z][a-z0-9-]*$", "type": "string"}, {"type": "null"}]},
+        "id": {"pattern": "^[a-z][a-z0-9-]*$", "type": "string"},
+        "kind": {"enum": ["error", "positive"]},
+        "test_nodeid": {"minLength": 1, "type": "string"},
+        "test_path": {"const": "tests/test_release_contracts.py"}
+      },
+      "required": ["error_code", "id", "kind", "test_nodeid", "test_path"],
+      "type": "object"
+    }
+  },
+  "required": ["cases", "release", "schema_version"],
+  "title": "Quarry aggregator conformance manifest v1",
+  "type": "object"
+}
