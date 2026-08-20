@@ -3329,6 +3329,78 @@ def _semantic_support(
         )
 
 
+def _read_synthetic_corpus_disclosure_attestation(body: bytes) -> dict:
+    """Read the candidate-independent public synthetic-corpus attestation."""
+    doc = _object(
+        _artifact_document(body, "A-CORPUS", "corpus-disclosure-report"),
+        "synthetic corpus disclosure attestation",
+        {
+            "artifact_type", "checks", "corpus_gate_id", "derivation_tree_digests",
+            "fixture_digest", "fixture_schema_digest", "release", "schema_version",
+            "synthetic_value_inventory_digest",
+        },
+    )
+    if (doc["artifact_type"] != "synthetic-corpus-disclosure-attestation" or
+            doc["schema_version"] != GATE_ARTIFACT_SCHEMA or doc["release"] != RELEASE):
+        raise evidence.EvidenceError("synthetic corpus disclosure attestation has unsupported identity")
+    if doc["corpus_gate_id"] != "C-CORPUS-SYNTHETIC":
+        raise evidence.EvidenceError("synthetic corpus disclosure attestation names the wrong corpus gate")
+    _digest(doc["fixture_digest"], "synthetic corpus fixture digest")
+    _digest(doc["fixture_schema_digest"], "synthetic corpus fixture schema digest")
+    _digest(
+        doc["synthetic_value_inventory_digest"],
+        "synthetic corpus value inventory digest",
+    )
+    derivations = _array(
+        doc["derivation_tree_digests"], "synthetic corpus derivation tree digests",
+    )
+    if len(derivations) != 2:
+        raise evidence.EvidenceError("synthetic corpus attestation requires two isolated derivations")
+    for digest in derivations:
+        _digest(digest, "synthetic corpus derivation tree digest")
+    if derivations != [doc["fixture_digest"], doc["fixture_digest"]]:
+        raise evidence.EvidenceError(
+            "synthetic corpus derivations do not both match the frozen fixture identity"
+        )
+    checks = _object(doc["checks"], "synthetic corpus disclosure checks", {
+        "deterministic_derivation", "disclosure_review", "schema_validation",
+    })
+    if checks != {
+        "deterministic_derivation": "pass",
+        "disclosure_review": "pass",
+        "schema_validation": "pass",
+    }:
+        raise evidence.EvidenceError("synthetic corpus disclosure checks are not all passing")
+    return doc
+
+
+def _semantic_corpus(
+    gate: dict, bodies: Mapping[str, bytes], **context: object,
+) -> None:
+    """Bind the public synthetic disclosure attestation without private claims."""
+    if gate["gate_id"] != "A-CORPUS":  # pragma: no cover - registry invariant
+        raise evidence.EvidenceError("corpus semantic verifier received the wrong gate")
+    corpus = context["corpus"]
+    if not isinstance(corpus, dict):  # pragma: no cover - aggregate invariant
+        raise evidence.EvidenceError("corpus verifier requires the accepted corpus manifest")
+    selected = [row for row in corpus["sources"] if row["selected"]]
+    if (len(selected) != 1 or selected[0]["gate_id"] != "C-CORPUS-SYNTHETIC" or
+            selected[0]["kind"] != "synthetic" or
+            selected[0]["fixture_digest"] is None or
+            selected[0]["attestation_digest"] is None):
+        raise evidence.EvidenceError("A-CORPUS has no unique selected synthetic corpus")
+    attestation_body = bodies["corpus-disclosure-report"]
+    if raw_sha256(attestation_body) != selected[0]["attestation_digest"]:
+        raise evidence.EvidenceError(
+            "synthetic corpus disclosure attestation does not match the frozen manifest digest"
+        )
+    attestation = _read_synthetic_corpus_disclosure_attestation(attestation_body)
+    if attestation["fixture_digest"] != selected[0]["fixture_digest"]:
+        raise evidence.EvidenceError(
+            "synthetic corpus disclosure attestation names a different fixture identity"
+        )
+
+
 def _semantic_taxonomy(
     gate: dict, bodies: Mapping[str, bytes], **context: object,
 ) -> None:
@@ -3415,6 +3487,7 @@ def _semantic_taxonomy(
 SEMANTIC_VERIFIERS = MappingProxyType({
     "A-IDENTITY": _semantic_identity,
     "A-TAXONOMY": _semantic_taxonomy,
+    "A-CORPUS": _semantic_corpus,
     "A-THRESHOLDS": _semantic_thresholds,
     "A-SUPPORT": _semantic_support,
     "C-NETWORK-BOUNDARY": _semantic_network_boundary,
@@ -3429,7 +3502,7 @@ SEMANTIC_VERIFIERS = MappingProxyType({
 
 def _validate_supporting_artifacts(
     gate: dict, bodies: Mapping[str, bytes], *, identity: dict, report: dict,
-    resolver: ArtifactResolver, scope: dict, support: dict, thresholds: dict,
+    resolver: ArtifactResolver, scope: dict, support: dict, thresholds: dict, corpus: dict,
     policy: dict, trusted_policy_digest: str, input_bodies: Mapping[str, bytes],
 ) -> None:
     gate_id = gate["gate_id"]
@@ -3447,6 +3520,7 @@ def _validate_supporting_artifacts(
         scope=scope,
         support=support,
         thresholds=thresholds,
+        corpus=corpus,
         policy=policy,
         trusted_policy_digest=trusted_policy_digest,
         input_bodies=input_bodies,
@@ -3582,7 +3656,7 @@ def _verify_pass_report(
             {"digest": row["digest"], "kind": "template_set", "name": row["name"]}
             for row in support["template_sets"]
         )
-    if gate["gate_id"] == "C-CORPUS-SYNTHETIC":
+    if gate["gate_id"] in {"A-CORPUS", "C-CORPUS-SYNTHETIC"}:
         selected = [row for row in corpus["sources"] if row["selected"]]
         if (len(selected) != 1 or selected[0]["fixture_digest"] is None or
                 selected[0]["attestation_digest"] is None):
@@ -3834,6 +3908,7 @@ def aggregate_records(
                     scope=scope_doc,
                     support=support,
                     thresholds=thresholds,
+                    corpus=corpus,
                     policy=policy,
                     trusted_policy_digest=trusted_policy_digest,
                     input_bodies=input_bodies,

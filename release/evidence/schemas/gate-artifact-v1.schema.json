@@ -11,7 +11,8 @@
     {"$ref": "#/$defs/benchmark_report"},
     {"$ref": "#/$defs/sbom"},
     {"$ref": "#/$defs/provenance"},
-    {"$ref": "#/$defs/publication_subjects"}
+    {"$ref": "#/$defs/publication_subjects"},
+    {"$ref": "#/$defs/synthetic_corpus_disclosure_attestation"}
   ],
   "properties": {
     "artifact_type": {"$ref": "#/$defs/token"},
@@ -21,7 +22,12 @@
     "builder": {"$ref": "#/$defs/builder"},
     "candidate_identity_digest": {"$ref": "#/$defs/digest"},
     "components": {"items": {"$ref": "#/$defs/component"}, "type": "array"},
+    "checks": {"$ref": "#/$defs/disclosure_checks"},
+    "corpus_gate_id": {"const": "C-CORPUS-SYNTHETIC"},
+    "derivation_tree_digests": {"items": {"$ref": "#/$defs/digest"}, "maxItems": 2, "minItems": 2, "type": "array"},
     "dependency_graph_digest": {"$ref": "#/$defs/digest"},
+    "fixture_digest": {"$ref": "#/$defs/digest"},
+    "fixture_schema_digest": {"$ref": "#/$defs/digest"},
     "gate_id": {"$ref": "#/$defs/gate"},
     "invalidations": {"items": {"$ref": "#/$defs/invalidation"}, "type": "array"},
     "materials": {"items": {"$ref": "#/$defs/named_digest"}, "type": "array"},
@@ -35,6 +41,7 @@
     "resource_limits_observed": {"$ref": "#/$defs/resources"},
     "schema_version": {"const": "quarry.gate-artifact.v1"},
     "subjects": {"items": {"type": "object"}, "type": "array"},
+    "synthetic_value_inventory_digest": {"$ref": "#/$defs/digest"},
     "trial_invalidations_digest": {"$ref": "#/$defs/digest"},
     "trials": {"items": {"$ref": "#/$defs/trial"}, "maxItems": 1000, "minItems": 1, "type": "array"},
     "warmup_runs": {"$ref": "#/$defs/count"}
@@ -89,6 +96,12 @@
       "type": "object"
     },
     "count": {"maximum": 9223372036854775807, "minimum": 0, "type": "integer"},
+    "disclosure_checks": {
+      "additionalProperties": false,
+      "properties": {"deterministic_derivation": {"const": "pass"}, "disclosure_review": {"const": "pass"}, "schema_validation": {"const": "pass"}},
+      "required": ["deterministic_derivation", "disclosure_review", "schema_validation"],
+      "type": "object"
+    },
     "digest": {"pattern": "^sha256:[0-9a-f]{64}$", "type": "string"},
     "environment": {
       "additionalProperties": false,
@@ -179,6 +192,12 @@
       "additionalProperties": false,
       "properties": {"artifact_type": {"const": "sbom"}, "candidate_identity_digest": {"$ref": "#/$defs/digest"}, "components": {"items": {"$ref": "#/$defs/component"}, "minItems": 1, "type": "array", "uniqueItems": true}, "dependency_graph_digest": {"$ref": "#/$defs/digest"}, "gate_id": {"const": "C-SBOM"}, "package": {"$ref": "#/$defs/package"}, "release": {"const": "0.3.10"}, "schema_version": {"const": "quarry.gate-artifact.v1"}},
       "required": ["artifact_type", "candidate_identity_digest", "components", "dependency_graph_digest", "gate_id", "package", "release", "schema_version"],
+      "type": "object"
+    },
+    "synthetic_corpus_disclosure_attestation": {
+      "additionalProperties": false,
+      "properties": {"artifact_type": {"const": "synthetic-corpus-disclosure-attestation"}, "checks": {"$ref": "#/$defs/disclosure_checks"}, "corpus_gate_id": {"const": "C-CORPUS-SYNTHETIC"}, "derivation_tree_digests": {"items": {"$ref": "#/$defs/digest"}, "maxItems": 2, "minItems": 2, "type": "array"}, "fixture_digest": {"$ref": "#/$defs/digest"}, "fixture_schema_digest": {"$ref": "#/$defs/digest"}, "release": {"const": "0.3.10"}, "schema_version": {"const": "quarry.gate-artifact.v1"}, "synthetic_value_inventory_digest": {"$ref": "#/$defs/digest"}},
+      "required": ["artifact_type", "checks", "corpus_gate_id", "derivation_tree_digests", "fixture_digest", "fixture_schema_digest", "release", "schema_version", "synthetic_value_inventory_digest"],
       "type": "object"
     },
     "text": {"minLength": 1, "pattern": "^[^\\u0000-\\u001f]+$", "type": "string"},

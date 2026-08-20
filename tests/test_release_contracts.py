@@ -314,8 +314,26 @@ def _taxonomy_body(environment: dict, toolchain: list[dict]) -> bytes:
     })
 
 
+def _corpus_disclosure_body(fixture_digest: str) -> bytes:
+    return contracts.canonical_json_line({
+        "artifact_type": "synthetic-corpus-disclosure-attestation",
+        "checks": {
+            "deterministic_derivation": "pass",
+            "disclosure_review": "pass",
+            "schema_validation": "pass",
+        },
+        "corpus_gate_id": "C-CORPUS-SYNTHETIC",
+        "derivation_tree_digests": [fixture_digest, fixture_digest],
+        "fixture_digest": fixture_digest,
+        "fixture_schema_digest": _digest("c"),
+        "release": "0.3.10",
+        "schema_version": contracts.GATE_ARTIFACT_SCHEMA,
+        "synthetic_value_inventory_digest": _digest("d"),
+    })
+
+
 def _supporting_bodies(
-    gate_id: str, *, identity: dict, scope: dict, support: dict, thresholds: dict,
+    gate_id: str, *, identity: dict, scope: dict, support: dict, thresholds: dict, corpus: dict,
     benchmark: dict | None, measurements: list[dict], environment: dict,
     evidence_instance_id: str, toolchain: list[dict], indexed: list[dict], policy: dict,
 ) -> dict[str, bytes]:
@@ -325,6 +343,9 @@ def _supporting_bodies(
         bodies["identity-verification"] = contracts.canonical_json_line(identity)
     elif gate_id == "A-TAXONOMY":
         bodies["classification-manifest"] = _taxonomy_body(environment, toolchain)
+    elif gate_id == "A-CORPUS":
+        selected = next(row for row in corpus["sources"] if row["selected"])
+        bodies["corpus-disclosure-report"] = _corpus_disclosure_body(selected["fixture_digest"])
     elif gate_id == "A-THRESHOLDS":
         bodies["threshold-reconciliation"] = contracts.canonical_json_line(thresholds)
     elif gate_id == "A-SUPPORT":
@@ -664,8 +685,10 @@ def _ready_contracts(
         )
         if row["class"] == "regression":
             row["baseline_digest"] = _digest("c")
-    corpus["sources"][-1]["attestation_digest"] = _digest("e")
     corpus["sources"][-1]["fixture_digest"] = _digest("f")
+    corpus["sources"][-1]["attestation_digest"] = contracts.raw_sha256(
+        _corpus_disclosure_body(corpus["sources"][-1]["fixture_digest"])
+    )
     for benchmark in thresholds["benchmarks"]:
         benchmark.update({
             "concurrency": 1,
@@ -889,7 +912,7 @@ def _scenario(tmp_path: Path, *, approved_at: str = "2026-08-01T00:00:00Z"):
                 materials.extend({
                     "digest": row["digest"], "kind": "template_set", "name": row["name"],
                 } for row in support["template_sets"])
-            if gate_id == "C-CORPUS-SYNTHETIC":
+            if gate_id in {"A-CORPUS", "C-CORPUS-SYNTHETIC"}:
                 selected_corpus = next(row for row in corpus["sources"] if row["selected"])
                 materials.extend((
                     {
@@ -910,6 +933,7 @@ def _scenario(tmp_path: Path, *, approved_at: str = "2026-08-01T00:00:00Z"):
                 scope=scope,
                 support=support,
                 thresholds=thresholds,
+                corpus=corpus,
                 benchmark=benchmark,
                 measurements=measurements,
                 environment=instances[0]["environment"],
@@ -1160,6 +1184,7 @@ def _rebind_scenario(arguments: dict) -> None:
                 scope=arguments["scope"],
                 support=arguments["support_matrix"],
                 thresholds=arguments["threshold_manifest"],
+                corpus=arguments["corpus_manifest"],
                 benchmark=report["benchmark"],
                 measurements=report["measurements"],
                 environment=gate["environment"],
@@ -1281,7 +1306,7 @@ class TestCommittedContracts:
         assert variant_names == [
             "machine_report", "package_inventory", "benchmark_baseline",
             "benchmark_trials", "benchmark_invalidations", "benchmark_report", "sbom",
-            "provenance", "publication_subjects",
+            "provenance", "publication_subjects", "synthetic_corpus_disclosure_attestation",
         ]
         discriminators = []
         for name in variant_names:
@@ -1474,7 +1499,7 @@ class TestIncompleteSemanticRegistry:
         assert set(contracts.SEMANTIC_VERIFIERS) == (
             set(contracts.RESOURCE_SEMANTIC_GATES)
             | {
-                "A-IDENTITY", "A-TAXONOMY", "A-THRESHOLDS", "A-SUPPORT",
+                "A-IDENTITY", "A-TAXONOMY", "A-CORPUS", "A-THRESHOLDS", "A-SUPPORT",
                 "C-NETWORK-BOUNDARY", "C-NET-DENY",
             }
         )
@@ -1886,6 +1911,57 @@ class TestArtifactsAndAggregation:
         _rebind_scenario(arguments)
         with pytest.raises(evidence.EvidenceError, match="primary lane marker"):
             contracts.aggregate_records(**arguments)
+
+    def test_corpus_disclosure_attestation_rehashes_to_the_selected_manifest(self, tmp_path):
+        arguments = _scenario(tmp_path)
+        indexed = next(
+            row for row in arguments["artifact_index"]["artifacts"]
+            if row["gate_id"] == "A-CORPUS" and row["name"] == "corpus-disclosure-report"
+        )
+        attestation = json.loads((arguments["artifact_root"] / indexed["path"]).read_bytes())
+        attestation["fixture_digest"] = _digest("0")
+        attestation["derivation_tree_digests"] = [_digest("0"), _digest("0")]
+        _rewrite_supporting_artifact(
+            arguments,
+            "A-CORPUS",
+            "corpus-disclosure-report",
+            contracts.canonical_json_line(attestation),
+        )
+        with pytest.raises(evidence.EvidenceError, match="frozen manifest digest"):
+            contracts.aggregate_records(**arguments)
+
+    @pytest.mark.parametrize(
+        ("mutate", "expected"),
+        [
+            (
+                lambda attestation: attestation["checks"].__setitem__("disclosure_review", "fail"),
+                "checks are not all passing",
+            ),
+            (
+                lambda attestation: attestation.__setitem__(
+                    "candidate_identity_digest", _digest("candidate"),
+                ),
+                "invalid members",
+            ),
+        ],
+    )
+    def test_corpus_disclosure_attestation_is_candidate_independent_and_fail_closed(
+        self, tmp_path, mutate, expected,
+    ):
+        arguments = _scenario(tmp_path)
+        selected = next(
+            row for row in arguments["corpus_manifest"]["sources"] if row["selected"]
+        )
+        attestation = json.loads(_corpus_disclosure_body(selected["fixture_digest"]))
+        mutate(attestation)
+        body = contracts.canonical_json_line(attestation)
+        selected["attestation_digest"] = contracts.raw_sha256(body)
+        with pytest.raises(evidence.EvidenceError, match=expected):
+            contracts._semantic_corpus(
+                {"gate_id": "A-CORPUS"},
+                {"corpus-disclosure-report": body},
+                corpus=arguments["corpus_manifest"],
+            )
 
     @pytest.mark.parametrize("manifest", ["support", "threshold", "corpus"])
     def test_changed_accepted_manifest_rejects_unchanged_substantive_evidence(

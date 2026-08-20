@@ -226,6 +226,15 @@ digest, and disclosure-review result. Only the output fixture and non-sensitive
 derivation metadata may enter the repository. The private input alias,
 attestation, and decision map stay outside it.
 
+For the v0.3.10 public scope, only `C-CORPUS-SYNTHETIC` is selected. Its
+`fixture_digest` is the canonical synthetic fixture-tree identity, and its
+`attestation_digest` is the raw SHA-256 of a candidate-independent public
+synthetic disclosure attestation. That attestation records two matching
+derivation tree identities and passing schema/disclosure checks, but contains
+no candidate identity, private alias, path, timestamp, or private attestation
+reference. The signed `A-CORPUS` gate binds that fixed attestation to the
+candidate. It makes no claim about the unselected private sources.
+
 Determinism is checked by two clean derivations with isolated output roots. The
 complete output trees must be byte-identical. A separate schema validation and
 disclosure review must then confirm that:
