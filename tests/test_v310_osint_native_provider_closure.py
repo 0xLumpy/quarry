@@ -35,6 +35,24 @@ def _bound_session(tmp_path):
     return session, ctx
 
 
+def test_osint_external_and_native_transports_share_one_bound_scope(tmp_path):
+    session = osint.OsintSession(tmp_path, "example.test", ts="shared-network-scope")
+    profile = _profile()
+    ctx = osint._OsintHttpRepository(
+        session, profile, SimpleNamespace(active_allowed=lambda _host: False),
+    )
+    policy = network_policy.NetworkPolicyScope(
+        block_private_targets=False, apex_domains=("example.test",),
+        own_ips=("192.0.2.10",), resolver_ips=("1.1.1.1",),
+    )
+
+    policy.bind(session)
+    ctx._network_policy_scope = policy
+
+    assert network_policy.scope_for(session) is policy
+    assert network_policy.scope_for(ctx) is policy
+
+
 def test_osint_provider_refuses_unbound_session_without_ambient_transport(monkeypatch, tmp_path):
     session = osint.OsintSession(tmp_path, "example.test", ts="unbound-provider")
     monkeypatch.setattr(urllib.request, "urlopen",

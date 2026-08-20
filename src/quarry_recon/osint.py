@@ -665,6 +665,12 @@ class OsintSession:
                     if fd >= 0:
                         os.close(fd)
 
+    def _append_base_artifact(self, components: tuple[str, ...], data: bytes) -> None:
+        """Expose only the network-policy append seam used by a bound scope."""
+        if components != ("raw", "network", "policy.jsonl"):
+            raise PermissionError("OSINT session only owns its network policy trace")
+        self._append_network_policy_trace(data)
+
     def output(self, path: Path | None = None):
         """Declare publish or discard under this exact unsealed session."""
         from .runner_repository import RepositoryOutput
@@ -1612,7 +1618,11 @@ def run(profile, scope, project_dir: Path, echo=print, timeout: int = 1800) -> P
     sess = OsintSession(project_dir, profile.target)
     from . import network_policy
     http_repository = _OsintHttpRepository(sess, profile, scope)
-    network_policy.NetworkPolicyScope.from_profile(profile).bind(http_repository)
+    effect_scope = network_policy.NetworkPolicyScope.from_profile(profile)
+    effect_scope.bind(sess)
+    # Native provider HTTP and external OSINT tools share the same run-scoped
+    # authority and durable trace, while retaining the small HTTP context face.
+    http_repository._network_policy_scope = effect_scope
     sess._http_context = http_repository
     from .runner import set_tool_cwd
     set_tool_cwd(sess.dir)   # contain any stray tool output inside the osint session dir
