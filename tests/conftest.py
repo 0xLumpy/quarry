@@ -16,6 +16,7 @@ remains open and is specified in ``docs/releases/RELEASE-GATES.md``.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import platform
@@ -47,6 +48,20 @@ def pytest_addoption(parser):
         "--quarry-taxonomy-manifest",
         metavar="PATH",
         help="write a new canonical diagnostic manifest for this collection",
+    )
+    group.addoption(
+        "--quarry-shard-count",
+        default=1,
+        metavar="N",
+        type=int,
+        help="split the selected tests into N deterministic CI shards",
+    )
+    group.addoption(
+        "--quarry-shard-index",
+        default=0,
+        metavar="N",
+        type=int,
+        help="run deterministic CI shard N (zero based)",
     )
 
 
@@ -105,6 +120,23 @@ def _utf8_key(value):
         return value.encode("utf-8", "strict")
     except UnicodeEncodeError as exc:
         raise pytest.UsageError("test taxonomy contains a non-Unicode node id") from exc
+
+
+def _test_shard(nodeid, count):
+    return int.from_bytes(hashlib.sha256(_utf8_key(nodeid)).digest(), "big") % count
+
+
+def _apply_test_shard(config, items):
+    count = config.getoption("quarry_shard_count")
+    index = config.getoption("quarry_shard_index")
+    if count < 1 or count > 64 or index < 0 or index >= count:
+        raise pytest.UsageError("quarry test shard must satisfy 1 <= count <= 64 and 0 <= index < count")
+    if count == 1:
+        return
+    selected = [item for item in items if _test_shard(item.nodeid, count) == index]
+    deselected = [item for item in items if _test_shard(item.nodeid, count) != index]
+    items[:] = selected
+    config.hook.pytest_deselected(items=deselected)
 
 
 def _taxonomy_manifest_bytes(rows, selected_nodeids, *, mark_expression, keyword_expression):
@@ -231,6 +263,7 @@ def pytest_collection_modifyitems(config, items):
         rendered = "\n".join(f"  - {message}" for message in sorted(errors))
         raise pytest.UsageError(f"test taxonomy violations:\n{rendered}")
     yield
+    _apply_test_shard(config, items)
     body = _taxonomy_manifest_bytes(
         rows,
         [item.nodeid for item in items],

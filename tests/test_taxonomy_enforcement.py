@@ -55,6 +55,15 @@ def test_each_primary_lane_classifies_exactly(primary, secondary, expected_tools
     assert taxonomy._classify_test_item(item) == (primary, expected_tools, False)
 
 
+def test_ci_shard_assignment_is_stable_complete_and_balanced():
+    nodeids = [f"tests/example.py::test_case_{index}" for index in range(6000)]
+    first = [taxonomy._test_shard(nodeid, 6) for nodeid in nodeids]
+    assert first == [taxonomy._test_shard(nodeid, 6) for nodeid in nodeids]
+    assert set(first) == set(range(6))
+    counts = [first.count(index) for index in range(6)]
+    assert max(counts) - min(counts) < 100
+
+
 @pytest.mark.parametrize(
     ("markers", "message"),
     [

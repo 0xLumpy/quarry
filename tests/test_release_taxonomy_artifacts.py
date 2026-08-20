@@ -650,6 +650,7 @@ class TestCommittedWorkflowParity:
         assert mapped_offline["lane"] == "H0-hermetic"
         assert mapped_offline["capabilities"] == []
         assert offline["strategy"]["matrix"]["python-version"] == ["3.10", "3.12"]
+        assert offline["strategy"]["matrix"]["shard"] == ["0", "1", "2", "3", "4", "5"]
         setup = next(
             step for step in offline["steps"]
             if str(step.get("uses", "")).startswith("actions/setup-python@")
@@ -671,5 +672,8 @@ class TestCommittedWorkflowParity:
         arguments = shlex.split(test_step["run"])
         assert arguments[arguments.index("-m") + 1] == \
             mapped_offline["selection"]["mark_expression"]
+        assert "--quarry-shard-count 6" in test_step["run"]
+        assert '--quarry-shard-index "${{ matrix.shard }}"' in test_step["run"]
+        assert '${{ matrix.shard }}' in test_step["run"]
         assert "--quarry-taxonomy-manifest" in arguments
         assert test_step["env"]["QUARRY_OFFLINE_CI"] == "1"
