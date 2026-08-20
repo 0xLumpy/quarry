@@ -62,7 +62,7 @@ def test_public_provider_calls_use_their_exact_registered_lane_ids(monkeypatch):
     ctx = _ctx()
     vertical_seen = []
 
-    def vertical_get(_ctx, url, *, source_id, **_kwargs):
+    def vertical_get(_ctx, url, _origin_host=None, *, source_id, **_kwargs):
         vertical_seen.append(source_id)
         if "censys" in url:
             body = {"result": {"hits": []}}
@@ -84,7 +84,7 @@ def test_public_provider_calls_use_their_exact_registered_lane_ids(monkeypatch):
 
     probe_seen = []
 
-    def shodan_get(_ctx, url, *, source_id, **_kwargs):
+    def shodan_get(_ctx, url, _origin_host=None, *, source_id, **_kwargs):
         probe_seen.append(source_id)
         return b'{"total": 0}', url, 200
 
