@@ -15,6 +15,7 @@ import json
 import pathlib
 import socket
 import urllib.error
+import urllib.request
 
 import pytest
 
@@ -24,8 +25,7 @@ from quarry_recon.contract import PROVIDER_CLASSES, is_measured_empty
 pytestmark = pytest.mark.offline
 
 class _Resp:
-    """The urlopen context manager, reduced to what the lane uses — including the STATUS, which the lane
-    reads rather than assuming (review-B1.7r9#1)."""
+    """A response reduced to what the scoped provider boundary uses."""
 
     def __init__(self, body, status=200):
         self._body = body
@@ -42,6 +42,19 @@ class _Resp:
             return b''                      # STREAM: the body once, then EOF
         self._eof = True
         return self._body
+
+
+def _patch_scoped(monkeypatch, handler):
+    """Adapt a small request-shaped fake to the bound public-provider fetch boundary."""
+    from quarry_recon import fetch
+
+    def scoped(ctx, url, origin_host=None, *, timeout=20, data=None, method="GET", headers=None, **_kw):
+        req = urllib.request.Request(url, data=data, method=method, headers=headers or {})
+        response = handler(req, timeout=timeout)
+        return response.read(), url, getattr(response, "status", 200)
+
+    monkeypatch.setattr(fetch, "scoped_public_provider_get", scoped)
+    return scoped
 
 
 FIX = pathlib.Path(__file__).parent / "fixtures" / "shodan"
@@ -1593,7 +1606,7 @@ class TestTheWiredLane:
                                             io.BytesIO(b'{"error": "No information available for that IP."}'))
             return _Resp(raw)
 
-        monkeypatch.setattr(probe.urllib.request, "urlopen", urlopen)
+        _patch_scoped(monkeypatch, urlopen)
         return probe, ctx, added, recorded
 
     def _events(self, tmp_path):
@@ -1682,8 +1695,8 @@ class TestTheWiredLane:
         from quarry_recon.contract import PROVIDER_CLASSES
         from quarry_recon.phases import probe as probe_mod
         probe, ctx, added, _rec = self._probe_ctx(tmp_path, monkeypatch)
-        monkeypatch.setattr(probe_mod.urllib.request, "urlopen",
-                            lambda req, timeout=20: (_ for _ in ()).throw(socket.timeout("timed out")))
+        _patch_scoped(monkeypatch,
+                      lambda req, timeout=20: (_ for _ in ()).throw(socket.timeout("timed out")))
         probe.shodan_host_lane(ctx)
         term = self._terminal(tmp_path)
         assert term and term[0]["status"] == "failed", term
@@ -1777,8 +1790,8 @@ class TestTheTerminalSpeaksTheProvidersClass:
         from quarry_recon.phases import probe as probe_mod
         wired = TestTheWiredLane()
         probe, ctx, _added, _rec = wired._probe_ctx(tmp_path, monkeypatch)
-        monkeypatch.setattr(probe_mod.urllib.request, "urlopen",
-                            lambda req, timeout=20: (_ for _ in ()).throw(err(str(req.full_url))))
+        _patch_scoped(monkeypatch,
+                      lambda req, timeout=20: (_ for _ in ()).throw(err(str(req.full_url))))
         probe.shodan_host_lane(ctx)
         term = wired._terminal(tmp_path)
         assert term and term[0]["status"] == "failed", term
@@ -1814,8 +1827,8 @@ class TestTheTerminalSpeaksTheProvidersClass:
 
         wired = TestTheWiredLane()
         probe, ctx, _added, _rec = wired._probe_ctx(tmp_path, monkeypatch)
-        monkeypatch.setattr(probe_mod.urllib.request, "urlopen",
-                            lambda req, timeout=20: (_ for _ in ()).throw(_Immutable("nope")))
+        _patch_scoped(monkeypatch,
+                      lambda req, timeout=20: (_ for _ in ()).throw(_Immutable("nope")))
         probe.shodan_host_lane(ctx)                      # must not raise
         term = wired._terminal(tmp_path)
         assert term and term[0]["status"] == "failed", term
@@ -1928,13 +1941,14 @@ class TestSelectionAndOutcomeAreSeparate:
         settings.reset_cache()
         clock = {"t": 0.0}
         monkeypatch.setattr(_b.time, "monotonic", lambda: clock["t"])
-        real = probe.urllib.request.urlopen
+        from quarry_recon import fetch as fetch_mod
+        real = fetch_mod.scoped_public_provider_get
 
-        def slow(req, timeout=20):
+        def slow(ctx, url, origin_host=None, **kwargs):
             clock["t"] += 1.0
-            return real(req, timeout=timeout)
+            return real(ctx, url, origin_host, **kwargs)
 
-        monkeypatch.setattr(probe.urllib.request, "urlopen", slow)
+        monkeypatch.setattr(fetch_mod, "scoped_public_provider_get", slow)
         probe.shodan_host_lane(ctx)
         sel = self._cov(tmp_path, "shodan_host_addresses")
         assert sel and sel[0]["kind"] == events.COVERAGE_CAP, sel
@@ -1946,8 +1960,8 @@ class TestSelectionAndOutcomeAreSeparate:
         from quarry_recon.phases import probe as probe_mod
         wired = TestTheWiredLane()
         probe, ctx, _added, _rec = wired._probe_ctx(tmp_path, monkeypatch)
-        monkeypatch.setattr(probe_mod.urllib.request, "urlopen",
-                            lambda req, timeout=20: (_ for _ in ()).throw(socket.timeout("timed out")))
+        _patch_scoped(monkeypatch,
+                      lambda req, timeout=20: (_ for _ in ()).throw(socket.timeout("timed out")))
         probe.shodan_host_lane(ctx)
         sel = self._cov(tmp_path, "shodan_host_addresses")
         out = self._cov(tmp_path, "shodan_host_answers")
@@ -1978,7 +1992,7 @@ class TestSelectionFollowsTheActualStop:
         probe, ctx, _added, _rec = wired._probe_ctx(
             tmp_path, monkeypatch,
             resolved=[{"host": "www.acme.com", "a": [f"1.1.{b}.1" for b in range(5)]}])
-        monkeypatch.setattr(probe_mod.urllib.request, "urlopen", urlopen)
+        _patch_scoped(monkeypatch, urlopen)
         probe.shodan_host_lane(ctx)
         return wired
 
@@ -2010,13 +2024,14 @@ class TestSelectionFollowsTheActualStop:
         settings.reset_cache()
         clock = {"t": 0.0}
         monkeypatch.setattr(_b.time, "monotonic", lambda: clock["t"])
-        real = probe_mod.urllib.request.urlopen
+        from quarry_recon import fetch as fetch_mod
+        real = fetch_mod.scoped_public_provider_get
 
-        def slow(req, timeout=20):
+        def slow(ctx, url, origin_host=None, **kwargs):
             clock["t"] += 1.0
-            return real(req, timeout=timeout)
+            return real(ctx, url, origin_host, **kwargs)
 
-        monkeypatch.setattr(probe_mod.urllib.request, "urlopen", slow)
+        monkeypatch.setattr(fetch_mod, "scoped_public_provider_get", slow)
         probe.shodan_host_lane(ctx)
         sel = self._cov(tmp_path, "shodan_host_addresses")
         assert sel and sel[0]["kind"] == events.COVERAGE_CAP and sel[0]["omitted"] == 3, sel
@@ -2034,13 +2049,14 @@ class TestSelectionFollowsTheActualStop:
         settings.reset_cache()
         clock = {"t": 0.0}
         monkeypatch.setattr(_b.time, "monotonic", lambda: clock["t"])
-        real = probe_mod.urllib.request.urlopen
+        from quarry_recon import fetch as fetch_mod
+        real = fetch_mod.scoped_public_provider_get
 
-        def slow(req, timeout=20):
+        def slow(ctx, url, origin_host=None, **kwargs):
             clock["t"] += 1.0
-            return real(req, timeout=timeout)
+            return real(ctx, url, origin_host, **kwargs)
 
-        monkeypatch.setattr(probe_mod.urllib.request, "urlopen", slow)
+        monkeypatch.setattr(fetch_mod, "scoped_public_provider_get", slow)
         probe.shodan_host_lane(ctx)
         term = wired._terminal(tmp_path)
         assert term and term[0]["status"] == "partial", term
@@ -2162,7 +2178,7 @@ class TestThePacingContractSurvivesTheCarrier:
         def limited(req, timeout=20):
             raise urllib.error.HTTPError(str(req.full_url), 429, "slow down", hdrs, io.BytesIO(b"slow"))
 
-        monkeypatch.setattr(probe_mod.urllib.request, "urlopen", limited)
+        _patch_scoped(monkeypatch, limited)
         monkeypatch.setattr(probe_mod._time, "sleep", lambda s: waited.append(s))
         probe.shodan_host_lane(ctx)
         assert waited, "a 429 was not honored at all"
@@ -2175,7 +2191,7 @@ class TestThePacingContractSurvivesTheCarrier:
             raise urllib.error.HTTPError(str(req.full_url), 404, "Not Found", {},
                                         io.BytesIO(b'{"error": "No information available for that IP."}'))
 
-        monkeypatch.setattr(probe_mod.urllib.request, "urlopen", refused)
+        _patch_scoped(monkeypatch, refused)
         raw, code, err = probe_mod._shodan_host_get("https://api.shodan.io/shodan/host/1.1.1.1?key=x", 5)
         assert raw == b"" and err is not None and code == 404
         assert err.code == 404 and err.error_class in ("http", "auth", "error"), err.error_class
@@ -2195,7 +2211,7 @@ class TestThePacingContractSurvivesTheCarrier:
         def refused(req, timeout=20):
             raise _Immutable(str(req.full_url), 500, "boom", {}, io.BytesIO(b"nope"))
 
-        monkeypatch.setattr(probe_mod.urllib.request, "urlopen", refused)
+        _patch_scoped(monkeypatch, refused)
         raw, code, err = probe_mod._shodan_host_get("https://api.shodan.io/shodan/host/1.1.1.1?key=x", 5)
         assert raw == b"" and err is not None and err.error_class == "server", err
         assert code == 500, code
@@ -2220,8 +2236,8 @@ class TestTheProvidersStatusIsNotAssumed:
 
     def test_the_REAL_adapter_reports_the_response_status(self, monkeypatch):
         from quarry_recon.phases import probe as probe_mod
-        monkeypatch.setattr(probe_mod.urllib.request, "urlopen",
-                            lambda req, timeout=20: _Resp(_body("1.1.1.1"), status=201))
+        _patch_scoped(monkeypatch,
+                      lambda req, timeout=20: _Resp(_body("1.1.1.1"), status=201))
         raw, code, err = probe_mod._shodan_host_get("https://api.shodan.io/shodan/host/1.1.1.1?key=x", 5)
         assert err is None and code == 201 and raw, (code, err)
 
@@ -2229,8 +2245,8 @@ class TestTheProvidersStatusIsNotAssumed:
         from quarry_recon.phases import probe as probe_mod
         wired = TestTheWiredLane()
         probe, ctx, added, _rec = wired._probe_ctx(tmp_path, monkeypatch)
-        monkeypatch.setattr(probe_mod.urllib.request, "urlopen",
-                            lambda req, timeout=20: _Resp(_body("1.1.1.1"), status=201))
+        _patch_scoped(monkeypatch,
+                      lambda req, timeout=20: _Resp(_body("1.1.1.1"), status=201))
         probe.shodan_host_lane(ctx)
         assert added == [], "an unmeasured status produced evidence"
         term = wired._terminal(tmp_path)
@@ -2434,7 +2450,7 @@ class TestAProvenLimitIsALimit:
             raise urllib.error.HTTPError(url, 401, "unauthorized", {},
                                         io.BytesIO(json.dumps({"error": self.QUOTA}).encode()))
 
-        monkeypatch.setattr(probe_mod.urllib.request, "urlopen", urlopen)
+        _patch_scoped(monkeypatch, urlopen)
         probe.shodan_host_lane(ctx)
         return wired, seen
 
@@ -2492,7 +2508,7 @@ class TestAProvenLimitIsALimit:
             raise urllib.error.HTTPError(url, 401, "unauthorized", {},
                                         io.BytesIO(json.dumps({"error": self.QUOTA}).encode()))
 
-        monkeypatch.setattr(probe_mod.urllib.request, "urlopen", urlopen)
+        _patch_scoped(monkeypatch, urlopen)
         probe.shodan_host_lane(ctx)
         term = wired._terminal(tmp_path)
         assert term and term[0]["status"] == "partial", term
@@ -2621,13 +2637,14 @@ class TestProgressIsLockedAndStrict:
         settings.reset_cache()
         clock = {"t": 0.0}
         monkeypatch.setattr(_b.time, "monotonic", lambda: clock["t"])
-        real = probe_mod.urllib.request.urlopen
+        from quarry_recon import fetch as fetch_mod
+        real = fetch_mod.scoped_public_provider_get
 
-        def slow(req, timeout=20):
+        def slow(ctx, url, origin_host=None, **kwargs):
             clock["t"] += 1.0
-            return real(req, timeout=timeout)
+            return real(ctx, url, origin_host, **kwargs)
 
-        monkeypatch.setattr(probe_mod.urllib.request, "urlopen", slow)
+        monkeypatch.setattr(fetch_mod, "scoped_public_provider_get", slow)
         monkeypatch.setattr(sh.SweepProgress, "save", lambda self: False)
         probe.shodan_host_lane(ctx)
         sel = [e for e in wired._events(tmp_path) if e.get("measure") == "shodan_host_addresses"]
@@ -2705,8 +2722,8 @@ class TestErrorEvidenceIsByteSafe:
                                                      if path.name == ".quarry-write-probe" else False))
         quota = ("Insufficient query credits, please upgrade your API plan or wait for the monthly "
                  "limit to reset")
-        monkeypatch.setattr(probe_mod.urllib.request, "urlopen",
-                            lambda req, timeout=20: (_ for _ in ()).throw(
+        _patch_scoped(monkeypatch,
+                      lambda req, timeout=20: (_ for _ in ()).throw(
                                 urllib.error.HTTPError(str(req.full_url), 401, "unauthorized", {},
                                                        io.BytesIO(json.dumps({"error": quota}).encode()))))
         probe.shodan_host_lane(ctx)
@@ -2739,7 +2756,7 @@ class TestMixedLimitsAreStructured:
             raise urllib.error.HTTPError(url, 401, "unauthorized", {},
                                         io.BytesIO(json.dumps({"error": self.QUOTA}).encode()))
 
-        monkeypatch.setattr(probe_mod.urllib.request, "urlopen", urlopen)
+        _patch_scoped(monkeypatch, urlopen)
         probe.shodan_host_lane(ctx)
         return wired, seen
 
@@ -2820,8 +2837,8 @@ class TestCountersDoNotMixUnits:
         from quarry_recon.phases import probe as probe_mod
         wired = TestTheWiredLane()
         probe, ctx, _added, _rec = wired._probe_ctx(tmp_path, monkeypatch)
-        monkeypatch.setattr(probe_mod.urllib.request, "urlopen",
-                            lambda req, timeout=20: (_ for _ in ()).throw(
+        _patch_scoped(monkeypatch,
+                      lambda req, timeout=20: (_ for _ in ()).throw(
                                 urllib.error.HTTPError(str(req.full_url), 401, "unauthorized", {},
                                                        io.BytesIO(json.dumps({"error": quota}).encode()))))
         probe.shodan_host_lane(ctx)
@@ -3006,10 +3023,14 @@ class TestSelectionIsAClaim:
         wired = TestTheWiredLane()
         probe, ctx, added, _rec = wired._probe_ctx(tmp_path, monkeypatch)
         calls = []
-        real = probe_mod.urllib.request.urlopen
-        monkeypatch.setattr(probe_mod.urllib.request, "urlopen",
-                            lambda req, timeout=20: (calls.append(str(req.full_url)),
-                                                     real(req, timeout=timeout))[1])
+        from quarry_recon import fetch as fetch_mod
+        real = fetch_mod.scoped_public_provider_get
+
+        def traced(ctx, url, origin_host=None, **kwargs):
+            calls.append(url)
+            return real(ctx, url, origin_host, **kwargs)
+
+        monkeypatch.setattr(fetch_mod, "scoped_public_provider_get", traced)
         with sh.sweep_session(sh.progress_path(ctx.run.project_dir)):
             probe.shodan_host_lane(ctx)
         assert calls == [], f"a contended run still queried: {calls}"
@@ -3043,8 +3064,9 @@ class TestSelectionIsAClaim:
         monkeypatch.setattr(settings, "concurrency", lambda k, d=None: 0)
         monkeypatch.setattr(probe_mod.settings, "concurrency", lambda k, d=None: 0)
         calls = []
-        monkeypatch.setattr(probe_mod.urllib.request, "urlopen",
-                            lambda req, timeout=20: calls.append(str(req.full_url)))
+        from quarry_recon import fetch as fetch_mod
+        monkeypatch.setattr(fetch_mod, "scoped_public_provider_get",
+                            lambda ctx, url, origin_host=None, **kwargs: calls.append(url))
         run.add("resolved", {"host": "www.acme.com", "a": ["1.1.1.1"]})
         ctx = SimpleNamespace(run=run, echo=lambda *a: None, http_timeout=20,
                               scope=SimpleNamespace(in_scope=lambda h: h.endswith("acme.com"),
@@ -3082,7 +3104,7 @@ class TestARefusalIsNotAnAnswer:
             raise urllib.error.HTTPError(str(req.full_url), 401, "unauthorized", {},
                                         io.BytesIO(json.dumps({"error": self.QUOTA}).encode()))
 
-        monkeypatch.setattr(probe_mod.urllib.request, "urlopen", urlopen)
+        _patch_scoped(monkeypatch, urlopen)
         probe.shodan_host_lane(ctx)
         return wired
 
@@ -3180,10 +3202,14 @@ class TestASaveCannotClaimAnUnlockedWrite:
         settings.reset_cache()
         clock = {"t": 0.0}
         monkeypatch.setattr(_b.time, "monotonic", lambda: clock["t"])
-        real = probe_mod.urllib.request.urlopen
-        monkeypatch.setattr(probe_mod.urllib.request, "urlopen",
-                            lambda req, timeout=20: (clock.__setitem__("t", clock["t"] + 1.0),
-                                                     real(req, timeout=timeout))[1])
+        from quarry_recon import fetch as fetch_mod
+        real = fetch_mod.scoped_public_provider_get
+
+        def slow(ctx, url, origin_host=None, **kwargs):
+            clock["t"] += 1.0
+            return real(ctx, url, origin_host, **kwargs)
+
+        monkeypatch.setattr(fetch_mod, "scoped_public_provider_get", slow)
         monkeypatch.setattr(sh, "_open_lock", lambda path, **kw: None)     # locking unavailable
         probe.shodan_host_lane(ctx)
         sel = [e for e in wired._events(tmp_path) if e.get("measure") == "shodan_host_addresses"]

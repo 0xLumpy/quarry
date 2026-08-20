@@ -265,7 +265,8 @@ class TestTheRegistryTellsTheTruth:
             assert policy.SOURCE_OWNERSHIP[lane] == "quarry_provider", lane
             assert lane in policy.PROVIDER_LANES, lane
         src = pathlib.Path(importlib.import_module("quarry_recon.phases.vertical").__file__).read_text()
-        assert "api.certspotter.com" in src and "urllib.request.urlopen" in src
+        assert "api.certspotter.com" in src and "fetch.scoped_public_provider_get" in src
+        assert "urllib.request.urlopen" not in src
 
     def test_the_boundary_is_OWNERSHIP_not_keyed_ness(self):
         """Quarry owns the call, the key or the budget -> ours. An external tool reading its OWN provider
