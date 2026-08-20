@@ -2935,12 +2935,17 @@ def test_consume_reaps_a_grant_closed_by_an_uncertain_prior_close(monkeypatch):
                 stop_event=threading.Event(),
             )
         assert registry._grants == [grant]
+        assert close_effect == [held]
+        assert probe_fault == [held]
+        with pytest.raises(OSError) as initially_closed:
+            real_fstat(held)
+        assert initially_closed.value.errno == errno.EBADF
 
         real_socket_identity = network_broker._socket_identity
 
         def identity_refuses_closed_grant(fd):
             if fd == held:
-                raise NetworkBrokerRefused("injected identity refusal")
+                raise OSError(errno.EBADF, "injected identity read fault")
             return real_socket_identity(fd)
 
         monkeypatch.setattr(

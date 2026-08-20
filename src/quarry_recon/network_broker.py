@@ -2711,6 +2711,13 @@ class ControlEndpointRegistry:
                     try:
                         identity = _socket_identity(grant.client_fd)
                     except (OSError, NetworkBrokerError) as exc:
+                        # An identity read can race an earlier close whose
+                        # result was uncertain.  Reap only after the separate
+                        # descriptor liveness check proves that this exact
+                        # grant fd is gone (or has been reused).  In
+                        # particular, do not use endpoint validation below as
+                        # a reason to close or discard an otherwise live
+                        # grant.
                         try:
                             closed = self._grant_fd_closed(grant)
                         except NetworkBrokerRefused as probe_exc:
