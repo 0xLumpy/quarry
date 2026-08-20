@@ -208,6 +208,49 @@ class TestVerdict:
         assert r2.status == Status.EMPTY and called == []   # all skipped, verdict still EMPTY
 
 
+class TestTransportIdentity:
+    def test_default_fast_scan_uses_exact_canonical_batch_hosts_without_redirect_following(
+            self, monkeypatch, tmp_path):
+        c = _fresh(monkeypatch, tmp_path)
+        monkeypatch.setattr(settings, "concurrency",
+                            lambda k, d=None: {"DALFOX_CHUNK": 4, "DALFOX_TARGETS": 4}.get(k, d))
+        calls = []
+        base = _exec(META0, 0)
+
+        def capture(*args, **kwargs):
+            calls.append((args, kwargs))
+            return base(*args, **kwargs)
+
+        monkeypatch.setattr(params, "exec_tool", capture)
+        params._dalfox_xss_fast(
+            c, ["https://EXAMPLE.test/a?q=", "https://[2001:db8::1]/b?q="], _Prof(),
+        )
+
+        args, kwargs = calls[0]
+        assert "-F" not in args[1]
+        assert kwargs["source_id"] == "params.dalfox_xss_fast"
+        assert kwargs["network_hosts"] == ("2001:db8::1", "example.test")
+
+    def test_armed_scan_uses_blind_transport_identity_without_exact_host_claim(
+            self, monkeypatch, tmp_path):
+        c = _fresh(monkeypatch, tmp_path)
+        calls = []
+        base = _exec(META0, 0)
+
+        def capture(*args, **kwargs):
+            calls.append((args, kwargs))
+            return base(*args, **kwargs)
+
+        monkeypatch.setattr(params, "exec_tool", capture)
+        prof = type("P", (), {"http_rl": 0, "blind_xss": True})()
+        params._dalfox_xss_fast(c, ["https://example.test/a?q="], prof)
+
+        args, kwargs = calls[0]
+        assert "--blind-oob" in args[1]
+        assert kwargs["source_id"] == "params.blind_xss"
+        assert "network_hosts" not in kwargs
+
+
 class TestRetryEvidence:
     def test_noncurrent_preserved_prior_is_never_parsed_hashed_or_reported(
         self, monkeypatch, tmp_path,

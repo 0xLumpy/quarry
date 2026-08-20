@@ -2394,19 +2394,38 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
                 _oob["attempted"] += 1
             try:
                 with blind_oob_credential(_plan_for_run["secret"]) as _cred:
-                    res = exec_tool(
-                        "dalfox", _dalfox_cmd(
-                            bf, cf, prof, len(batch), _cred, oob_plan=_plan_for_run,
-                        ),
-                                    repository=ctx.run,
-                                    stdout=RepositoryOutput.discard(),
-                                    stderr=RepositoryOutput.discard(),
-                                    native_outputs=(RepositoryNativeOutput.file(
-                                        6, *cf.relative_to(ctx.run.dir).parts, required=False,
-                                    ),),
-                                    ok_codes=(0, 1),
-                                    timeout=scaled_timeout(len(batch), ctx.http_timeout, 30),
-                                    source_id="params.dalfox_xss_fast")
+                    # Reflected-only Dalfox contacts exactly the hosts in this actual
+                    # invocation (a resume may have narrowed `batch` to its owed URLs).
+                    # An armed OOB scan also contacts its callback infrastructure, so
+                    # it retains the proxy transport and its distinct authority identity.
+                    network_hosts = ()
+                    if not _plan_for_run["armed"]:
+                        network_hosts = tuple(sorted({normalize.host_of_url(url) for url in batch}))
+                        if not network_hosts or "" in network_hosts:
+                            raise ValueError("Dalfox batch contains a URL without a canonical network host")
+                    exec_kwargs = {
+                        "repository": ctx.run,
+                        "stdout": RepositoryOutput.discard(),
+                        "stderr": RepositoryOutput.discard(),
+                        "native_outputs": (RepositoryNativeOutput.file(
+                            6, *cf.relative_to(ctx.run.dir).parts, required=False,
+                        ),),
+                        "ok_codes": (0, 1),
+                        "timeout": scaled_timeout(len(batch), ctx.http_timeout, 30),
+                    }
+                    command = _dalfox_cmd(
+                        bf, cf, prof, len(batch), _cred, oob_plan=_plan_for_run,
+                    )
+                    if _plan_for_run["armed"]:
+                        res = exec_tool(
+                            "dalfox", command, source_id="params.blind_xss",
+                            **exec_kwargs,
+                        )
+                    else:
+                        res = exec_tool(
+                            "dalfox", command, source_id="params.dalfox_xss_fast",
+                            network_hosts=network_hosts, **exec_kwargs,
+                        )
                     # proven by the runner, never inferred: a missing binary, a cancelled launch or a Popen
                     # that raised must not read as a process that ran with the armed channel
                     if _plan_for_run["armed"] and getattr(res, "started", False):

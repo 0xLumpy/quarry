@@ -36,6 +36,7 @@ class TransportDoor:
     helpers: tuple[str, ...]
     descendants: tuple[str, ...]
     required_argv: tuple[str, ...]
+    forbidden_argv: tuple[str, ...]
     connect_time_peer: bool
     broker_required: bool
     supported: bool
@@ -52,12 +53,12 @@ AUTHORITY_CLASSES = (
 
 
 def _door(source_id: str, kind: str, authority_class: str, profile: str, *,
-          argv0=(), helpers=(), descendants=(), required_argv=(),
+          argv0=(), helpers=(), descendants=(), required_argv=(), forbidden_argv=(),
           connect_time_peer=True, broker_required=True, supported=True,
           unsupported_reason="") -> TransportDoor:
     return TransportDoor(
         source_id, kind, authority_class, profile, tuple(argv0), tuple(helpers),
-        tuple(descendants), tuple(required_argv), connect_time_peer,
+        tuple(descendants), tuple(required_argv), tuple(forbidden_argv), connect_time_peer,
         broker_required, supported, unsupported_reason,
     )
 
@@ -132,8 +133,11 @@ _register(("probe.httpx", "enrich.httpx", "vertical.wildcard_http",
           required_argv=("-duc", "-follow-host-redirects"))
 _register(("params.arjun",), "external-http", "target", "target-http-exact",
           argv0=("arjun",), required_argv=("--disable-redirects",))
-_register(("params.blind_xss", "params.dalfox", "params.dalfox_xss_fast"),
-          "external-http", "target", "target-http-proxy", argv0=("dalfox",))
+_register(("params.dalfox_xss_fast",), "external-http", "target",
+          "target-http-exact", argv0=("dalfox",), required_argv=("--skip-mining",),
+          forbidden_argv=("-F", "--follow-redirects"))
+_register(("params.blind_xss", "params.dalfox"), "external-http", "target",
+          "target-http-proxy", argv0=("dalfox",))
 _register(("params.nuclei_oast", "params.nuclei_scan", "params.nuclei_takeover",
            "probe.nuclei_waf", "enrich.nuclei_waf"), "external-template-http", "target",
           "nuclei-authorized-http", argv0=("nuclei",), required_argv=("-duc",))
@@ -401,6 +405,8 @@ def transport_door(source_id: str, *, argv=None, helper: str | None = None) -> T
     if Path(argv[0]).name not in door.argv0:
         return None
     if any(required not in argv for required in door.required_argv):
+        return None
+    if any(value.split("=", 1)[0] in door.forbidden_argv for value in argv):
         return None
     return door
 

@@ -181,6 +181,17 @@ def test_transport_lookup_never_falls_back_to_a_tool_basename():
             "ffuf", "-noninteractive", "-u", "https://example.test",
         ),
     ).profile == "target-http-exact"
+    assert network_policy.transport_door(
+        "params.dalfox_xss_fast", argv=("dalfox", "scan"),
+    ) is None
+    assert network_policy.transport_door(
+        "params.dalfox_xss_fast", argv=("dalfox", "scan", "--skip-mining"),
+    ).profile == "target-http-exact"
+    for redirect_flag in ("-F", "--follow-redirects", "--follow-redirects=true"):
+        assert network_policy.transport_door(
+            "params.dalfox_xss_fast",
+            argv=("dalfox", "scan", "--skip-mining", redirect_flag),
+        ) is None
 
 
 def test_transport_lookup_requires_exact_native_helper_identity():
