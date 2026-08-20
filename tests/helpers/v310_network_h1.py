@@ -1372,7 +1372,11 @@ def main() -> int:
             and record.get("peer") == _FIXTURE_IP
             for record in controller_summary["records"]):
         acceptance_errors.append("controller_direct_target")
-    if any(int(value, 16) != 0 for value in capability_lines.values()):
+    # An ordinary unprivileged process retains an inert capability bounding
+    # set.  The executable authority sets must be empty; CapBnd is retained in
+    # the report as an environmental fact, not misreported as active authority.
+    if any(int(capability_lines[name], 16) != 0
+           for name in ("CapInh", "CapPrm", "CapEff", "CapAmb")):
         acceptance_errors.append("worker_capabilities")
     if any(value not in {errno.EACCES, errno.EPERM}
            for value in dumpability_witness.values()):
