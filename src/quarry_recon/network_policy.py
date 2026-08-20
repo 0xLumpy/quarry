@@ -114,7 +114,7 @@ for _sid, _helper in {
 # Target-facing external HTTP/TLS/browser doors.  Redirect-capable tools need
 # the pinned per-authority proxy at integration; a union of approved IPs is not
 # enough to bind Host/SNI and every redirect.
-_register(("content.ffuf",), "external-http", "target", "content-ffuf",
+_register(("content.ffuf",), "external-http", "target", "target-http-exact",
           argv0=("ffuf",))
 _register(("probe.ffuf_vhost",), "external-http", "target", "target-http-exact",
           argv0=("ffuf",), required_argv=("-noninteractive",))
@@ -277,8 +277,7 @@ TRANSPORT_DOORS = MappingProxyType({**_registered_doors, **_auxiliary_doors})
 del _sid, _helper
 
 _PROXY_BOUND_PROFILES = frozenset({
-    "browser-pipe-proxy", "content-ffuf",
-    "target-http-proxy", "nuclei-authorized-http",
+    "browser-pipe-proxy", "target-http-proxy", "nuclei-authorized-http",
 })
 _CIDR_PEER_PROFILES = frozenset({
     "target-connect-scan", "target-connect-service", "target-cidr-tls",

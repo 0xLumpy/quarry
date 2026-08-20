@@ -172,7 +172,7 @@ def test_transport_lookup_never_falls_back_to_a_tool_basename():
     ) is None
     assert network_policy.transport_door(
         "content.ffuf", argv=("ffuf", "-u", "https://example.test"),
-    ).profile == "content-ffuf"
+    ).profile == "target-http-exact"
     assert network_policy.transport_door(
         "probe.ffuf_vhost", argv=("ffuf", "-u", "https://example.test"),
     ) is None

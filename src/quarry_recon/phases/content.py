@@ -12,7 +12,7 @@ import hashlib
 from importlib import resources
 from pathlib import Path
 
-from .. import budget, events, normalize, settings
+from .. import budget, events, netguard, normalize, settings
 from ..contract import run_contract
 from ..runner import (Status, ffuf_http_row, ffuf_results, ffuf_usable_rows,
                       fresh_artifact_dir as runner_fresh,
@@ -100,6 +100,15 @@ def _run_one(ctx, url, wl, wl_digest, mc, recurse, ct_to, out, prof):
     if recurse:                                  # 11.2: balanced/deep only (gated by the caller)
         cmd += ["-recursion", "-recursion-depth", str(recurse)]
     hard = ct_to + 60 if ct_to else 0            # backstop when bounded; unbounded (0) when ct_to==0
+    network_host = normalize.host_of_url(url)
+    try:
+        network_literal = netguard.canonical_ip_set((network_host,))
+    except (TypeError, ValueError):
+        network_literal = ()
+    network_host = (network_literal[0] if network_literal
+                    else normalize.canon_host_strict(network_host))
+    if network_host is None:
+        raise ValueError("content target does not contain a canonical hostname")
     # per-target work_unit binds the target URL + coverage config (match codes, recursion depth,
     # wordlist) + wordlist digest → re-run on any change.
     wu = events.work_unit("content.ffuf", inputs={"url": url},
@@ -114,6 +123,7 @@ def _run_one(ctx, url, wl, wl_digest, mc, recurse, ct_to, out, prof):
             16, *out.relative_to(ctx.run.dir).parts,
         ),),
         work_unit=wu, timeout=hard,
+        network_hosts=(network_host,),
         reclassify=lambda res, o=out, e=errf: reclassify_ffuf(res, o, e, ct_to or None),
     )
 

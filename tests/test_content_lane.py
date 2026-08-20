@@ -103,10 +103,12 @@ def _drive(tmp_path, monkeypatch, live, *, body=None, status=Status.SUCCESS, bud
     # test's own override — so the two config-change tests re-used one fingerprint and proved nothing.
     monkeypatch.setattr(content, "_merged_wordlist", lambda c, wl: (wl.write_text(wl_body), wl)[1])
     seen = []
+    contract_kwargs = []
 
     def fake(sid, cmd, **k):
         out = __import__("pathlib").Path(cmd[cmd.index("-o") + 1])
         seen.append(out)
+        contract_kwargs.append(k)
         b = bodies.pop(0) if bodies else body
         if b is not None:
             out.parent.mkdir(parents=True, exist_ok=True)
@@ -117,6 +119,7 @@ def _drive(tmp_path, monkeypatch, live, *, body=None, status=Status.SUCCESS, bud
     monkeypatch.setattr(content, "run_contract", fake)
     c = ctx or _Ctx(tmp_path, live)
     content.run(c)
+    c.contract_kwargs = contract_kwargs
     return c, seen
 
 
@@ -126,6 +129,14 @@ def _cov(tmp_path, measure):
 
 
 class TestNoMembershipCap:
+    def test_ffuf_declares_canonical_origin_for_exact_transport(self, tmp_path, monkeypatch):
+        c, _ = _drive(tmp_path, monkeypatch, _live("https://H.Ex.COM:443"), body=_rows())
+        assert c.contract_kwargs[0]["network_hosts"] == ("h.ex.com",)
+
+    def test_ffuf_preserves_an_ipv6_origin_as_an_address(self, tmp_path, monkeypatch):
+        c, _ = _drive(tmp_path, monkeypatch, _live("https://[2001:db8::1]:443"), body=_rows())
+        assert c.contract_kwargs[0]["network_hosts"] == ("2001:db8::1",)
+
     def test_every_eligible_service_is_scanned(self, tmp_path, monkeypatch):
         """MAX_HOSTS=25 silently excluded 473 of 498 eligible services on the OTC run."""
         live = _live(*[f"https://h{i}.ex.com" for i in range(40)])
