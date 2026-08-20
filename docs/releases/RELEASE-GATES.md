@@ -209,6 +209,12 @@ threshold, and machine-evidence contracts have not been configured.
 
 These run for the exact candidate after Phase B is green.
 
+The source verifier strictly checks retained collector-produced evidence bytes,
+including the `C-PACKAGE-BUILD` clean-build log. CI's captured build output is
+diagnostic input only: a trusted P0 collector must assemble, index, and sign a
+candidate record externally. That collector and production signing authority
+remain open; these checks do not close the release gate.
+
 #### Package and supply chain
 
 | Gate | Lane | Requirement | Machine evidence |

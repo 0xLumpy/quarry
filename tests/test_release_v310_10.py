@@ -19,6 +19,7 @@ pytestmark = pytest.mark.offline
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 CHECKOUT = "actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5"
 SETUP_PYTHON = "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065"
+UPLOAD_ARTIFACT = "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
 
 
 def _text(path: str) -> str:
@@ -79,10 +80,25 @@ def test_pull_request_ci_selects_every_public_nonlive_lane_separately():
         assert len(pytest_steps) == 1
         assert all("verify-quarry-live.sh" not in step.get("run", "") for step in job["steps"])
         actions = [step["uses"] for step in job["steps"] if "uses" in step]
-        assert actions == [CHECKOUT, SETUP_PYTHON]
+        expected_actions = [CHECKOUT, SETUP_PYTHON]
+        if name in {"offline", "package"}:
+            expected_actions.append(UPLOAD_ARTIFACT)
+        assert actions == expected_actions
         assert job["timeout-minutes"] <= 45
     assert jobs["offline"]["strategy"]["matrix"]["python-version"] == ["3.10", "3.12"]
     assert jobs["package"]["strategy"]["matrix"]["python-version"] == ["3.10", "3.12"]
+    package_steps = jobs["package"]["steps"]
+    build_index = next(
+        index for index, step in enumerate(package_steps)
+        if step.get("name") == "Build clean candidate worktrees twice and retain combined logs"
+    )
+    upload = package_steps[build_index + 1]
+    assert upload["name"] == "Upload bounded clean-build logs"
+    assert upload["uses"] == UPLOAD_ARTIFACT
+    assert upload["with"]["path"].splitlines() == [
+        "${{ runner.temp }}/quarry-build-a.log",
+        "${{ runner.temp }}/quarry-build-b.log",
+    ]
 
 
 def test_offline_and_authorized_live_diagnostics_are_separate():

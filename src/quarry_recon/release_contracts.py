@@ -300,6 +300,7 @@ REQUIRED_ARTIFACTS = {
     "B-DETERMINISM": (("artifact-tree-diff", "application/json"),),
     "B-DOCS-POLICY": (("parity-report", "application/json"),),
     "C-PACKAGE-BUILD": (
+        ("build-log", "application/json"),
         ("package-inventory", "application/json"),
         ("sdist", "application/gzip"),
         ("wheel", "application/zip"),
@@ -444,6 +445,10 @@ _TOKEN_RE = evidence._TOKEN_RE
 _GATE_ID_RE = evidence._GATE_ID_RE
 _MEDIA_TYPE_RE = evidence._MEDIA_TYPE_RE
 _DOCUMENT_BYTES = evidence.MAX_RECORD_BYTES
+_BUILD_LOG_OUTPUT_BYTES = 65_536
+_CLEAN_BUILD_COMMAND = (
+    "python", "-m", "build", "--sdist", "--wheel", "--outdir", "dist",
+)
 _ED25519_P = 2**255 - 19
 _ED25519_L = 2**252 + 27742317777372353535851937790883648493
 _ED25519_D = (-121665 * pow(121666, _ED25519_P - 2, _ED25519_P)) % _ED25519_P
@@ -1357,6 +1362,29 @@ def _base64(value: object, name: str, *, size: int) -> bytes:
         raise evidence.EvidenceError(f"{name} is not canonical base64") from exc
     if len(decoded) != size or base64.b64encode(decoded).decode("ascii") != text[7:]:
         raise evidence.EvidenceError(f"{name} must contain exactly {size} canonical bytes")
+    return decoded
+
+
+def _bounded_base64(value: object, name: str, *, maximum: int) -> bytes:
+    """Read canonical base64 retained output without treating it as text.
+
+    Build tools may emit newlines and other printable control characters.  The
+    gate record therefore retains their combined stdout/stderr as bounded raw
+    bytes instead of asking a JSON string to normalize it.
+    """
+    text = _string(value, name)
+    if not text.startswith("base64:"):
+        raise evidence.EvidenceError(f"{name} must use the base64: encoding label")
+    try:
+        decoded = base64.b64decode(text[7:], validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise evidence.EvidenceError(f"{name} is not canonical base64") from exc
+    if not decoded:
+        raise evidence.EvidenceError(f"{name} must retain non-empty combined output")
+    if len(decoded) > maximum:
+        raise evidence.EvidenceError(f"{name} exceeds its retained-output bound")
+    if base64.b64encode(decoded).decode("ascii") != text[7:]:
+        raise evidence.EvidenceError(f"{name} is not canonical base64")
     return decoded
 
 
@@ -2659,6 +2687,36 @@ def _validate_package_artifacts(bodies: Mapping[str, bytes], *, identity: dict) 
     } for name, media_type in (("sdist", "application/gzip"), ("wheel", "application/zip"))]
     if doc["subjects"] != expected:
         raise evidence.EvidenceError("package inventory does not reconcile the sdist and wheel bytes")
+
+    build_log = _object(
+        _artifact_document(bodies["build-log"], "C-PACKAGE-BUILD", "build-log"),
+        "clean build log",
+        {
+            "artifact_type", "candidate_identity_digest", "clean_tree", "command",
+            "combined_output", "exit_code", "gate_id", "package", "release",
+            "schema_version", "subjects",
+        },
+    )
+    if build_log["artifact_type"] != "clean-build-log" or \
+            build_log["schema_version"] != GATE_ARTIFACT_SCHEMA or \
+            build_log["release"] != RELEASE or \
+            build_log["gate_id"] != "C-PACKAGE-BUILD" or \
+            build_log["candidate_identity_digest"] != evidence.canonical_digest(identity):
+        raise evidence.EvidenceError("clean build log is bound to the wrong contract")
+    if build_log["package"] != {"name": "quarry-recon", "version": RELEASE}:
+        raise evidence.EvidenceError("clean build log identifies the wrong package")
+    if build_log["command"] != list(_CLEAN_BUILD_COMMAND):
+        raise evidence.EvidenceError("clean build log does not carry the exact clean build command")
+    if build_log["clean_tree"] is not True:
+        raise evidence.EvidenceError("clean build log does not attest a clean working tree")
+    if type(build_log["exit_code"]) is not int or build_log["exit_code"] != 0:
+        raise evidence.EvidenceError("clean build log does not record a zero exit")
+    _bounded_base64(
+        build_log["combined_output"], "clean build log.combined_output",
+        maximum=_BUILD_LOG_OUTPUT_BYTES,
+    )
+    if build_log["subjects"] != expected:
+        raise evidence.EvidenceError("clean build log does not reconcile the sdist and wheel bytes")
 
 
 def _statistic(values: Sequence[int], kind: str) -> int:

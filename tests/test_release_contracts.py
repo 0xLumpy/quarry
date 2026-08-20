@@ -534,6 +534,27 @@ def _supporting_bodies(
     elif gate_id == "C-PACKAGE-BUILD":
         bodies["sdist"] = _synthetic_sdist()
         bodies["wheel"] = _synthetic_wheel()
+        subjects = [{
+            "digest": contracts.raw_sha256(bodies[name]),
+            "media_type": media_type,
+            "name": name,
+            "size": len(bodies[name]),
+        } for name, media_type in (("sdist", "application/gzip"), ("wheel", "application/zip"))]
+        bodies["build-log"] = contracts.canonical_json_line({
+            "artifact_type": "clean-build-log",
+            "candidate_identity_digest": evidence.canonical_digest(identity),
+            "clean_tree": True,
+            "command": list(contracts._CLEAN_BUILD_COMMAND),
+            "combined_output": "base64:" + base64.b64encode(
+                b"* Creating isolated environment: venv+pip...\nSuccessfully built fixture\n"
+            ).decode("ascii"),
+            "exit_code": 0,
+            "gate_id": gate_id,
+            "package": {"name": "quarry-recon", "version": "0.3.10"},
+            "release": "0.3.10",
+            "schema_version": contracts.GATE_ARTIFACT_SCHEMA,
+            "subjects": subjects,
+        })
         bodies["package-inventory"] = contracts.canonical_json_line({
             "artifact_type": "package-inventory",
             "candidate_identity_digest": evidence.canonical_digest(identity),
@@ -541,12 +562,7 @@ def _supporting_bodies(
             "package": {"name": "quarry-recon", "version": "0.3.10"},
             "release": "0.3.10",
             "schema_version": contracts.PACKAGE_INVENTORY_SCHEMA,
-            "subjects": [{
-                "digest": contracts.raw_sha256(bodies[name]),
-                "media_type": media_type,
-                "name": name,
-                "size": len(bodies[name]),
-            } for name, media_type in (("sdist", "application/gzip"), ("wheel", "application/zip"))],
+            "subjects": subjects,
         })
     elif gate_id == "C-NETWORK-BOUNDARY":
         bodies["network-boundary-trace"] = _network_boundary_body(identity, support)
@@ -1509,7 +1525,7 @@ class TestCommittedContracts:
         )
         variant_names = [reference["$ref"].rsplit("/", 1)[-1] for reference in schema["oneOf"]]
         assert variant_names == [
-            "machine_report", "package_inventory", "benchmark_baseline",
+            "machine_report", "clean_build_log", "package_inventory", "benchmark_baseline",
             "benchmark_trials", "benchmark_invalidations", "benchmark_report", "sbom",
             "provenance", "publication_subjects", "synthetic_corpus_disclosure_attestation",
             "aggregator_conformance_report", "h0_test_report", "h0_isolation_self_test",
@@ -1525,6 +1541,12 @@ class TestCommittedContracts:
         assert schema["$defs"]["benchmark_trials"]["properties"]["trials"][
             "maxItems"
         ] == 1000
+        clean_build_log = schema["$defs"]["clean_build_log"]
+        assert clean_build_log["properties"]["command"]["const"] == \
+            list(contracts._CLEAN_BUILD_COMMAND)
+        assert clean_build_log["properties"]["exit_code"] == {"const": 0}
+        assert schema["$defs"]["build_output"]["maxLength"] == 87_391
+        assert schema["$defs"]["build_output"]["minLength"] == 11
         h0_runs = schema["$defs"]["h0_test_report"]["properties"]["runs"]
         assert h0_runs["minItems"] == h0_runs["maxItems"] == 2
         h0_fragments = schema["$defs"]["h0_run"]["properties"]["fragments"]
@@ -2591,6 +2613,23 @@ class TestArtifactsAndAggregation:
                 "exact support matrix",
             ),
             ("C-PACKAGE-BUILD", "wheel", "invalid-wheel", "readable ZIP archive"),
+            (
+                "C-PACKAGE-BUILD", "build-log", "wrong-build-command",
+                "exact clean build command",
+            ),
+            (
+                "C-PACKAGE-BUILD", "build-log", "nonzero-build-exit", "zero exit",
+            ),
+            (
+                "C-PACKAGE-BUILD", "build-log", "invalid-build-output", "base64",
+            ),
+            (
+                "C-PACKAGE-BUILD", "build-log", "empty-build-output", "non-empty",
+            ),
+            (
+                "C-PACKAGE-BUILD", "build-log", "wrong-build-subject-order",
+                "reconcile the sdist and wheel bytes",
+            ),
             ("C-SBOM", "sbom", "missing-dependency", "declared direct dependency"),
             (
                 "C-PROVENANCE",
@@ -2664,6 +2703,16 @@ class TestArtifactsAndAggregation:
                 document["trials"][0]["metrics"][0]["current_value"] += 1
             elif mutation == "missing-publication-subject":
                 document["subjects"].pop()
+            elif mutation == "wrong-build-command":
+                document["command"][-1] = "temporary-dist"
+            elif mutation == "nonzero-build-exit":
+                document["exit_code"] = 1
+            elif mutation == "invalid-build-output":
+                document["combined_output"] = "base64:not valid!"
+            elif mutation == "empty-build-output":
+                document["combined_output"] = "base64:"
+            elif mutation == "wrong-build-subject-order":
+                document["subjects"].reverse()
             changed = contracts.canonical_json_line(document)
         _rewrite_supporting_artifact(arguments, gate_id, artifact_name, changed)
         with pytest.raises(evidence.EvidenceError, match=expected):

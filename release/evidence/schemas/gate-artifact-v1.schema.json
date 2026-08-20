@@ -4,6 +4,7 @@
   "additionalProperties": false,
   "oneOf": [
     {"$ref": "#/$defs/machine_report"},
+    {"$ref": "#/$defs/clean_build_log"},
     {"$ref": "#/$defs/package_inventory"},
     {"$ref": "#/$defs/benchmark_baseline"},
     {"$ref": "#/$defs/benchmark_trials"},
@@ -24,6 +25,9 @@
     "benchmark_digest": {"$ref": "#/$defs/digest"},
     "builder": {"$ref": "#/$defs/builder"},
     "candidate_identity_digest": {"$ref": "#/$defs/digest"},
+    "clean_tree": {"type": "boolean"},
+    "combined_output": {"$ref": "#/$defs/build_output"},
+    "command": {"items": {"$ref": "#/$defs/text"}, "type": "array"},
     "cases": {"items": {"$ref": "#/$defs/conformance_case"}, "type": "array"},
     "components": {"items": {"$ref": "#/$defs/component"}, "type": "array"},
     "collection_manifest_digest": {"$ref": "#/$defs/digest"},
@@ -31,6 +35,7 @@
     "corpus_gate_id": {"const": "C-CORPUS-SYNTHETIC"},
     "derivation_tree_digests": {"items": {"$ref": "#/$defs/digest"}, "maxItems": 2, "minItems": 2, "type": "array"},
     "dependency_graph_digest": {"$ref": "#/$defs/digest"},
+    "exit_code": {"type": "integer"},
     "fixture_digest": {"$ref": "#/$defs/digest"},
     "fixture_schema_digest": {"$ref": "#/$defs/digest"},
     "gate_id": {"$ref": "#/$defs/gate"},
@@ -76,6 +81,7 @@
       "required": ["metric", "unit", "value"],
       "type": "object"
     },
+    "build_output": {"maxLength": 87391, "minLength": 11, "pattern": "^base64:(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$", "type": "string"},
     "benchmark_baseline": {
       "additionalProperties": false,
       "properties": {"artifact_type": {"const": "benchmark-baseline"}, "gate_id": {"$ref": "#/$defs/gate"}, "metrics": {"items": {"$ref": "#/$defs/baseline_metric"}, "minItems": 1, "type": "array"}, "release": {"const": "0.3.10"}, "schema_version": {"const": "quarry.gate-artifact.v1"}},
@@ -110,6 +116,12 @@
       "additionalProperties": false,
       "properties": {"content_digest": {"$ref": "#/$defs/digest"}, "declared_requirement": {"oneOf": [{"$ref": "#/$defs/text"}, {"type": "null"}]}, "license": {"$ref": "#/$defs/text"}, "name": {"$ref": "#/$defs/token"}, "relationship": {"enum": ["dependency", "project", "template", "tool"]}, "version": {"$ref": "#/$defs/text"}},
       "required": ["content_digest", "declared_requirement", "license", "name", "relationship", "version"],
+      "type": "object"
+    },
+    "clean_build_log": {
+      "additionalProperties": false,
+      "properties": {"artifact_type": {"const": "clean-build-log"}, "candidate_identity_digest": {"$ref": "#/$defs/digest"}, "clean_tree": {"const": true}, "command": {"const": ["python", "-m", "build", "--sdist", "--wheel", "--outdir", "dist"]}, "combined_output": {"$ref": "#/$defs/build_output"}, "exit_code": {"const": 0}, "gate_id": {"const": "C-PACKAGE-BUILD"}, "package": {"$ref": "#/$defs/package"}, "release": {"const": "0.3.10"}, "schema_version": {"const": "quarry.gate-artifact.v1"}, "subjects": {"items": {"$ref": "#/$defs/package_subject"}, "maxItems": 2, "minItems": 2, "type": "array", "uniqueItems": true}},
+      "required": ["artifact_type", "candidate_identity_digest", "clean_tree", "command", "combined_output", "exit_code", "gate_id", "package", "release", "schema_version", "subjects"],
       "type": "object"
     },
     "conformance_case": {"additionalProperties": false, "properties": {"aggregate_digests": {"items": {"$ref": "#/$defs/digest"}, "maxItems": 2, "type": "array"}, "error_digest": {"oneOf": [{"$ref": "#/$defs/digest"}, {"type": "null"}]}, "id": {"$ref": "#/$defs/token"}, "status": {"const": "pass"}}, "required": ["aggregate_digests", "error_digest", "id", "status"], "type": "object"},
