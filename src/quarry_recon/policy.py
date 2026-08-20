@@ -438,40 +438,6 @@ EXCLUDED: dict[str, tuple[str, str]] = {
     "quarry_recon.network_proxy:_MAX_PROXY_BUFFER_BYTES": (
         "resource", "the per-direction streaming relay buffer bound; backpressure replaces unbounded "
                     "request or response accumulation"),
-    "quarry_recon.network_trace:NETWORK_TRACE_MAX_ROWS": (
-        "resource", "the exact invocation-owned network decision row envelope; the next plan is refused "
-                    "before an effect instead of producing an unauthenticated journal prefix"),
-    "quarry_recon.network_trace:NETWORK_TRACE_MAX_BYTES": (
-        "resource", "the preallocated logical byte envelope for one invocation-owned network trace; "
-                    "capacity is durably reserved before tool effects begin"),
-    "quarry_recon.network_trace:NETWORK_TRACE_MAX_ROW_BYTES": (
-        "resource", "the canonical framing bound for one network trace row; oversize truth is refused "
-                    "before its corresponding network effect"),
-    "quarry_recon.network_trace:NETWORK_TRACE_MAX_JSON_DEPTH": (
-        "parser", "the recursion-safety grammar for one canonical network trace row or compact settlement"),
-    "quarry_recon.network_trace:NETWORK_TRACE_MAX_INTEGER_MAGNITUDE": (
-        "parser", "the portable exact-integer domain of the canonical network trace schema"),
-    "quarry_recon.network_trace:NETWORK_TRACE_MAX_SETTLEMENT_BYTES": (
-        "resource", "the compact terminal network-trace identity envelope embedded in the existing durable "
-                    "settlement record; full decision rows remain in the authenticated artifact"),
-    "quarry_recon.network_trace:NETWORK_TRACE_MAX_COMPONENTS": (
-        "resource", "the finite typed component inventory sharing one invocation trace; unknown or excess "
-                    "component identities are refused rather than merged"),
-    "quarry_recon.network_trace:NETWORK_TRACE_MAX_RESERVED_ROWS": (
-        "resource", "the maximum durable future-row reservation attached to one pre-effect plan; excess "
-                    "work is refused before contact"),
-    "quarry_recon.network_trace:NETWORK_TRACE_MAX_RELPATH_BYTES": (
-        "identity", "the bounded descriptor-relative identity of the private invocation trace artifact"),
-    "quarry_recon.network_trace:NETWORK_TRACE_READ_CHUNK_BYTES": (
-        "resource", "the bounded replay-validation read allocation; it does not truncate the authenticated "
-                    "artifact byte envelope"),
-    "quarry_recon.network_trace:NETWORK_TRACE_MIN_ALLOCATION_GRANULARITY": (
-        "identity", "the minimum trusted filesystem allocation-unit identity accepted before aligned "
-                    "network-trace tail deallocation"),
-    "quarry_recon.network_trace:NETWORK_TRACE_MAX_ALLOCATION_GRANULARITY": (
-        "resource", "the maximum trusted filesystem allocation unit used to bound aligned preallocation-tail "
-                    "retention and deallocation"),
-
     # acquisition + corpus envelopes — structural truthfulness/safety ceilings, not per-run volume knobs.
     # Overflow is refused with a durable remainder, never dropped; `--unbound` uses work a run already has.
     "quarry_recon.contract:_FREE_RESERVE_DEFAULT": ("resource", "the default free-space reserve kept on the "
