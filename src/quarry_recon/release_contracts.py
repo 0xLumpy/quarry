@@ -26,6 +26,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from types import MappingProxyType
 
 from . import release_evidence as evidence
+from . import release_v310_05
 from . import resource_contract
 
 
@@ -198,6 +199,12 @@ RESOURCE_REPORT_GATES = (
 RESOURCE_SEMANTIC_GATES = tuple(
     gate_id for gate_id in RESOURCE_REPORT_GATES
     if gate_id != "C-PERF-PHASE-FAIRNESS"
+)
+V310_05_SEMANTIC_GATES = (
+    "C-INSTALL-ROLLBACK",
+    "C-FAULT-INSTALL",
+    "C-SECRETS",
+    "C-EXEC-IDENTITY",
 )
 PERFORMANCE_THRESHOLD_CONTRACTS = (
     ("C-PERF-RUNNER", "absolute", "peak_aggregate_rss", "at_most", "p95", "bytes"),
@@ -3308,6 +3315,54 @@ def _semantic_network_denial(
     )
 
 
+def _semantic_v310_05(
+    gate: dict, bodies: Mapping[str, bytes], **context: object,
+) -> None:
+    """Promote the frozen V310-05 artifact family without widening its contract."""
+    gate_id = gate["gate_id"]
+    candidate_digest = evidence.canonical_digest(context["identity"])
+    v310_bodies = {
+        kind: bodies[kind]
+        for kind, _media_type in required_artifact_contract(gate_id)
+    }
+    try:
+        reports = release_v310_05.verify_gate_artifacts(
+            gate_id, v310_bodies, candidate_identity_digest=candidate_digest,
+        )
+    except release_v310_05.V31005EvidenceError as exc:
+        raise evidence.EvidenceError(f"V310-05 evidence is not accepted: {exc}") from exc
+
+    report = context["report"]
+    gate_started = _timestamp(gate["started_at"], "V310-05 gate.started_at")
+    gate_finished = _timestamp(gate["finished_at"], "V310-05 gate.finished_at")
+    for kind, parsed in reports.items():
+        digest = raw_sha256(bodies[kind])
+        owners = [
+            instance for instance in report["instances"]
+            if {"digest": digest, "name": kind} in instance["artifacts"]
+        ]
+        if len(owners) != 1:
+            raise evidence.EvidenceError(
+                "V310-05 report is not referenced by one exact signed gate evidence instance"
+            )
+        if not (
+            gate_started
+            <= _timestamp(parsed["started_at"], "V310-05 report.started_at")
+            <= _timestamp(parsed["finished_at"], "V310-05 report.finished_at")
+            <= gate_finished
+        ):
+            raise evidence.EvidenceError("V310-05 report lies outside its signed gate interval")
+        if not (
+            _timestamp(owners[0]["started_at"], "V310-05 owner.started_at")
+            <= _timestamp(parsed["started_at"], "V310-05 report.started_at")
+            <= _timestamp(parsed["finished_at"], "V310-05 report.finished_at")
+            <= _timestamp(owners[0]["finished_at"], "V310-05 owner.finished_at")
+        ):
+            raise evidence.EvidenceError(
+                "V310-05 report lies outside its signed evidence instance interval"
+            )
+
+
 def _semantic_network_boundary(
     _gate: dict, bodies: Mapping[str, bytes], **context: object,
 ) -> None:
@@ -3672,6 +3727,7 @@ SEMANTIC_VERIFIERS = MappingProxyType({
     "C-PERF-INGEST": _semantic_resource_benchmark,
     "C-PERF-DISK": _semantic_resource_benchmark,
     "C-PERF-RESOLVER": _semantic_resource_benchmark,
+    **{gate_id: _semantic_v310_05 for gate_id in V310_05_SEMANTIC_GATES},
 })
 
 

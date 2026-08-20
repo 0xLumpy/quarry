@@ -16,6 +16,7 @@ import pytest
 
 from quarry_recon import release_contracts as contracts
 from quarry_recon import release_evidence as evidence
+from quarry_recon import release_v310_05
 from quarry_recon import resource_contract
 
 pytestmark = pytest.mark.offline
@@ -181,6 +182,35 @@ def _generic_supporting_body(gate_id: str, name: str, identity: dict) -> bytes:
         }],
         "release": "0.3.10",
         "schema_version": contracts.SUPPORTING_ARTIFACT_SCHEMA,
+    })
+
+
+def _v310_05_body(gate_id: str, artifact_kind: str, identity: dict) -> bytes:
+    """Build the complete canonical matrix accepted by the frozen V310-05 parser."""
+    matrix = release_v310_05._MATRICES[(gate_id, artifact_kind)]
+    identity_mode = (
+        "switch" if (gate_id, artifact_kind) == ("C-INSTALL-ROLLBACK", "filesystem-trace")
+        else "none" if gate_id == "C-SECRETS"
+        else "preserve"
+    )
+    before = _digest("6")
+    after = _digest("7") if identity_mode == "switch" else before
+    return contracts.canonical_json_line({
+        "artifact_kind": artifact_kind,
+        "candidate_identity_digest": evidence.canonical_digest(identity),
+        "finished_at": "2026-08-14T10:20:01Z",
+        "gate_id": gate_id,
+        "schema_version": release_v310_05.SCHEMA_VERSION,
+        "started_at": "2026-08-14T10:20:00Z",
+        "trials": [{
+            "after_identity": None if identity_mode == "none" else after,
+            "artifact_digests": [_digest(format(index % 16, "x"))],
+            "assertions": {name: True for name in sorted(assertions)},
+            "before_identity": None if identity_mode == "none" else before,
+            "case": case,
+            "outcome": "pass",
+        } for index, (case, assertions) in enumerate(sorted(matrix.items()))],
+        "verdict": "pass",
     })
 
 
@@ -429,6 +459,9 @@ def _supporting_bodies(
             "release": "0.3.10",
             "schema_version": contracts.NETWORK_DENIAL_REPORT_SCHEMA,
         })
+    elif gate_id in contracts.V310_05_SEMANTIC_GATES:
+        for artifact_kind, _media_type in contracts.required_artifact_contract(gate_id):
+            bodies[artifact_kind] = _v310_05_body(gate_id, artifact_kind, identity)
     elif gate_id in contracts.PERFORMANCE_OPERATIONS:
         assert benchmark is not None
         bodies["benchmark-baseline"] = _benchmark_baseline_body(thresholds, gate_id)
@@ -1530,7 +1563,7 @@ class TestIncompleteSemanticRegistry:
             set(contracts.RESOURCE_SEMANTIC_GATES)
             | {
                 "A-IDENTITY", "A-EVIDENCE-SCHEMA", "A-TAXONOMY", "A-CORPUS", "A-THRESHOLDS", "A-SUPPORT",
-                "C-NETWORK-BOUNDARY", "C-NET-DENY",
+                "C-NETWORK-BOUNDARY", "C-NET-DENY", *contracts.V310_05_SEMANTIC_GATES,
             }
         )
         assert "C-PERF-PHASE-FAIRNESS" not in contracts.SEMANTIC_VERIFIERS
@@ -2316,6 +2349,47 @@ class TestArtifactsAndAggregation:
                 document["subjects"].pop()
             changed = contracts.canonical_json_line(document)
         _rewrite_supporting_artifact(arguments, gate_id, artifact_name, changed)
+        with pytest.raises(evidence.EvidenceError, match=expected):
+            contracts.aggregate_records(**arguments)
+
+    @pytest.mark.parametrize(
+        "gate_id,artifact_name,mutation,expected",
+        [
+            ("C-INSTALL-ROLLBACK", "fault-matrix", "candidate", "another release candidate"),
+            ("C-INSTALL-ROLLBACK", "fault-matrix", "gate", "another gate"),
+            ("C-INSTALL-ROLLBACK", "fault-matrix", "kind", "required artifact kind"),
+            ("C-FAULT-INSTALL", "fault-matrix", "missing-case", "exactly cover"),
+            ("C-SECRETS", "sink-scan", "failed-assertion", "changes or fails"),
+            ("C-EXEC-IDENTITY", "launch-trace", "identity", "reconcile identity"),
+            ("C-EXEC-IDENTITY", "launch-trace", "time", "signed gate interval"),
+        ],
+    )
+    def test_promoted_v310_05_evidence_rejects_adversarial_reports(
+        self, tmp_path, gate_id, artifact_name, mutation, expected,
+    ):
+        arguments = _scenario(tmp_path)
+        indexed = next(
+            row for row in arguments["artifact_index"]["artifacts"]
+            if row["gate_id"] == gate_id and row["name"] == artifact_name
+        )
+        document = json.loads((arguments["artifact_root"] / indexed["path"]).read_bytes())
+        if mutation == "candidate":
+            document["candidate_identity_digest"] = _digest("9")
+        elif mutation == "gate":
+            document["gate_id"] = "C-FAULT-INSTALL"
+        elif mutation == "kind":
+            document["artifact_kind"] = "filesystem-trace"
+        elif mutation == "missing-case":
+            document["trials"].pop()
+        elif mutation == "failed-assertion":
+            document["trials"][0]["assertions"]["matches_zero"] = False
+        elif mutation == "identity":
+            document["trials"][0]["after_identity"] = _digest("8")
+        elif mutation == "time":
+            document["started_at"] = "2026-08-14T10:19:59Z"
+        _rewrite_supporting_artifact(
+            arguments, gate_id, artifact_name, contracts.canonical_json_line(document),
+        )
         with pytest.raises(evidence.EvidenceError, match=expected):
             contracts.aggregate_records(**arguments)
 
