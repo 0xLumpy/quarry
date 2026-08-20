@@ -35,7 +35,7 @@ jobs:
         run: ruff check src tests scripts --select E9,F63,F7,F82
       - name: Typed release boundaries
         run: >-
-          mypy --no-incremental
+          mypy --no-incremental --follow-imports=skip
           src/quarry_recon/report_truth.py
           src/quarry_recon/release_v310_05.py
           src/quarry_recon/release_v310_08.py

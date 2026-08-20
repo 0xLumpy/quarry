@@ -470,7 +470,7 @@ def _jxscout_sandbox(cmd: list, out_file, err_file) -> list:
     for path in _JXSCOUT_RUNTIME_PATHS:
         args += ["--ro-bind-try", path, path]
     args += ["--ro-bind", engine, engine,                     # the shim and, through it, the pinned tree
-             "--ro-bind", str(JXSCOUT_ENGINE), str(JXSCOUT_ENGINE),
+             "--ro-bind-try", str(JXSCOUT_ENGINE), str(JXSCOUT_ENGINE),
              "--ro-bind", str(bundle), str(bundle),           # the one input
              "--bind", scratch, scratch,                      # this call's scratch, and nothing else
              "--setenv", "NODE_OPTIONS", f"--max-old-space-size={_JXSCOUT_HEAP_MB}",
