@@ -1317,6 +1317,8 @@ def _run_phases_scoped(profile_path, phases, passive, timeout, prepare=None, fin
     from .runner import set_tool_cwd
     run_obj = Run.create(project, profile.target)   # collision-resistant id, atomically-claimed dir
     _payload_scope.bind(run_obj)
+    from .network_policy import NetworkPolicyScope
+    NetworkPolicyScope.from_profile(profile).bind(run_obj)
     if finished is not None:
         finished["run_id"] = run_obj.run_id
     events.configure(run_obj.dir)   # persist runtime events to <run>/events.jsonl

@@ -1978,7 +1978,7 @@ def run_contract(source_id, cmd, *, repository=None, stdout=None, stderr=None,
                 "stderr": stderr,
             }
         res = _run(
-            tool, cmd, native_outputs=native_outputs, env=env,
+            tool, cmd, source_id=source_id, native_outputs=native_outputs, env=env,
             **repository_policies, **run_kwargs,
         )
         if reclassify is not None:

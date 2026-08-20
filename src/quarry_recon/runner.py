@@ -1585,6 +1585,7 @@ def _run_with_repository(
     cmd,
     *,
     repository,
+    source_id: str | None = None,
     stdout,
     stderr,
     native_outputs,
@@ -1597,7 +1598,7 @@ def _run_with_repository(
     max_output_bytes,
 ) -> RunResult:
     """Normalize once, then delegate all execution publication authority."""
-    from . import runner_native, runner_protocol, runner_repository, store
+    from . import network_policy, runner_native, runner_protocol, runner_repository, store
     from .osint import OsintSession
 
     safe_cmd, argv_error = _preflight_argv(cmd)
@@ -1635,6 +1636,17 @@ def _run_with_repository(
         return preflight_failure("native outputs require an exact tuple")
     if native_outputs and type(repository) is not store.Run:
         return preflight_failure("native outputs require Run ownership")
+
+    # A bound policy scope is an explicit request for network-authorized
+    # execution.  Admission must carry the literal source identity and the
+    # caller's exact argv through the transport-door registry; otherwise a
+    # scoped repository must not reach runtime identity preparation or spawn.
+    if network_policy.scope_for(repository) is not None:
+        door = network_policy.transport_door(source_id, argv=safe_cmd)
+        if door is None or not door.supported:
+            return preflight_failure(
+                "bound network policy requires a supported source_id and exact transport door",
+            )
 
     if type(repository) is store.Run:
         raw_path = runner_repository._expected_output_path(repository, stdout)
@@ -1895,6 +1907,7 @@ def run(
     cmd: list[str],
     *,
     repository=_REPOSITORY_POLICY_UNSET,
+    source_id: str | None = None,
     stdout=_REPOSITORY_POLICY_UNSET,
     stderr=_REPOSITORY_POLICY_UNSET,
     native_outputs=(),
@@ -1946,6 +1959,7 @@ def run(
             tool,
             cmd,
             repository=repository,
+            source_id=source_id,
             stdout=stdout,
             stderr=stderr,
             native_outputs=native_outputs,
