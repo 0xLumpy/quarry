@@ -2140,6 +2140,33 @@ def test_proxy_listener_registration_is_owned_before_cancel_can_return(monkeypat
     assert proxy._accept_thread is None
 
 
+@pytest.mark.parametrize(
+    ("profile", "expected_field"),
+    (("target-http-proxy", "control_clients"),
+     ("browser-pipe-proxy", "control_helpers")),
+)
+def test_proxy_registration_uses_profile_specific_client_identity(
+        profile, expected_field):
+    helper = ("b" * 64, 1)
+    client = ("c" * 64, 2)
+    policy = replace(
+        _policy(), transport_profile=profile,
+        control_helpers=(helper,), control_clients=(client,),
+    )
+    registry = network_broker.ControlEndpointRegistry()
+    proxy = network_proxy.PinnedBrowserProxy(
+        policy, registry, deadline_monotonic=time.monotonic() + 5.0,
+    )
+    try:
+        proxy.start()
+        assert proxy._registration.client_identities == getattr(
+            policy, expected_field,
+        )
+    finally:
+        proxy.stop()
+    assert proxy.summary()["complete"] is True
+
+
 def test_proxy_listener_close_fault_retains_retry_authority(monkeypatch):
     class FirstCloseFails(socket.socket):
         def __init__(self, *args, **kwargs):

@@ -356,10 +356,15 @@ class PinnedBrowserProxy:
                 listener.setblocking(False)
                 if self._effect_fence.is_set():
                     raise NetworkBrokerRefused("network_effect_fence_closed")
+                client_identities = (
+                    self._policy.control_clients
+                    if self._policy.transport_profile == "target-http-proxy"
+                    else self._policy.control_helpers
+                )
                 registration = self._registry.register_worker_listener(
                     request_id=self._policy.request_id,
                     listener_fd=listener.fileno(),
-                    client_identities=self._policy.control_helpers,
+                    client_identities=client_identities,
                     purpose="pinned-browser-proxy", owner_token=self._owner_token,
                 )
                 self._registration = registration

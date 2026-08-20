@@ -10,6 +10,7 @@ the target.
 from __future__ import annotations
 
 import ctypes
+import dataclasses
 import hashlib
 import os
 import select
@@ -51,9 +52,11 @@ from .runner_containment import (
 from .runner_streams import _run_stream_engine
 from .network_broker import (
     BrokerPolicy,
+    ControlEndpointRegistry,
     ListenerHandoff,
     NetworkBrokerRefused,
     NetworkBrokerSession,
+    NetworkEffectFence,
     acquire_worker_subreaper,
     acknowledge_listener,
     child_install_and_report,
@@ -61,6 +64,7 @@ from .network_broker import (
     seal_worker_identity,
     verify_listener_bootstrap,
 )
+from .network_proxy import PinnedBrowserProxy
 from .network_policy import PRIVATE_POLICY_ENV
 
 
@@ -75,6 +79,10 @@ _PR_SET_PDEATHSIG = 1
 _EXIT_BOOTSTRAP_INVALID = 64
 _EXIT_CONTROL_FAILED = 65
 _BROKER_BOOTSTRAP_SECONDS = 5.0
+_RUNNER_PROXY_FLAGS = frozenset({
+    "-proxy", "--proxy", "-http-proxy", "--http-proxy",
+    "-socks5", "--socks5", "-socks-proxy", "--socks-proxy",
+})
 
 
 def _expected_parent_pid() -> int:
@@ -426,6 +434,9 @@ class _ParkedLauncher:
         self._broker_ack_write = broker_ack_write
         self._release_callback = None
         self._network_broker_session = None
+        self._network_proxy = None
+        self._network_control_registry = None
+        self._network_effect_fence = None
         self._released = False
         self._reaped = False
         self._stop_wait_state = "not_started"
@@ -997,17 +1008,50 @@ def _close_listener_handoff(handoff: ListenerHandoff | None) -> None:
         _close_quietly(fd)
 
 
-def _configure_network_broker(request: WorkerRequest, launcher) -> None:
-    """Bind an optional request policy to the post-EOF launcher seam.
+def _configure_network_broker(request: WorkerRequest, launcher) -> WorkerRequest:
+    """Prepare optional policy-owned transport before the launcher release.
 
-    The callback is deliberately installed only after the request is decoded and
-    the parent has sent GO.  ``release_for_exec`` invokes it after writing that
-    exact request and closing the release writer, while the child is blocked in
-    its private listener-report/ACK handshake.
+    Policy parsing and any worker-owned proxy happen only after the authenticated
+    GO, but before ``release_for_exec`` receives the derived child request.  The
+    callback then starts the kernel broker while the child is blocked in its
+    private listener-report/ACK handshake.
     """
     policy_raw = dict(request.environment).get(PRIVATE_POLICY_ENV)
     if policy_raw is None:
-        return
+        return request
+
+    policy = BrokerPolicy.from_json(policy_raw)
+    if (policy.request_id != request.request_id
+            or policy.tool != request.tool):
+        raise RuntimeError("network_broker_policy_request_mismatch")
+
+    registry = ControlEndpointRegistry()
+    effect_fence = NetworkEffectFence()
+    launcher._network_control_registry = registry
+    launcher._network_effect_fence = effect_fence
+    child_request = request
+    if (policy.source_id == "crawl.katana_standard"
+            and policy.transport_profile == "target-http-proxy"):
+        if any(value.split("=", 1)[0] in _RUNNER_PROXY_FLAGS
+               for value in request.argv):
+            raise RuntimeError("network_proxy_caller_argument_forbidden")
+        session_deadline = (
+            time.monotonic() + float(request.timeout) + _BROKER_BOOTSTRAP_SECONDS
+            if request.timeout else float((1 << 53) - 1)
+        )
+        proxy = PinnedBrowserProxy(
+            policy, registry, deadline_monotonic=session_deadline,
+            effect_fence=effect_fence,
+        )
+        launcher._network_proxy = proxy
+        proxy.start()
+        host, port = proxy.endpoint
+        if host != "127.0.0.1":
+            raise RuntimeError("network_proxy_endpoint_invalid")
+        child_request = dataclasses.replace(
+            request,
+            argv=request.argv + ("-proxy", f"http://127.0.0.1:{port}"),
+        )
 
     def bootstrap(*, deadline, clock) -> None:
         now = float(clock())
@@ -1038,10 +1082,6 @@ def _configure_network_broker(request: WorkerRequest, launcher) -> None:
                 # on failure; do not retry their numeric values in finally.
                 handoff = None
                 raise
-            policy = BrokerPolicy.from_json(policy_raw)
-            if (policy.request_id != request.request_id
-                    or policy.tool != request.tool):
-                raise RuntimeError("network_broker_policy_request_mismatch")
             session_deadline = (
                 now + float(request.timeout) + _BROKER_BOOTSTRAP_SECONDS
                 if request.timeout else float((1 << 53) - 1)
@@ -1049,6 +1089,8 @@ def _configure_network_broker(request: WorkerRequest, launcher) -> None:
             session = NetworkBrokerSession(
                 handoff, policy, expected_profile="standard",
                 deadline_monotonic=session_deadline,
+                control_registry=registry,
+                effect_fence=effect_fence,
             )
             session.start()
             child_pidfd = handoff.child_pidfd
@@ -1061,6 +1103,9 @@ def _configure_network_broker(request: WorkerRequest, launcher) -> None:
             )
             launcher._broker_ack_write = -1
             session = None  # launcher now owns listener and pidfd settlement.
+        except BaseException:
+            effect_fence.cancel()
+            raise
         finally:
             # The report pipe is no longer useful after its exact EOF proof;
             # acknowledge_listener owns and closes the ACK writer on success.
@@ -1075,14 +1120,39 @@ def _configure_network_broker(request: WorkerRequest, launcher) -> None:
                 _close_listener_handoff(handoff)
 
     launcher._release_callback = bootstrap
+    return child_request
 
 
 def _settle_network_broker(launcher) -> dict | None:
-    """Settle the listener only after the direct launcher is terminal."""
+    """Settle proxy and listener only after the direct launcher is terminal."""
+    proxy = getattr(launcher, "_network_proxy", None)
     session = getattr(launcher, "_network_broker_session", None)
-    if session is None:
-        return None
+    launcher._network_proxy = None
     launcher._network_broker_session = None
+    proxy_fault = None
+    if proxy is not None:
+        try:
+            proxy.stop()
+            proxy_summary = proxy.summary()
+            if (type(proxy_summary) is not dict
+                    or proxy_summary.get("complete") is not True):
+                raise NetworkBrokerRefused(
+                    "network_proxy_settlement_incomplete",
+                )
+        except BaseException as exc:
+            proxy_fault = exc
+            fence = getattr(launcher, "_network_effect_fence", None)
+            if fence is not None:
+                try:
+                    fence.cancel()
+                except BaseException as cancel_fault:
+                    if isinstance(proxy_fault, Exception) \
+                            and not isinstance(cancel_fault, Exception):
+                        proxy_fault = cancel_fault
+    if session is None:
+        if proxy_fault is not None:
+            raise proxy_fault
+        return None
     try:
         session.settle_after_tasks(
             deadline_monotonic=time.monotonic() + _BROKER_BOOTSTRAP_SECONDS,
@@ -1090,9 +1160,21 @@ def _settle_network_broker(launcher) -> dict | None:
         summary = session.summary()
         if type(summary) is not dict or summary.get("complete") is not True:
             raise NetworkBrokerRefused("network_broker_settlement_incomplete")
+        if proxy_fault is not None:
+            raise proxy_fault
         return summary
-    except BaseException:
+    except BaseException as primary:
+        fence = getattr(launcher, "_network_effect_fence", None)
+        cancel_fault = None
+        if fence is not None:
+            try:
+                fence.cancel()
+            except BaseException as exc:
+                cancel_fault = exc
         session.stop()
+        if (cancel_fault is not None and isinstance(primary, Exception)
+                and not isinstance(cancel_fault, Exception)):
+            raise cancel_fault
         raise
 
 
@@ -1470,9 +1552,9 @@ def _run_execution_transaction(
         None if execution_deadline is None else execution_deadline + 5.0
     )
     try:
-        _configure_network_broker(request, launcher)
+        child_request = _configure_network_broker(request, launcher)
         settlement = _run_stream_engine(
-            request,
+            child_request,
             launcher,
             stdin_data=stdin_data,
             stdin_file_fd=stdin_file_fd,

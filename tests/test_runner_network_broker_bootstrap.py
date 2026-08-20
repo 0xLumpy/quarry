@@ -15,11 +15,11 @@ from quarry_recon.network_policy import PRIVATE_POLICY_ENV
 pytestmark = pytest.mark.offline
 
 
-def _request(*, environment=()):
+def _request(*, environment=(), tool="fixture", cmd=("/bin/true",)):
     return protocol.normalize_invocation(
         request_id="ab" * 16,
-        tool="fixture",
-        cmd=("/bin/true",),
+        tool=tool,
+        cmd=cmd,
         timeout=3,
         env=dict(environment),
         base_environment={},
@@ -108,7 +108,7 @@ def test_no_policy_release_closes_private_parent_bootstrap_fds(monkeypatch):
                     pass
 
 
-def test_malformed_policy_refuses_before_ack_and_closes_handoff_fds(monkeypatch):
+def test_malformed_policy_refuses_before_launcher_release(monkeypatch):
     report_read, report_write = os.pipe()
     ack_read, ack_write = os.pipe()
     listener_read, listener_write = os.pipe()
@@ -135,15 +135,12 @@ def test_malformed_policy_refuses_before_ack_and_closes_handoff_fds(monkeypatch)
         lambda *_args, **_kwargs: acknowledged.append(True),
     )
     try:
-        runner_worker._configure_network_broker(request, launcher)
         with pytest.raises(NetworkBrokerRefused, match="network_broker_policy_invalid"):
-            launcher._release_callback(
-                deadline=time.monotonic() + 1, clock=time.monotonic,
-            )
+            runner_worker._configure_network_broker(request, launcher)
         assert acknowledged == []
-        assert launcher._broker_report_read == -1
-        assert _closed(report_read)
-        assert _closed(listener_read) and _closed(pidfd_read)
+        assert launcher._release_callback is None
+        assert not _closed(report_read)
+        assert not _closed(listener_read) and not _closed(pidfd_read)
     finally:
         for fd in (report_read, report_write, ack_read, ack_write,
                    listener_read, listener_write, pidfd_read, pidfd_write):
@@ -179,6 +176,8 @@ def test_policy_handoff_verifies_parses_and_starts_before_ack(monkeypatch):
     class FakePolicy:
         request_id = request.request_id
         tool = request.tool
+        source_id = "fixture"
+        transport_profile = "test-exact-approved"
 
         @classmethod
         def from_json(cls, raw):
@@ -217,11 +216,12 @@ def test_policy_handoff_verifies_parses_and_starts_before_ack(monkeypatch):
     )
     try:
         runner_worker._configure_network_broker(request, launcher)
+        assert events == ["parse"]
         launcher._release_callback(
             deadline=time.monotonic() + 1, clock=time.monotonic,
         )
         assert events == [
-            "subreaper", "seal", "duplicate", "verify", "parse",
+            "parse", "subreaper", "seal", "duplicate", "verify",
             "session_init", "session_start", "ack",
         ]
         assert launcher._broker_report_read == launcher._broker_ack_write == -1
@@ -233,6 +233,132 @@ def test_policy_handoff_verifies_parses_and_starts_before_ack(monkeypatch):
                     os.close(fd)
                 except OSError:
                     pass
+
+
+def test_katana_standard_proxy_is_runner_injected_before_release_and_shares_authority(
+        monkeypatch):
+    report_read, report_write = os.pipe()
+    ack_read, ack_write = os.pipe()
+    events = []
+    request = _request(
+        environment=((PRIVATE_POLICY_ENV, "policy-wire"),),
+        tool="katana", cmd=("katana", "-duc", "-silent"),
+    )
+    launcher = SimpleNamespace(
+        pid=12345,
+        _broker_report_read=report_read,
+        _broker_ack_write=ack_write,
+        _release_callback=None,
+        _network_broker_session=None,
+        _network_proxy=None,
+    )
+    handoff = SimpleNamespace(child_pidfd=444, profile="standard")
+
+    class FakePolicy:
+        request_id = request.request_id
+        tool = request.tool
+        source_id = "crawl.katana_standard"
+        transport_profile = "target-http-proxy"
+
+        @classmethod
+        def from_json(cls, raw):
+            assert raw == "policy-wire"
+            events.append("parse")
+            return cls()
+
+    class FakeProxy:
+        def __init__(self, policy, registry, **kwargs):
+            assert isinstance(policy, FakePolicy)
+            self.registry = registry
+            self.fence = kwargs["effect_fence"]
+            self.endpoint = ("127.0.0.1", 43123)
+            events.append("proxy_init")
+
+        def start(self):
+            events.append("proxy_start")
+
+    class FakeSession:
+        def __init__(self, observed_handoff, policy, **kwargs):
+            assert observed_handoff is handoff and isinstance(policy, FakePolicy)
+            assert kwargs["control_registry"] is launcher._network_proxy.registry
+            assert kwargs["effect_fence"] is launcher._network_proxy.fence
+            events.append("session_init")
+
+        def start(self):
+            events.append("session_start")
+
+        def stop(self):
+            events.append("session_stop")
+
+    monkeypatch.setattr(runner_worker, "BrokerPolicy", FakePolicy)
+    monkeypatch.setattr(runner_worker, "PinnedBrowserProxy", FakeProxy)
+    monkeypatch.setattr(runner_worker, "NetworkBrokerSession", FakeSession)
+    monkeypatch.setattr(runner_worker, "acquire_worker_subreaper", lambda: None)
+    monkeypatch.setattr(runner_worker, "seal_worker_identity", lambda: None)
+    monkeypatch.setattr(
+        runner_worker, "duplicate_reported_listener", lambda *_a, **_k: handoff,
+    )
+    monkeypatch.setattr(
+        runner_worker, "verify_listener_bootstrap", lambda *_a, **_k: None,
+    )
+    monkeypatch.setattr(
+        runner_worker, "acknowledge_listener", lambda *_a, **_k: events.append("ack"),
+    )
+    try:
+        original_digest = protocol.request_digest(request)
+        child_request = runner_worker._configure_network_broker(request, launcher)
+        assert events == ["parse", "proxy_init", "proxy_start"]
+        assert request.argv == ("katana", "-duc", "-silent")
+        assert protocol.request_digest(request) == original_digest
+        assert child_request.argv == request.argv + (
+            "-proxy", "http://127.0.0.1:43123",
+        )
+
+        launcher._release_callback(
+            deadline=time.monotonic() + 1, clock=time.monotonic,
+        )
+        assert events[-3:] == ["session_init", "session_start", "ack"]
+    finally:
+        for fd in (report_read, report_write, ack_read, ack_write):
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+
+def test_incomplete_proxy_cancels_shared_fence_and_stops_broker(monkeypatch):
+    events = []
+
+    class IncompleteProxy:
+        def stop(self):
+            events.append("proxy_stop")
+
+        def summary(self):
+            return {"complete": False}
+
+    class Broker:
+        def settle_after_tasks(self, **_kwargs):
+            events.append("broker_settle")
+
+        def summary(self):
+            return {"complete": True}
+
+        def stop(self):
+            events.append("broker_stop")
+
+    fence = runner_worker.NetworkEffectFence()
+    launcher = SimpleNamespace(
+        _network_proxy=IncompleteProxy(),
+        _network_broker_session=Broker(),
+        _network_effect_fence=fence,
+    )
+    with pytest.raises(
+        NetworkBrokerRefused, match="network_proxy_settlement_incomplete",
+    ):
+        runner_worker._settle_network_broker(launcher)
+    assert fence.is_set()
+    assert events == ["proxy_stop", "broker_settle", "broker_stop"]
 
 
 def test_incomplete_broker_summary_cannot_settle_as_tool_success(monkeypatch):
