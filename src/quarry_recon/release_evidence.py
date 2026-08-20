@@ -212,6 +212,40 @@ def canonical_digest(document: object) -> str:
     return "sha256:" + hasher.hexdigest()
 
 
+def h0_roster_digest(nodeids: Iterable[str]) -> str:
+    """Return the stable identity of one unordered H0 pytest node roster."""
+    ordered = []
+    for index, nodeid in enumerate(nodeids):
+        if type(nodeid) is not str or not nodeid or any(ord(char) < 0x20 for char in nodeid):
+            raise EvidenceError(f"H0 roster node {index} must be a control-free string")
+        try:
+            encoded = nodeid.encode("utf-8", "strict")
+        except UnicodeEncodeError as exc:
+            raise EvidenceError(f"H0 roster node {index} must be valid Unicode") from exc
+        ordered.append((encoded, nodeid))
+    ordered.sort(key=lambda row: row[0])
+    if len({nodeid for _encoded, nodeid in ordered}) != len(ordered):
+        raise EvidenceError("H0 roster contains duplicate node ids")
+    hasher = hashlib.sha256(b"quarry.h0-shard-outcome-roster.v1\0")
+    for encoded, _nodeid in ordered:
+        hasher.update(len(encoded).to_bytes(8, "big"))
+        hasher.update(encoded)
+    return "sha256:" + hasher.hexdigest()
+
+
+def h0_shard_index(nodeid: str, shard_count: int) -> int:
+    """Return the deterministic zero-based H0 shard for one pytest node id."""
+    if type(nodeid) is not str or not nodeid or any(ord(char) < 0x20 for char in nodeid):
+        raise EvidenceError("H0 shard node id must be a control-free string")
+    if type(shard_count) is not int or type(shard_count) is bool or not 1 <= shard_count <= 64:
+        raise EvidenceError("H0 shard count must be an exact integer in 1..64")
+    try:
+        encoded = nodeid.encode("utf-8", "strict")
+    except UnicodeEncodeError as exc:
+        raise EvidenceError("H0 shard node id must be valid Unicode") from exc
+    return int.from_bytes(hashlib.sha256(encoded).digest(), "big") % shard_count
+
+
 def _json_object_no_duplicates(pairs: list[tuple[str, object]]) -> dict:
     result: dict = {}
     for key, value in pairs:

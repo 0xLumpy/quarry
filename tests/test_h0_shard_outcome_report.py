@@ -109,6 +109,17 @@ def test_roster_digest_is_order_invariant_and_rejects_duplicates():
         collector._h0_roster_digest([nodes[0], nodes[0]])
 
 
+def test_shared_roster_and_shard_helpers_match_the_collector_and_fail_closed():
+    nodes = ["tests/z.py::test_z", "tests/a.py::test_a"]
+    assert evidence.h0_roster_digest(nodes) == collector._h0_roster_digest(nodes)
+    for nodeid in nodes:
+        assert evidence.h0_shard_index(nodeid, 7) == collector._test_shard(nodeid, 7)
+    with pytest.raises(evidence.EvidenceError, match="1..64"):
+        evidence.h0_shard_index(nodes[0], 0)
+    with pytest.raises(evidence.EvidenceError, match="duplicate"):
+        evidence.h0_roster_digest([nodes[0], nodes[0]])
+
+
 def test_shards_keep_the_full_digest_and_bind_distinct_selected_digests():
     full = ["tests/a.py::test_a", "tests/b.py::test_b"]
     first = _state(selected=(full[0],), full=full)
@@ -166,3 +177,47 @@ def test_start_requires_the_exact_h0_selection_expression():
     config = _Config(quarry_h0_shard_report="out.json", markexpr="offline or integration", keyword="")
     with pytest.raises(pytest.UsageError, match="exactly '-m offline'"):
         collector._start_h0_shard_report(config, rows, ["tests/a.py::test_a"])
+
+
+def test_collection_hook_freezes_post_marker_taxonomy_before_sharding(monkeypatch):
+    nodes = ["tests/a.py::test_a", "tests/b.py::test_b"]
+    shard_index = evidence.h0_shard_index(nodes[0], 2)
+    while evidence.h0_shard_index(nodes[1], 2) == shard_index:
+        nodes[1] += "x"
+    items = [SimpleNamespace(nodeid=nodeid) for nodeid in (*nodes, "tests/i.py::test_i")]
+
+    class Hook:
+        def pytest_deselected(self, *, items):
+            self.deselected = list(items)
+
+    config = _Config(
+        keyword="",
+        markexpr="offline",
+        quarry_h0_shard_report="report.json",
+        quarry_shard_count=2,
+        quarry_shard_index=shard_index,
+        quarry_taxonomy_manifest=None,
+    )
+    config.stash = {collector.H0_COLLECTION_FAILURES_KEY: 0}
+    config.hook = Hook()
+    monkeypatch.setattr(
+        collector,
+        "_classify_test_item",
+        lambda item: (
+            ("integration", ("pytest",), False)
+            if item.nodeid.endswith("test_i") else ("offline", (), False)
+        ),
+    )
+
+    hook = collector.pytest_collection_modifyitems(config, items)
+    next(hook)
+    items[:] = items[:2]  # pytest's marker hook has selected the full offline lane.
+    with pytest.raises(StopIteration):
+        next(hook)
+
+    taxonomy = evidence.read_pytest_taxonomy(config.stash[collector.TAXONOMY_MANIFEST_KEY])
+    assert taxonomy["lanes"][0]["nodes"] == sorted(nodes)
+    assert taxonomy["selection"]["selected"] == 2
+    state = config.stash[collector.H0_SHARD_REPORT_STATE_KEY]
+    assert state["full_h0"] == sorted(nodes)
+    assert state["selected"] == [nodes[0]]

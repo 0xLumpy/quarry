@@ -56,6 +56,16 @@ jobs:
           pytest -m offline
           --quarry-shard-count 6 --quarry-shard-index "${{ matrix.shard }}"
           --quarry-taxonomy-manifest "$RUNNER_TEMP/quarry-taxonomy.json"
+          --quarry-h0-shard-report "$RUNNER_TEMP/h0-shard-${{ matrix.python-version }}-${{ matrix.shard }}.json"
+      - name: Upload H0 shard outcome
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: h0-shard-outcome-${{ matrix.python-version }}-${{ matrix.shard }}
+          path: |
+            ${{ runner.temp }}/h0-shard-${{ matrix.python-version }}-${{ matrix.shard }}.json
+            ${{ runner.temp }}/quarry-taxonomy.json
+          if-no-files-found: error
 
   integration:
     env:

@@ -13,7 +13,9 @@
     {"$ref": "#/$defs/provenance"},
     {"$ref": "#/$defs/publication_subjects"},
     {"$ref": "#/$defs/synthetic_corpus_disclosure_attestation"},
-    {"$ref": "#/$defs/aggregator_conformance_report"}
+    {"$ref": "#/$defs/aggregator_conformance_report"},
+    {"$ref": "#/$defs/h0_test_report"},
+    {"$ref": "#/$defs/h0_isolation_self_test"}
   ],
   "properties": {
     "artifact_type": {"$ref": "#/$defs/token"},
@@ -24,6 +26,7 @@
     "candidate_identity_digest": {"$ref": "#/$defs/digest"},
     "cases": {"items": {"$ref": "#/$defs/conformance_case"}, "type": "array"},
     "components": {"items": {"$ref": "#/$defs/component"}, "type": "array"},
+    "collection_manifest_digest": {"$ref": "#/$defs/digest"},
     "checks": {"$ref": "#/$defs/disclosure_checks"},
     "corpus_gate_id": {"const": "C-CORPUS-SYNTHETIC"},
     "derivation_tree_digests": {"items": {"$ref": "#/$defs/digest"}, "maxItems": 2, "minItems": 2, "type": "array"},
@@ -33,6 +36,7 @@
     "gate_id": {"$ref": "#/$defs/gate"},
     "gate_evidence_counts": {"$ref": "#/$defs/conformance_counts"},
     "invalidations": {"items": {"$ref": "#/$defs/invalidation"}, "type": "array"},
+    "instances": {"items": {"type": "object"}, "type": "array"},
     "materials": {"items": {"$ref": "#/$defs/named_digest"}, "type": "array"},
     "measurements": {"items": {"$ref": "#/$defs/measurement"}, "type": "array"},
     "manifest_digest": {"$ref": "#/$defs/digest"},
@@ -43,6 +47,7 @@
     "records": {"items": {"$ref": "#/$defs/machine_record"}, "minItems": 1, "type": "array"},
     "release": {"const": "0.3.10"},
     "resource_limits_observed": {"$ref": "#/$defs/resources"},
+    "runs": {"items": {"$ref": "#/$defs/h0_run"}, "type": "array"},
     "schema_version": {"const": "quarry.gate-artifact.v1"},
     "subjects": {"items": {"type": "object"}, "type": "array"},
     "synthetic_value_inventory_digest": {"$ref": "#/$defs/digest"},
@@ -128,6 +133,72 @@
       "additionalProperties": false,
       "properties": {"id": {"$ref": "#/$defs/token"}, "reason": {"$ref": "#/$defs/text"}, "superseded_trials": {"$ref": "#/$defs/benchmark_trials"}, "superseded_trials_digest": {"$ref": "#/$defs/digest"}},
       "required": ["id", "reason", "superseded_trials", "superseded_trials_digest"],
+      "type": "object"
+    },
+    "h0_denial": {
+      "additionalProperties": false,
+      "properties": {"code": {"$ref": "#/$defs/token"}, "detail": {"maxLength": 512, "minLength": 1, "pattern": "^[^\\u0000-\\u001f]+$", "type": "string"}},
+      "required": ["code", "detail"],
+      "type": "object"
+    },
+    "h0_isolation_attempt": {
+      "additionalProperties": false,
+      "properties": {"denial": {"$ref": "#/$defs/h0_denial"}, "kind": {"enum": ["native-tool", "proxy", "resolver", "socket", "subprocess"]}, "outcome": {"const": "denied"}},
+      "required": ["denial", "kind", "outcome"],
+      "type": "object"
+    },
+    "h0_isolation_instance": {
+      "additionalProperties": false,
+      "properties": {"attempts": {"items": false, "maxItems": 5, "minItems": 5, "prefixItems": [{"allOf": [{"$ref": "#/$defs/h0_isolation_attempt"}, {"properties": {"kind": {"const": "native-tool"}}, "required": ["kind"]}]}, {"allOf": [{"$ref": "#/$defs/h0_isolation_attempt"}, {"properties": {"kind": {"const": "proxy"}}, "required": ["kind"]}]}, {"allOf": [{"$ref": "#/$defs/h0_isolation_attempt"}, {"properties": {"kind": {"const": "resolver"}}, "required": ["kind"]}]}, {"allOf": [{"$ref": "#/$defs/h0_isolation_attempt"}, {"properties": {"kind": {"const": "socket"}}, "required": ["kind"]}]}, {"allOf": [{"$ref": "#/$defs/h0_isolation_attempt"}, {"properties": {"kind": {"const": "subprocess"}}, "required": ["kind"]}]}], "type": "array"}, "environment": {"$ref": "#/$defs/environment"}, "evidence_instance_id": {"$ref": "#/$defs/token"}, "isolation_profile": {"$ref": "#/$defs/digest"}},
+      "required": ["attempts", "environment", "evidence_instance_id", "isolation_profile"],
+      "type": "object"
+    },
+    "h0_isolation_self_test": {
+      "additionalProperties": false,
+      "properties": {"artifact_type": {"const": "h0-isolation-self-test"}, "candidate_identity_digest": {"$ref": "#/$defs/digest"}, "gate_id": {"const": "B-HERMETIC-ALL"}, "instances": {"items": {"$ref": "#/$defs/h0_isolation_instance"}, "maxItems": 2, "minItems": 2, "type": "array"}, "name": {"const": "isolation-self-test"}, "release": {"const": "0.3.10"}, "schema_version": {"const": "quarry.gate-artifact.v1"}},
+      "required": ["artifact_type", "candidate_identity_digest", "gate_id", "instances", "name", "release", "schema_version"],
+      "type": "object"
+    },
+    "h0_fragment": {
+      "additionalProperties": false,
+      "properties": {"digest": {"$ref": "#/$defs/digest"}, "job_instance_id": {"pattern": "^\\.github/workflows/ci\\.yml#jobs\\.offline\\[python-version=3\\.(10|12),shard=[0-5]\\]$", "type": "string"}, "report": {"$ref": "#/$defs/h0_shard_report"}},
+      "required": ["digest", "job_instance_id", "report"],
+      "type": "object"
+    },
+    "h0_collector": {
+      "additionalProperties": false,
+      "properties": {"name": {"const": "pytest"}, "python_implementation": {"$ref": "#/$defs/token"}, "python_version": {"$ref": "#/$defs/text"}, "version": {"$ref": "#/$defs/text"}},
+      "required": ["name", "python_implementation", "python_version", "version"],
+      "type": "object"
+    },
+    "h0_outcomes": {
+      "additionalProperties": false,
+      "properties": {"failed": {"const": 0}, "passed": {"$ref": "#/$defs/count"}, "skipped": {"const": 0}, "xfailed": {"const": 0}, "xpassed": {"const": 0}},
+      "required": ["failed", "passed", "skipped", "xfailed", "xpassed"],
+      "type": "object"
+    },
+    "h0_roster": {
+      "additionalProperties": false,
+      "properties": {"count": {"maximum": 9223372036854775807, "minimum": 1, "type": "integer"}, "digest": {"$ref": "#/$defs/digest"}},
+      "required": ["count", "digest"],
+      "type": "object"
+    },
+    "h0_shard_report": {
+      "additionalProperties": false,
+      "properties": {"collector": {"$ref": "#/$defs/h0_collector"}, "collection_failures": {"const": 0}, "full_h0_roster": {"$ref": "#/$defs/h0_roster"}, "keyword_expression": {"const": ""}, "mark_expression": {"const": "offline"}, "outcomes": {"$ref": "#/$defs/h0_outcomes"}, "passed_roster": {"$ref": "#/$defs/h0_roster"}, "schema_version": {"const": "quarry.h0-shard-outcome-report.v1"}, "selected_roster": {"$ref": "#/$defs/h0_roster"}, "session_exit_code": {"const": 0}, "shard_count": {"const": 6}, "shard_index": {"maximum": 5, "minimum": 0, "type": "integer"}},
+      "required": ["collector", "collection_failures", "full_h0_roster", "keyword_expression", "mark_expression", "outcomes", "passed_roster", "schema_version", "selected_roster", "session_exit_code", "shard_count", "shard_index"],
+      "type": "object"
+    },
+    "h0_run": {
+      "additionalProperties": false,
+      "properties": {"environment": {"$ref": "#/$defs/environment"}, "evidence_instance_id": {"$ref": "#/$defs/token"}, "fragments": {"items": {"$ref": "#/$defs/h0_fragment"}, "maxItems": 6, "minItems": 6, "type": "array"}},
+      "required": ["environment", "evidence_instance_id", "fragments"],
+      "type": "object"
+    },
+    "h0_test_report": {
+      "additionalProperties": false,
+      "properties": {"artifact_type": {"const": "h0-test-report"}, "candidate_identity_digest": {"$ref": "#/$defs/digest"}, "collection_manifest_digest": {"$ref": "#/$defs/digest"}, "gate_id": {"const": "B-HERMETIC-ALL"}, "name": {"const": "test-report"}, "release": {"const": "0.3.10"}, "runs": {"items": {"$ref": "#/$defs/h0_run"}, "maxItems": 2, "minItems": 2, "type": "array"}, "schema_version": {"const": "quarry.gate-artifact.v1"}},
+      "required": ["artifact_type", "candidate_identity_digest", "collection_manifest_digest", "gate_id", "name", "release", "runs", "schema_version"],
       "type": "object"
     },
     "machine_record": {

@@ -668,7 +668,12 @@ class TestCommittedWorkflowParity:
                     if uses.startswith("actions/setup-python@"):
                         assert uses == \
                             "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065"
-        test_step = next(step for step in offline["steps"] if step.get("name") == "H0 tests (deny guard)")
+        test_steps = [
+            step for step in offline["steps"]
+            if step.get("name") == "H0 tests (deny guard)"
+        ]
+        assert len(test_steps) == 1
+        test_step = test_steps[0]
         arguments = shlex.split(test_step["run"])
         assert arguments[arguments.index("-m") + 1] == \
             mapped_offline["selection"]["mark_expression"]
@@ -676,4 +681,28 @@ class TestCommittedWorkflowParity:
         assert '--quarry-shard-index "${{ matrix.shard }}"' in test_step["run"]
         assert '${{ matrix.shard }}' in test_step["run"]
         assert "--quarry-taxonomy-manifest" in arguments
+        report_option = arguments.index("--quarry-h0-shard-report")
+        assert arguments[report_option + 1] == (
+            "$RUNNER_TEMP/h0-shard-${{ matrix.python-version }}-"
+            "${{ matrix.shard }}.json"
+        )
         assert test_step["env"]["QUARRY_OFFLINE_CI"] == "1"
+
+        upload_steps = [
+            step for step in offline["steps"]
+            if step.get("name") == "Upload H0 shard outcome"
+        ]
+        assert len(upload_steps) == 1
+        upload = upload_steps[0]
+        assert upload["if"] == "${{ always() }}"
+        assert upload["uses"] == \
+            "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
+        assert upload["with"] == {
+            "name": "h0-shard-outcome-${{ matrix.python-version }}-${{ matrix.shard }}",
+            "path": (
+                "${{ runner.temp }}/h0-shard-${{ matrix.python-version }}-"
+                "${{ matrix.shard }}.json\n"
+                "${{ runner.temp }}/quarry-taxonomy.json\n"
+            ),
+            "if-no-files-found": "error",
+        }

@@ -16,7 +16,6 @@ remains open and is specified in ``docs/releases/RELEASE-GATES.md``.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import platform
@@ -27,6 +26,8 @@ import sys
 from pathlib import Path
 
 import pytest
+
+from quarry_recon import release_evidence as _release_evidence
 
 _PRIMARY_LANES = (
     ("offline", "H0-hermetic"),
@@ -133,20 +134,18 @@ def _utf8_key(value):
 
 
 def _test_shard(nodeid, count):
-    return int.from_bytes(hashlib.sha256(_utf8_key(nodeid)).digest(), "big") % count
+    try:
+        return _release_evidence.h0_shard_index(nodeid, count)
+    except _release_evidence.EvidenceError as exc:
+        raise pytest.UsageError(str(exc)) from exc
 
 
 def _h0_roster_digest(nodeids):
     """Return the domain-separated digest for one sorted, unique node roster."""
-    ordered = sorted(nodeids, key=_utf8_key)
-    if len(ordered) != len(set(ordered)):
-        raise pytest.UsageError("H0 outcome report roster contains duplicate node ids")
-    hasher = hashlib.sha256(b"quarry.h0-shard-outcome-roster.v1\0")
-    for nodeid in ordered:
-        encoded = _utf8_key(nodeid)
-        hasher.update(len(encoded).to_bytes(8, "big"))
-        hasher.update(encoded)
-    return "sha256:" + hasher.hexdigest()
+    try:
+        return _release_evidence.h0_roster_digest(nodeids)
+    except _release_evidence.EvidenceError as exc:
+        raise pytest.UsageError(str(exc)) from exc
 
 
 def _apply_test_shard(config, items):
@@ -411,10 +410,10 @@ def pytest_collection_modifyitems(config, items):
         rendered = "\n".join(f"  - {message}" for message in sorted(errors))
         raise pytest.UsageError(f"test taxonomy violations:\n{rendered}")
     yield
-    _apply_test_shard(config, items)
+    post_marker_nodeids = [item.nodeid for item in items]
     body = _taxonomy_manifest_bytes(
         rows,
-        [item.nodeid for item in items],
+        post_marker_nodeids,
         mark_expression=config.getoption("markexpr") or "",
         keyword_expression=config.getoption("keyword") or "",
     )
@@ -422,6 +421,7 @@ def pytest_collection_modifyitems(config, items):
     output = config.getoption("quarry_taxonomy_manifest")
     if output:
         _write_new_private(output, body)
+    _apply_test_shard(config, items)
     _start_h0_shard_report(config, rows, [item.nodeid for item in items])
 
 

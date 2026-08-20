@@ -344,6 +344,27 @@ def _taxonomy_body(environment: dict, toolchain: list[dict]) -> bytes:
     })
 
 
+def _h0_collection_taxonomy_body(environment: dict, toolchain: list[dict]) -> bytes:
+    document = json.loads(_taxonomy_body(environment, toolchain))
+    h0_nodes = [
+        "tests/taxonomy.py::test_offline_0",
+        "tests/taxonomy.py::test_offline_3",
+        "tests/taxonomy.py::test_offline_4",
+        "tests/taxonomy.py::test_offline_5",
+        "tests/taxonomy.py::test_offline_8",
+        "tests/taxonomy.py::test_offline_21",
+    ]
+    h0_nodes.sort(key=lambda value: value.encode("utf-8"))
+    document["lanes"][0]["nodes"] = h0_nodes
+    document["selection"].update({
+        "collected": len(h0_nodes) + 4,
+        "deselected": 4,
+        "selected": len(h0_nodes),
+    })
+    document["selection"]["selected_by_lane"][0]["selected"] = len(h0_nodes)
+    return evidence.canonical_json_bytes(document)
+
+
 def _corpus_disclosure_body(fixture_digest: str) -> bytes:
     return contracts.canonical_json_line({
         "artifact_type": "synthetic-corpus-disclosure-attestation",
@@ -365,7 +386,8 @@ def _corpus_disclosure_body(fixture_digest: str) -> bytes:
 def _supporting_bodies(
     gate_id: str, *, identity: dict, scope: dict, support: dict, thresholds: dict, corpus: dict,
     benchmark: dict | None, measurements: list[dict], environment: dict,
-    evidence_instance_id: str, toolchain: list[dict], indexed: list[dict], policy: dict,
+    evidence_instance_id: str, evidence_instances: list[dict], toolchain: list[dict],
+    indexed: list[dict], policy: dict,
 ) -> dict[str, bytes]:
     names = [name for name, _media_type in contracts.required_artifact_contract(gate_id)]
     bodies: dict[str, bytes] = {}
@@ -409,6 +431,106 @@ def _supporting_bodies(
         bodies["threshold-reconciliation"] = contracts.canonical_json_line(thresholds)
     elif gate_id == "A-SUPPORT":
         bodies["support-reconciliation"] = contracts.canonical_json_line(support)
+    elif gate_id == "B-HERMETIC-ALL":
+        h0_environments = [
+            copy.deepcopy(instance["environment"])
+            for instance in evidence_instances if instance["lane"] == "H0-hermetic"
+        ]
+        common = {
+            "candidate_identity_digest": evidence.canonical_digest(identity),
+            "gate_id": gate_id,
+            "release": "0.3.10",
+            "schema_version": contracts.GATE_ARTIFACT_SCHEMA,
+        }
+        collection_body = _h0_collection_taxonomy_body(h0_environments[0], toolchain)
+        taxonomy = evidence.read_pytest_taxonomy(collection_body)
+        h0_nodes = taxonomy["lanes"][0]["nodes"]
+        runs = []
+        instance_by_environment = {
+            tuple(instance["environment"][key] for key in (
+                "architecture", "isolation_profile", "os", "python", "runner_image",
+            )): instance["id"]
+            for instance in evidence_instances
+        }
+        for h0_environment in h0_environments:
+            instance_id = instance_by_environment[tuple(h0_environment[key] for key in (
+                "architecture", "isolation_profile", "os", "python", "runner_image",
+            ))]
+            python_minor = h0_environment["python"].rsplit(".", 1)[0]
+            full_roster = {
+                "count": len(h0_nodes),
+                "digest": evidence.h0_roster_digest(h0_nodes),
+            }
+            fragments = []
+            for shard_index in range(6):
+                selected_nodes = [
+                    nodeid for nodeid in h0_nodes
+                    if evidence.h0_shard_index(nodeid, 6) == shard_index
+                ]
+                selected_roster = {
+                    "count": len(selected_nodes),
+                    "digest": evidence.h0_roster_digest(selected_nodes),
+                }
+                fragment = {
+                    "collector": {
+                        **taxonomy["collector"], "python_version": h0_environment["python"],
+                    },
+                    "collection_failures": 0,
+                    "full_h0_roster": full_roster,
+                    "keyword_expression": "",
+                    "mark_expression": "offline",
+                    "outcomes": {
+                        "failed": 0, "passed": len(selected_nodes), "skipped": 0,
+                        "xfailed": 0, "xpassed": 0,
+                    },
+                    "passed_roster": selected_roster,
+                    "schema_version": evidence.H0_SHARD_OUTCOME_REPORT_SCHEMA,
+                    "selected_roster": selected_roster,
+                    "session_exit_code": 0,
+                    "shard_count": 6,
+                    "shard_index": shard_index,
+                }
+                fragment_body = evidence.canonical_json_bytes(fragment)
+                fragments.append({
+                    "digest": contracts.raw_sha256(fragment_body),
+                    "job_instance_id": (
+                        ".github/workflows/ci.yml#jobs.offline"
+                        f"[python-version={python_minor},shard={shard_index}]"
+                    ),
+                    "report": fragment,
+                })
+            runs.append({
+                "environment": h0_environment,
+                "evidence_instance_id": instance_id,
+                "fragments": fragments,
+            })
+        bodies["collection-manifest"] = collection_body
+        bodies["test-report"] = contracts.canonical_json_line({
+            **common,
+            "artifact_type": "h0-test-report",
+            "collection_manifest_digest": contracts.raw_sha256(collection_body),
+            "name": "test-report",
+            "runs": runs,
+        })
+        bodies["isolation-self-test"] = contracts.canonical_json_line({
+            **common,
+            "artifact_type": "h0-isolation-self-test",
+            "instances": [{
+                "attempts": [{
+                    "denial": {"code": "EPERM", "detail": "synthetic H0 denial"},
+                    "kind": kind,
+                    "outcome": "denied",
+                } for kind in contracts._H0_ISOLATION_ATTEMPTS],
+                "environment": h0_environment,
+                "evidence_instance_id": instance_by_environment[
+                    tuple(h0_environment[key] for key in (
+                        "architecture", "isolation_profile", "os", "python", "runner_image",
+                    ))
+                ],
+                "isolation_profile": h0_environment["isolation_profile"],
+            } for h0_environment in h0_environments],
+            "name": "isolation-self-test",
+        })
     elif gate_id == "C-PACKAGE-BUILD":
         bodies["sdist"] = _synthetic_sdist()
         bodies["wheel"] = _synthetic_wheel()
@@ -931,6 +1053,11 @@ def _scenario(tmp_path: Path, *, approved_at: str = "2026-08-01T00:00:00Z"):
                         "collected": 5, "deselected": 4, "failed": 0, "passed": 1,
                         "selected": 1, "skipped": 0, "xfailed": 0, "xpassed": 0,
                     }
+                if gate_id == "B-HERMETIC-ALL":
+                    selection = {
+                        "collected": 10, "deselected": 4, "failed": 0, "passed": 6,
+                        "selected": 6, "skipped": 0, "xfailed": 0, "xpassed": 0,
+                    }
                 instances.append({
                     "artifacts": [],
                     "assertions": [assertion],
@@ -1000,6 +1127,7 @@ def _scenario(tmp_path: Path, *, approved_at: str = "2026-08-01T00:00:00Z"):
                 measurements=measurements,
                 environment=instances[0]["environment"],
                 evidence_instance_id=instances[0]["id"],
+                evidence_instances=instances,
                 toolchain=supported_toolchain,
                 indexed=indexed,
                 policy=policy,
@@ -1065,6 +1193,11 @@ def _scenario(tmp_path: Path, *, approved_at: str = "2026-08-01T00:00:00Z"):
         }
         if gate_id == "A-TAXONOMY":
             selection = copy.deepcopy(instances[0]["selection"])
+        if gate_id == "B-HERMETIC-ALL":
+            selection = {
+                name: sum(instance["selection"][name] for instance in instances)
+                for name in selection
+            }
         rule = None
         reason = None
         status = "pass"
@@ -1251,6 +1384,7 @@ def _rebind_scenario(arguments: dict) -> None:
                 measurements=report["measurements"],
                 environment=gate["environment"],
                 evidence_instance_id=report["instances"][0]["id"],
+                evidence_instances=report["instances"],
                 toolchain=gate["toolchain"],
                 indexed=arguments["artifact_index"]["artifacts"],
                 policy=arguments["trust_policy"],
@@ -1378,7 +1512,7 @@ class TestCommittedContracts:
             "machine_report", "package_inventory", "benchmark_baseline",
             "benchmark_trials", "benchmark_invalidations", "benchmark_report", "sbom",
             "provenance", "publication_subjects", "synthetic_corpus_disclosure_attestation",
-            "aggregator_conformance_report",
+            "aggregator_conformance_report", "h0_test_report", "h0_isolation_self_test",
         ]
         discriminators = []
         for name in variant_names:
@@ -1391,6 +1525,26 @@ class TestCommittedContracts:
         assert schema["$defs"]["benchmark_trials"]["properties"]["trials"][
             "maxItems"
         ] == 1000
+        h0_runs = schema["$defs"]["h0_test_report"]["properties"]["runs"]
+        assert h0_runs["minItems"] == h0_runs["maxItems"] == 2
+        h0_fragments = schema["$defs"]["h0_run"]["properties"]["fragments"]
+        assert h0_fragments["minItems"] == h0_fragments["maxItems"] == 6
+        assert schema["$defs"]["h0_fragment"]["properties"]["report"] == {
+            "$ref": "#/$defs/h0_shard_report",
+        }
+        assert schema["$defs"]["h0_roster"]["properties"]["count"]["maximum"] == \
+            evidence.MAX_JSON_INTEGER
+        isolation_instances = schema["$defs"]["h0_isolation_self_test"][
+            "properties"
+        ]["instances"]
+        assert isolation_instances["minItems"] == isolation_instances["maxItems"] == 2
+        attempts = schema["$defs"]["h0_isolation_instance"]["properties"]["attempts"]
+        assert attempts["items"] is False
+        assert attempts["minItems"] == attempts["maxItems"] == 5
+        assert [
+            row["allOf"][1]["properties"]["kind"]["const"]
+            for row in attempts["prefixItems"]
+        ] == list(contracts._H0_ISOLATION_ATTEMPTS)
         assert all(
             definition.get("additionalProperties") is False
             for name, definition in schema["$defs"].items()
@@ -1572,6 +1726,7 @@ class TestIncompleteSemanticRegistry:
             set(contracts.RESOURCE_SEMANTIC_GATES)
             | {
                 "A-IDENTITY", "A-EVIDENCE-SCHEMA", "A-TAXONOMY", "A-CORPUS", "A-THRESHOLDS", "A-SUPPORT",
+                "B-HERMETIC-ALL",
                 "C-NETWORK-BOUNDARY", "C-NET-DENY", *contracts.V310_05_SEMANTIC_GATES,
             }
         )
@@ -1579,9 +1734,162 @@ class TestIncompleteSemanticRegistry:
         arguments = _scenario(tmp_path)
         with pytest.raises(
             evidence.EvidenceError,
-            match="B-HERMETIC-ALL has no registered obligation-specific semantic verifier",
+            match="B-SCHEMA has no registered obligation-specific semantic verifier",
         ):
             contracts.aggregate_records(**arguments)
+
+
+class TestH0HermeticSemanticEvidence:
+    @staticmethod
+    def _case(tmp_path):
+        arguments = _scenario(tmp_path)
+        gate = next(
+            row for row in arguments["records"]
+            if row["gate_id"] == "B-HERMETIC-ALL"
+        )
+        bodies = {}
+        for row in arguments["artifact_index"]["artifacts"]:
+            if row["gate_id"] == "B-HERMETIC-ALL":
+                bodies[row["name"]] = (arguments["artifact_root"] / row["path"]).read_bytes()
+        report = contracts.read_evidence_report(
+            bodies.pop("gate-evidence"), identity=arguments["identity"],
+            gate_id="B-HERMETIC-ALL",
+        )
+        context = {
+            "identity": arguments["identity"],
+            "input_bodies": arguments["input_bodies"],
+            "report": report,
+            "support": arguments["support_matrix"],
+        }
+        return gate, bodies, context
+
+    def test_exact_candidate_bound_h0_composition_is_accepted(self, tmp_path):
+        gate, bodies, context = self._case(tmp_path)
+        contracts._semantic_h0_hermetic_all(gate, bodies, **context)
+
+    @pytest.mark.parametrize(
+        ("name", "mutate", "match"),
+        [
+            (
+                "test-report",
+                lambda doc: doc.update(candidate_identity_digest=_digest("0")),
+                "wrong candidate",
+            ),
+            (
+                "test-report",
+                lambda doc: doc["runs"][0]["fragments"][0].update(digest=_digest("0")),
+                "digest does not match",
+            ),
+            (
+                "test-report",
+                lambda doc: doc["runs"][0]["fragments"].append(
+                    copy.deepcopy(doc["runs"][0]["fragments"][0])
+                ),
+                "every shard index exactly once",
+            ),
+            (
+                "test-report",
+                lambda doc: doc["runs"][0].update(
+                    evidence_instance_id=doc["runs"][1]["evidence_instance_id"]
+                ),
+                "exact signed gate-evidence instance",
+            ),
+            (
+                "test-report",
+                lambda doc: doc["runs"][0]["fragments"][0].update(
+                    job_instance_id=doc["runs"][0]["fragments"][1]["job_instance_id"]
+                ),
+                "exact verification job instance",
+            ),
+            (
+                "isolation-self-test",
+                lambda doc: doc["instances"][0]["attempts"].reverse(),
+                "roster or order",
+            ),
+            (
+                "isolation-self-test",
+                lambda doc: doc["instances"][0].update(isolation_profile=_digest("0")),
+                "profile does not match",
+            ),
+            (
+                "isolation-self-test",
+                lambda doc: doc["instances"][0].update(
+                    evidence_instance_id=doc["instances"][1]["evidence_instance_id"]
+                ),
+                "exact signed gate-evidence instance",
+            ),
+        ],
+    )
+    def test_substitution_shard_and_isolation_mutations_fail_closed(
+        self, tmp_path, name, mutate, match,
+    ):
+        gate, bodies, context = self._case(tmp_path)
+        document = json.loads(bodies[name])
+        mutate(document)
+        bodies[name] = contracts.canonical_json_line(document)
+        with pytest.raises(evidence.EvidenceError, match=match):
+            contracts._semantic_h0_hermetic_all(gate, bodies, **context)
+
+    def test_nonpass_fragment_and_gate_logical_count_substitution_fail_closed(self, tmp_path):
+        gate, bodies, context = self._case(tmp_path)
+        report = json.loads(bodies["test-report"])
+        fragment_record = report["runs"][0]["fragments"][0]
+        fragment_record["report"]["outcomes"].update(passed=0, skipped=1)
+        fragment_record["report"]["passed_roster"] = {
+            "count": 0,
+            "digest": evidence.h0_roster_digest([]),
+        }
+        fragment_record["digest"] = contracts.raw_sha256(
+            evidence.canonical_json_bytes(fragment_record["report"])
+        )
+        bodies["test-report"] = contracts.canonical_json_line(report)
+        with pytest.raises(evidence.EvidenceError, match="full/selected/pass roster"):
+            contracts._semantic_h0_hermetic_all(gate, bodies, **context)
+
+        gate, bodies, context = self._case(tmp_path / "counts")
+        context["report"]["instances"][0]["selection"]["collected"] += 1
+        with pytest.raises(evidence.EvidenceError, match="logical H0 collection counts"):
+            contracts._semantic_h0_hermetic_all(gate, bodies, **context)
+
+    def test_rebound_wrong_partition_and_runner_topology_fail_closed(self, tmp_path):
+        gate, bodies, context = self._case(tmp_path)
+        report = json.loads(bodies["test-report"])
+        fragment_record = report["runs"][0]["fragments"][0]
+        fragment_record["report"]["selected_roster"] = copy.deepcopy(
+            report["runs"][0]["fragments"][1]["report"]["selected_roster"]
+        )
+        fragment_record["digest"] = contracts.raw_sha256(
+            evidence.canonical_json_bytes(fragment_record["report"])
+        )
+        bodies["test-report"] = contracts.canonical_json_line(report)
+        with pytest.raises(evidence.EvidenceError, match="roster does not reconcile"):
+            contracts._semantic_h0_hermetic_all(gate, bodies, **context)
+
+        gate, bodies, context = self._case(tmp_path / "topology")
+        job_map = json.loads(context["input_bodies"]["verification-job-map"])
+        offline = next(row for row in job_map["jobs"] if row["lane"] == "H0-hermetic")
+        offline["instances"].pop()
+        context["input_bodies"] = dict(context["input_bodies"])
+        context["input_bodies"]["verification-job-map"] = contracts.canonical_json_line(job_map)
+        with pytest.raises(evidence.EvidenceError, match="2x6 offline matrix"):
+            contracts._semantic_h0_hermetic_all(gate, bodies, **context)
+
+    @pytest.mark.parametrize(
+        ("field", "value", "match"),
+        [
+            ("code", "not a token", "stable token"),
+            ("detail", "x" * 513, "exceeds 512"),
+        ],
+    )
+    def test_isolation_denial_fields_are_strictly_bounded(
+        self, tmp_path, field, value, match,
+    ):
+        gate, bodies, context = self._case(tmp_path)
+        isolation = json.loads(bodies["isolation-self-test"])
+        isolation["instances"][0]["attempts"][0]["denial"][field] = value
+        bodies["isolation-self-test"] = contracts.canonical_json_line(isolation)
+        with pytest.raises(evidence.EvidenceError, match=match):
+            contracts._semantic_h0_hermetic_all(gate, bodies, **context)
 
 
 class TestArtifactsAndAggregation:

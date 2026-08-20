@@ -3617,6 +3617,290 @@ def _semantic_taxonomy(
         )
 
 
+_H0_ISOLATION_ATTEMPTS = (
+    "native-tool", "proxy", "resolver", "socket", "subprocess",
+)
+
+
+def _h0_environment(row: dict) -> dict:
+    return {key: row[key] for key in (
+        "architecture", "isolation_profile", "os", "python", "runner_image",
+    )}
+
+
+def _h0_artifact(
+    body: bytes, *, name: str, artifact_type: str, identity: dict, members: set[str],
+) -> dict:
+    doc = _object(
+        _artifact_document(body, "B-HERMETIC-ALL", name),
+        f"B-HERMETIC-ALL {name}",
+        {
+            "artifact_type", "candidate_identity_digest", "gate_id", "name",
+            "release", "schema_version", *members,
+        },
+    )
+    expected_identity = {
+        "artifact_type": artifact_type,
+        "candidate_identity_digest": evidence.canonical_digest(identity),
+        "gate_id": "B-HERMETIC-ALL",
+        "name": name,
+        "release": RELEASE,
+        "schema_version": GATE_ARTIFACT_SCHEMA,
+    }
+    if any(doc[key] != value for key, value in expected_identity.items()):
+        raise evidence.EvidenceError(
+            f"B-HERMETIC-ALL {name} is bound to the wrong candidate, gate, release or name"
+        )
+    return doc
+
+
+def _semantic_h0_hermetic_all(
+    gate: dict, bodies: Mapping[str, bytes], **context: object,
+) -> None:
+    """Recompute the complete H0 roster, shard outcomes and isolation witnesses.
+
+    This verifier intentionally does not make the current development H0 runner
+    an isolation producer.  B-HERMETIC-ALL remains open until a candidate-qualified
+    runner supplies the bound isolation-self-test artifact validated below.
+    """
+    if gate["gate_id"] != "B-HERMETIC-ALL":  # pragma: no cover - registry invariant
+        raise evidence.EvidenceError("H0 hermetic verifier received the wrong gate")
+    identity = context["identity"]
+    support = context["support"]
+    report = context["report"]
+    if not isinstance(identity, dict) or not isinstance(support, dict) or not isinstance(report, dict):
+        raise evidence.EvidenceError("H0 hermetic verifier requires accepted release context")
+    expected_environments = [
+        _h0_environment(row) for row in support["environments"]
+        if row["lane"] == "H0-hermetic"
+    ]
+    if not expected_environments:
+        raise evidence.EvidenceError("B-HERMETIC-ALL has no supported H0 environments")
+
+    collection_body = bodies["collection-manifest"]
+    taxonomy = evidence.read_pytest_taxonomy(collection_body)
+    pytest_tools = [tool for tool in gate["toolchain"] if tool["name"] == "pytest"]
+    if len(pytest_tools) != 1:
+        raise evidence.EvidenceError("B-HERMETIC-ALL requires one exact pytest tool identity")
+    selection = taxonomy["selection"]
+    selected_by_lane = {
+        row["lane"]: row["selected"] for row in selection["selected_by_lane"]
+    }
+    full_nodes = taxonomy["lanes"][0]["nodes"]
+    if (selection["mark_expression"] != "offline" or
+            selection["keyword_expression"] != "" or not full_nodes or
+            selection["selected"] != len(full_nodes) or
+            selected_by_lane["H0-hermetic"] != len(full_nodes) or
+            any(value for lane, value in selected_by_lane.items()
+                if lane != "H0-hermetic")):
+        raise evidence.EvidenceError(
+            "H0 collection taxonomy must select the positive complete offline roster"
+        )
+    collector = taxonomy["collector"]
+    if (collector["python_version"] != gate["environment"]["python"] or
+            collector["version"] != pytest_tools[0]["version"]):
+        raise evidence.EvidenceError(
+            "H0 collection taxonomy collector does not match the signed environment/toolchain"
+        )
+
+    inputs = context["input_bodies"]
+    if not isinstance(inputs, Mapping):
+        raise evidence.EvidenceError("H0 hermetic verifier requires frozen runner topology inputs")
+    try:
+        job_map = evidence.read_verification_job_map(
+            inputs["verification-job-map"],
+            workflow_bodies={".github/workflows/ci.yml": inputs["verification-workflow-ci"]},
+        )
+    except KeyError as exc:  # pragma: no cover - frozen scope invariant
+        raise evidence.EvidenceError("H0 hermetic verifier is missing its runner topology") from exc
+    offline_jobs = [row for row in job_map["jobs"] if row["lane"] == "H0-hermetic"]
+    if (len(offline_jobs) != 1 or offline_jobs[0]["selection"] != {
+        "keyword_expression": "", "mark_expression": "offline",
+    }):
+        raise evidence.EvidenceError("H0 runner topology must have one exact offline job")
+    topology = []
+    topology_ids = {}
+    for instance in offline_jobs[0]["instances"]:
+        matrix = {row["name"]: row["value"] for row in instance["matrix"]}
+        if set(matrix) != {"python-version", "shard"}:
+            raise evidence.EvidenceError("H0 runner topology has unexpected matrix dimensions")
+        if not matrix["shard"].isdigit():
+            raise evidence.EvidenceError("H0 runner topology has a non-numeric shard")
+        topology.append((matrix["python-version"], matrix["shard"]))
+        topology_ids[(matrix["python-version"], int(matrix["shard"]))] = instance["id"]
+    expected_topology = [
+        (python, str(shard)) for python in ("3.10", "3.12") for shard in range(6)
+    ]
+    if topology != expected_topology:
+        raise evidence.EvidenceError("H0 runner topology is not the frozen 2x6 offline matrix")
+    if [environment["python"].rsplit(".", 1)[0] for environment in expected_environments] != \
+            ["3.10", "3.12"]:
+        raise evidence.EvidenceError("H0 support environments do not match the frozen runner matrix")
+
+    test_report = _h0_artifact(
+        bodies["test-report"], name="test-report", artifact_type="h0-test-report",
+        identity=identity, members={"collection_manifest_digest", "runs"},
+    )
+    if test_report["collection_manifest_digest"] != raw_sha256(collection_body):
+        raise evidence.EvidenceError("H0 test report binds a different collection manifest")
+    run_rows = _array(test_report["runs"], "H0 test report.runs")
+    observed_run_environments = []
+    logical_counts_by_environment: dict[tuple[str, ...], dict] = {}
+    report_instance_by_environment = {
+        tuple(instance["environment"][field] for field in (
+            "architecture", "isolation_profile", "os", "python", "runner_image",
+        )): instance["id"]
+        for instance in report["instances"]
+    }
+    for run_index, record in enumerate(run_rows):
+        run = _object(record, f"H0 test report.runs[{run_index}]", {
+            "environment", "evidence_instance_id", "fragments",
+        })
+        environment = _object(
+            run["environment"], f"H0 test report.runs[{run_index}].environment",
+            {"architecture", "isolation_profile", "os", "python", "runner_image"},
+        )
+        key = tuple(environment[field] for field in (
+            "architecture", "isolation_profile", "os", "python", "runner_image",
+        ))
+        if run["evidence_instance_id"] != report_instance_by_environment.get(key):
+            raise evidence.EvidenceError(
+                "H0 test run does not bind its exact signed gate-evidence instance"
+            )
+        fragments = _array(run["fragments"], f"H0 test report.runs[{run_index}].fragments")
+        if not fragments:
+            raise evidence.EvidenceError("H0 test report has no shard fragments")
+        parsed_fragments = []
+        for fragment_index, fragment_record in enumerate(fragments):
+            embedded = _object(
+                fragment_record,
+                f"H0 test report.runs[{run_index}].fragments[{fragment_index}]",
+                {"digest", "job_instance_id", "report"},
+            )
+            fragment_body = evidence.canonical_json_bytes(embedded["report"])
+            fragment = evidence.read_h0_shard_outcome_report(fragment_body)
+            if embedded["digest"] != raw_sha256(fragment_body):
+                raise evidence.EvidenceError("H0 shard digest does not match its embedded document")
+            python_minor = environment["python"].rsplit(".", 1)[0]
+            if embedded["job_instance_id"] != topology_ids.get(
+                (python_minor, fragment["shard_index"])
+            ):
+                raise evidence.EvidenceError(
+                    "H0 shard does not bind its exact verification job instance"
+                )
+            parsed_fragments.append(fragment)
+        shard_count = 6
+        if (len(parsed_fragments) != shard_count or
+                [row["shard_index"] for row in parsed_fragments] != list(range(shard_count)) or
+                any(row["shard_count"] != shard_count for row in parsed_fragments)):
+            raise evidence.EvidenceError("H0 test report must contain every shard index exactly once")
+        full_roster = {
+            "count": len(full_nodes), "digest": evidence.h0_roster_digest(full_nodes),
+        }
+        for shard_index, fragment in enumerate(parsed_fragments):
+            selected_nodes = [
+                nodeid for nodeid in full_nodes
+                if evidence.h0_shard_index(nodeid, shard_count) == shard_index
+            ]
+            selected_roster = {
+                "count": len(selected_nodes),
+                "digest": evidence.h0_roster_digest(selected_nodes),
+            }
+            fragment_collector = fragment["collector"]
+            if (fragment_collector["name"] != collector["name"] or
+                    fragment_collector["python_implementation"] != collector["python_implementation"] or
+                    fragment_collector["python_version"] != environment["python"] or
+                    fragment_collector["version"] != collector["version"] or
+                    fragment["full_h0_roster"] != full_roster or
+                    fragment["selected_roster"] != selected_roster or
+                    fragment["passed_roster"] != selected_roster):
+                raise evidence.EvidenceError(
+                    "H0 shard collector or full/selected/pass roster does not reconcile"
+                )
+            outcomes = fragment["outcomes"]
+            if (fragment["collection_failures"] != 0 or fragment["session_exit_code"] != 0 or
+                    outcomes["passed"] != len(selected_nodes) or
+                    any(outcomes[name] for name in ("failed", "skipped", "xfailed", "xpassed"))):
+                raise evidence.EvidenceError("H0 shard contains collection, execution or non-pass outcomes")
+        logical_counts_by_environment[key] = {
+            "collected": selection["collected"],
+            "deselected": selection["deselected"],
+            "failed": 0,
+            "passed": len(full_nodes),
+            "selected": len(full_nodes),
+            "skipped": 0,
+            "xfailed": 0,
+            "xpassed": 0,
+        }
+        observed_run_environments.append(environment)
+    if observed_run_environments != expected_environments:
+        raise evidence.EvidenceError(
+            "H0 test report does not cover the exact supported H0 environments"
+        )
+
+    isolation = _h0_artifact(
+        bodies["isolation-self-test"], name="isolation-self-test",
+        artifact_type="h0-isolation-self-test", identity=identity, members={"instances"},
+    )
+    isolation_rows = _array(isolation["instances"], "H0 isolation self-test.instances")
+    observed_isolation_environments = []
+    for index, record in enumerate(isolation_rows):
+        item = _object(record, f"H0 isolation self-test.instances[{index}]", {
+            "attempts", "environment", "evidence_instance_id", "isolation_profile",
+        })
+        environment = _object(
+            item["environment"], f"H0 isolation self-test.instances[{index}].environment",
+            {"architecture", "isolation_profile", "os", "python", "runner_image"},
+        )
+        if item["isolation_profile"] != environment["isolation_profile"]:
+            raise evidence.EvidenceError("H0 isolation self-test profile does not match its environment")
+        isolation_key = tuple(environment[field] for field in (
+            "architecture", "isolation_profile", "os", "python", "runner_image",
+        ))
+        if item["evidence_instance_id"] != report_instance_by_environment.get(isolation_key):
+            raise evidence.EvidenceError(
+                "H0 isolation self-test does not bind its exact signed gate-evidence instance"
+            )
+        attempts = _array(item["attempts"], f"H0 isolation self-test.instances[{index}].attempts")
+        if [attempt.get("kind") if type(attempt) is dict else None for attempt in attempts] != \
+                list(_H0_ISOLATION_ATTEMPTS):
+            raise evidence.EvidenceError("H0 isolation self-test attempt roster or order is not exact")
+        for attempt_index, attempt in enumerate(attempts):
+            observed = _object(
+                attempt, f"H0 isolation self-test.instances[{index}].attempts[{attempt_index}]",
+                {"denial", "kind", "outcome"},
+            )
+            denial = _object(observed["denial"], "H0 isolation self-test denial", {
+                "code", "detail",
+            })
+            _token(denial["code"], "H0 isolation self-test denial.code")
+            detail = _string(denial["detail"], "H0 isolation self-test denial.detail")
+            if len(detail) > 512:
+                raise evidence.EvidenceError("H0 isolation self-test denial.detail exceeds 512 characters")
+            if observed["outcome"] != "denied":
+                raise evidence.EvidenceError("H0 isolation self-test contains a non-denied attempt")
+        observed_isolation_environments.append(environment)
+    if observed_isolation_environments != expected_environments:
+        raise evidence.EvidenceError(
+            "H0 isolation self-test does not cover the exact supported H0 environments"
+        )
+
+    report_instances = report["instances"]
+    if ([instance["environment"] for instance in report_instances] != expected_environments or
+            any(instance["lane"] != "H0-hermetic" for instance in report_instances)):
+        raise evidence.EvidenceError(
+            "B-HERMETIC-ALL gate evidence does not have one exact instance per H0 environment"
+        )
+    for instance in report_instances:
+        key = tuple(instance["environment"][field] for field in (
+            "architecture", "isolation_profile", "os", "python", "runner_image",
+        ))
+        if instance["selection"] != logical_counts_by_environment.get(key):
+            raise evidence.EvidenceError(
+                "B-HERMETIC-ALL gate evidence counts do not match logical H0 collection counts"
+            )
+
+
 def _semantic_evidence_schema(
     gate: dict, bodies: Mapping[str, bytes], **context: object,
 ) -> None:
@@ -3720,6 +4004,7 @@ SEMANTIC_VERIFIERS = MappingProxyType({
     "A-CORPUS": _semantic_corpus,
     "A-THRESHOLDS": _semantic_thresholds,
     "A-SUPPORT": _semantic_support,
+    "B-HERMETIC-ALL": _semantic_h0_hermetic_all,
     "C-NETWORK-BOUNDARY": _semantic_network_boundary,
     "C-NET-DENY": _semantic_network_denial,
     "C-FAULT-DISK": _semantic_resource_fault,
