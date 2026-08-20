@@ -2,6 +2,7 @@
 
 import ast
 import hashlib
+import socket
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,8 +10,9 @@ from unittest.mock import ANY
 
 import pytest
 
-from quarry_recon import (contract, events, runner, runner_protocol,
-                          runner_repository, runner_supervisor, runtime_identity, store)
+from quarry_recon import (contract, events, netguard, network_dns, resource_contract,
+                          runner, runner_protocol, runner_repository, runner_supervisor,
+                          runtime_identity, store)
 import quarry_recon.network_policy as network_policy
 from quarry_recon.runner import Status
 from quarry_recon.runner_native import RepositoryNativeOutput
@@ -291,6 +293,26 @@ def test_run_contract_passes_literal_source_id(monkeypatch, tmp_path):
     assert captured["approved_peers"] == ("8.8.8.8",)
 
 
+def test_run_contract_forwards_network_hosts(monkeypatch, tmp_path):
+    events.configure(tmp_path)
+    captured = {}
+
+    def fake_run(tool, cmd, **kwargs):
+        captured.update(kwargs)
+        return runner.RunResult(tool, cmd, Status.EMPTY, 0, 0.0, None, 0)
+
+    monkeypatch.setattr(contract, "_run", fake_run)
+    try:
+        contract.run_contract(
+            "vertical.subfinder", ["subfinder", "-duc"],
+            network_hosts=("Example.TEST.",),
+        )
+    finally:
+        events.reset()
+
+    assert captured["network_hosts"] == ("Example.TEST.",)
+
+
 def test_unbound_repository_keeps_optional_source_id_compatibility(tmp_path, monkeypatch):
     run = _running_run(tmp_path)
     monkeypatch.setattr(network_policy, "scope_for", lambda _repository: None)
@@ -352,6 +374,157 @@ def test_bound_policy_forwards_caller_owned_approved_peers(tmp_path, monkeypatch
     assert scope.prepared["approved_peers"] == (
         "8.8.8.8", "2001:4860:4860::8888",
     )
+
+
+def test_bound_policy_resolves_network_hosts_before_forwarding(tmp_path, monkeypatch):
+    run = _running_run(tmp_path)
+    scope = _PolicyScope()
+    _install_bound_policy(monkeypatch, run, scope)
+    observed = {}
+    monkeypatch.setattr(
+        runner, "_resolve_network_hosts",
+        lambda current, **kwargs: (
+            observed.update(scope=current, **kwargs) or ("8.8.8.8",)
+        ),
+    )
+    monkeypatch.setattr(
+        runner_repository, "supervise_repository_execution",
+        lambda _repository, invocation, **_kwargs: _authenticated_outcome(
+            invocation.worker.request_id, clean=True,
+        ),
+    )
+
+    _managed_call(
+        run, ["fixture", "--exact"], source_id="fixture.source",
+        network_hosts=("example.test",),
+    )
+
+    assert observed["scope"] is scope
+    assert observed["network_hosts"] == ("example.test",)
+    assert scope.prepared["approved_peers"] == ("8.8.8.8",)
+
+
+def _network_host_scope():
+    return network_policy.NetworkPolicyScope(
+        block_private_targets=False,
+        own_ips=("192.0.2.10",),
+        resolver_ips=("1.1.1.1",),
+        requested_cidrs=("8.8.8.0/24",),
+        apex_domains=("example.test",),
+    )
+
+
+def test_network_hosts_use_validating_dns_and_canonical_union(monkeypatch):
+    scope = _network_host_scope()
+    traces = []
+    monkeypatch.setattr(scope, "_trace", lambda row: traces.append(row))
+    monkeypatch.setattr(netguard, "own_ips", lambda: ("192.0.2.10",))
+    monkeypatch.setattr(
+        socket, "getaddrinfo",
+        lambda *_args, **_kwargs: pytest.fail("ambient resolver was reached"),
+    )
+    seen = []
+
+    def resolve(policy, host, *, on_event, effect_fence, **_kwargs):
+        assert policy.source_id == "probe.tlsx_certs"
+        assert policy.tool == "native-dns"
+        assert effect_fence is scope.effect_fence
+        seen.append(host)
+        on_event("dns-planned", "1.1.1.1", 53, "allow", "planned")
+        on_event("dns-settled", "1.1.1.1", 53, "allow", "settled")
+        return (("8.8.4.4",) if host == "a.example.test" else ("8.8.8.8",)), "ok"
+
+    monkeypatch.setattr(network_dns, "resolve", resolve)
+    assert runner._canonical_network_hosts(
+        ("B.EXAMPLE.TEST.", "a.example.test"),
+    ) == ("a.example.test", "b.example.test")
+    peers = runner._resolve_network_hosts(
+        scope, request_id="a" * 32, source_id="probe.tlsx_certs",
+        network_hosts=("a.example.test", "b.example.test"),
+    )
+
+    assert seen == ["a.example.test", "b.example.test"]
+    assert peers == ("8.8.4.4", "8.8.8.8")
+    assert [row["record_type"] for row in traces] == [
+        "planned", "planned", "settlement", "settlement",
+        "planned", "planned", "settlement", "settlement",
+    ]
+    assert all(row["tool"] == "native-dns" for row in traces)
+
+
+@pytest.mark.parametrize("answers,state", [
+    (("8.8.8.8", "127.0.0.1"), "ok"),
+    (("127.0.0.1",), "ok"),
+    ((), "indeterminate"),
+])
+def test_network_hosts_refuse_mixed_protected_and_indeterminate_answers(
+        monkeypatch, answers, state):
+    scope = _network_host_scope()
+    monkeypatch.setattr(scope, "_trace", lambda _row: None)
+    monkeypatch.setattr(netguard, "own_ips", lambda: ("192.0.2.10",))
+    monkeypatch.setattr(
+        network_dns, "resolve", lambda *_args, **_kwargs: (answers, state),
+    )
+
+    with pytest.raises(network_policy.NetworkPolicyError):
+        runner._resolve_network_hosts(
+            scope, request_id="b" * 32, source_id="probe.tlsx_certs",
+            network_hosts=("example.test",),
+        )
+
+
+def test_network_host_literal_is_classified_without_dns(monkeypatch):
+    scope = _network_host_scope()
+    monkeypatch.setattr(scope, "_trace", lambda _row: None)
+    monkeypatch.setattr(netguard, "own_ips", lambda: ("192.0.2.10",))
+    monkeypatch.setattr(
+        network_dns, "resolve",
+        lambda *_args, **_kwargs: pytest.fail("literal reached DNS"),
+    )
+
+    assert runner._resolve_network_hosts(
+        scope, request_id="c" * 32, source_id="probe.tlsx_certs",
+        network_hosts=("8.8.8.8",),
+    ) == ("8.8.8.8",)
+
+
+def test_network_host_authority_fault_settles_its_outer_plan(monkeypatch):
+    scope = _network_host_scope()
+    traces = []
+    monkeypatch.setattr(scope, "_trace", lambda row: traces.append(row))
+
+    def authority_fault(*_args, **_kwargs):
+        raise OSError("authority snapshot failed")
+
+    monkeypatch.setattr(scope, "host_allowed", authority_fault)
+
+    with pytest.raises(OSError):
+        runner._resolve_network_hosts(
+            scope, request_id="d" * 32, source_id="probe.tlsx_certs",
+            network_hosts=("example.test",),
+        )
+
+    assert [row["record_type"] for row in traces] == ["planned", "settlement"]
+    assert traces[-1]["decision"] == "deny"
+
+
+def test_network_host_corpus_deadline_refuses_before_dns(monkeypatch):
+    scope = _network_host_scope()
+    traces = []
+    monkeypatch.setattr(scope, "_trace", lambda row: traces.append(row))
+    monkeypatch.setattr(resource_contract, "MAX_RESOLVER_CORPUS_DEADLINE_SECONDS", 0.0)
+    monkeypatch.setattr(
+        network_dns, "resolve", lambda *_args, **_kwargs: pytest.fail("DNS exceeded corpus deadline"),
+    )
+
+    with pytest.raises(network_policy.NetworkPolicyError):
+        runner._resolve_network_hosts(
+            scope, request_id="e" * 32, source_id="probe.tlsx_certs",
+            network_hosts=("example.test",),
+        )
+
+    assert [row["record_type"] for row in traces] == ["planned", "settlement"]
+    assert traces[-1]["decision"] == "deny"
 
 
 @pytest.mark.parametrize("failure", ("normalize", "supervisor"))

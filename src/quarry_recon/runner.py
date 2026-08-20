@@ -10,6 +10,7 @@ import json
 import os
 import select
 import signal
+import socket
 import shutil
 import stat
 import subprocess
@@ -399,6 +400,209 @@ def _preflight_failure(tool: str, safe_cmd: "list[str] | None", detail: str) -> 
     fault = Fault("machinery", where=tool, detail=message).to_dict()
     return RunResult(tool, safe_cmd or [], Status.FAILED, None, 0.0, None, 0,
                      note=message, meta={"started": False, "faults": [fault]})
+
+
+_NETWORK_INPUT_UNSET = object()
+
+
+def _canonical_network_hosts(values) -> tuple[str, ...]:
+    """Return a bounded canonical host set without consulting ambient NSS."""
+    from . import netguard, network_policy, normalize
+
+    if (type(values) not in (tuple, list)
+            or len(values) > network_policy._MAX_NETWORK_HOSTS):
+        raise ValueError("network host set is not a bounded exact sequence")
+    hosts = []
+    for value in values:
+        if type(value) is not str or not value or "\x00" in value:
+            raise ValueError("network host set contains an invalid host")
+        try:
+            # This deliberately also rejects IPv6 zones.  It is only a parser
+            # here; literals are classified below without a DNS query.
+            literal = netguard.canonical_ip_set((value,))[0]
+        except (TypeError, ValueError):
+            literal = None
+        if literal is not None:
+            hosts.append(literal)
+            continue
+        canonical = normalize.canon_host_strict(value)
+        if canonical is None:
+            raise ValueError("network host set contains an invalid host")
+        hosts.append(canonical)
+    result = tuple(sorted(set(hosts)))
+    if len(result) != len(hosts):
+        raise ValueError("network host set contains duplicate canonical hosts")
+    return result
+
+
+def _preflight_network_inputs(network_hosts, approved_peers, *,
+                              network_hosts_supplied: bool,
+                              approved_peers_supplied: bool):
+    """Validate exact bounded network inputs before any launch admission."""
+    from . import netguard, network_policy
+
+    try:
+        hosts = _canonical_network_hosts(network_hosts)
+    except (TypeError, ValueError) as exc:
+        return (), (), f"network host set is invalid ({type(exc).__name__})"
+    if (type(approved_peers) not in (tuple, list)
+            or len(approved_peers) > network_policy._maximum_effective_cidrs):
+        return (), (), "approved peer set is not a bounded exact sequence"
+    try:
+        approved = netguard.canonical_ip_set(approved_peers)
+    except (TypeError, ValueError):
+        return (), (), "approved peer set is invalid"
+    if tuple(approved_peers) != approved:
+        return (), (), "approved peer set is not canonical"
+    if network_hosts_supplied and approved_peers_supplied:
+        return (), (), "network_hosts and approved_peers cannot both be supplied"
+    return hosts, approved, None
+
+
+def _trace_runner_dns(scope, *, request_id: str, source_id: str, host: str,
+                      record_type: str, decision: str, reason: str,
+                      answers=(), resolver=None) -> None:
+    """Persist one side of a parent-owned validating DNS effect."""
+    destination = {"host": host, "answers": list(answers)}
+    if resolver is not None:
+        destination["resolver"] = resolver
+    scope._trace({
+        "schema_version": "quarry.network-policy-trace.v1",
+        "record_type": record_type,
+        "request_id": request_id,
+        "source_id": source_id,
+        "tool": "native-dns",
+        "decision": decision,
+        "reason": reason,
+        "destination": destination,
+    })
+
+
+def _resolve_network_hosts(scope, *, request_id: str, source_id: str,
+                           network_hosts) -> tuple[str, ...]:
+    """Resolve and classify an all-or-nothing peer set before child launch."""
+    from . import netguard, network_dns, network_policy, resource_contract
+    from .network_broker import BrokerPolicy
+
+    hosts = network_hosts
+    if not hosts:
+        return ()
+    policy = BrokerPolicy.from_json(json.dumps(
+        scope.broker_policy(
+            request_id=request_id, source_id=source_id, tool="native-dns",
+            approved_peers=(),
+        ),
+        ensure_ascii=True, sort_keys=True, separators=(",", ":"),
+    ))
+    approved = []
+    deadline = time.monotonic() + resource_contract.MAX_RESOLVER_CORPUS_DEADLINE_SECONDS
+    for host in hosts:
+        _trace_runner_dns(
+            scope, request_id=request_id, source_id=source_id, host=host,
+            record_type="planned", decision="allow",
+            reason="runner will resolve and classify host before external launch",
+        )
+        planned: set[tuple[str, int]] = set()
+
+        def on_event(stage, peer, port, decision, reason):
+            key = (peer, port)
+            if stage == "dns-planned":
+                _trace_runner_dns(
+                    scope, request_id=request_id, source_id=source_id, host=host,
+                    record_type="planned", decision=decision, reason=reason,
+                    resolver=peer,
+                )
+                planned.add(key)
+                return
+            if stage != "dns-settled" or key not in planned:
+                raise network_policy.NetworkPolicyError(
+                    "validating DNS settlement lacked its durable plan",
+                )
+            try:
+                _trace_runner_dns(
+                    scope, request_id=request_id, source_id=source_id, host=host,
+                    record_type="settlement", decision=decision, reason=reason,
+                    resolver=peer,
+                )
+            except BaseException:
+                # A transient trace failure must not leave the durable plan
+                # without a best-effort terminal before DNS cancels its fence.
+                try:
+                    _trace_runner_dns(
+                        scope, request_id=request_id, source_id=source_id, host=host,
+                        record_type="settlement", decision="deny",
+                        reason="validating DNS trace callback failed", resolver=peer,
+                    )
+                finally:
+                    planned.remove(key)
+                raise
+            planned.remove(key)
+
+        try:
+            host_decision, _host_reason = scope.host_allowed(
+                host, source_id=source_id,
+                _runner_authority=network_policy._RUNNER_NATIVE_DNS_AUTHORITY,
+            )
+            if host_decision != "allow":
+                raise network_policy.NetworkPolicyError(
+                    "network host authority is outside active scope",
+                )
+            try:
+                literal = netguard.canonical_ip_set((host,))
+            except (TypeError, ValueError):
+                literal = ()
+            if literal:
+                answers, state = literal, "ok"
+            else:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise network_policy.NetworkPolicyError(
+                        "network host corpus exceeded its resolver deadline",
+                    )
+                answers, state = network_dns.resolve(
+                    policy, host, timeout=min(5.0, remaining), on_event=on_event,
+                    effect_fence=scope.effect_fence,
+                )
+            if planned:
+                raise network_policy.NetworkPolicyError(
+                    "validating DNS retained an unsettled effect",
+                )
+            # The DNS module itself returns this form.  Requiring it here also
+            # makes adapters and future resolver implementations fail closed.
+            if type(answers) is not tuple or state != "ok" or not answers:
+                raise network_policy.NetworkPolicyError(
+                    "network host did not obtain a complete address answer set",
+                )
+            canonical = netguard.canonical_ip_set(answers)
+            if canonical != answers:
+                raise network_policy.NetworkPolicyError(
+                    "network host answer set is not canonical",
+                )
+            for peer in canonical:
+                verdict = scope.decide_peer(
+                    peer, 0, socket.SOCK_STREAM, socket.IPPROTO_TCP,
+                    source_id=source_id,
+                    _runner_authority=network_policy._RUNNER_NATIVE_DNS_AUTHORITY,
+                )
+                if not verdict.allowed:
+                    raise network_policy.NetworkPolicyError(
+                        "network host answer is outside peer policy",
+                    )
+            approved.extend(canonical)
+        except BaseException as exc:
+            _trace_runner_dns(
+                scope, request_id=request_id, source_id=source_id, host=host,
+                record_type="settlement", decision="deny",
+                reason=f"runner DNS/peer validation refused ({type(exc).__name__})",
+            )
+            raise
+        _trace_runner_dns(
+            scope, request_id=request_id, source_id=source_id, host=host,
+            record_type="settlement", decision="allow",
+            reason="runner DNS/peer validation settled before external launch",
+            answers=canonical,
+        )
+    return netguard.canonical_ip_set(approved)
 
 
 def have(bin_name: str) -> bool:
@@ -1597,6 +1801,9 @@ def _run_with_repository(
     env,
     max_output_bytes,
     approved_peers,
+    network_hosts,
+    approved_peers_supplied,
+    network_hosts_supplied,
 ) -> RunResult:
     """Normalize once, then delegate all execution publication authority."""
     from . import network_policy, runner_native, runner_protocol, runner_repository, store
@@ -1642,7 +1849,16 @@ def _run_with_repository(
     # execution.  Admission must carry the literal source identity and the
     # caller's exact argv through the transport-door registry; otherwise a
     # scoped repository must not reach runtime identity preparation or spawn.
+    network_hosts, approved_peers, network_input_error = _preflight_network_inputs(
+        network_hosts, approved_peers,
+        network_hosts_supplied=network_hosts_supplied,
+        approved_peers_supplied=approved_peers_supplied,
+    )
+    if network_input_error is not None:
+        return preflight_failure(network_input_error)
     policy_scope = network_policy.scope_for(repository)
+    if network_hosts and policy_scope is None:
+        return preflight_failure("network_hosts require a bound network policy scope")
     if policy_scope is not None:
         door = network_policy.transport_door(source_id, argv=safe_cmd)
         if door is None or not door.supported or not door.broker_required:
@@ -1717,6 +1933,10 @@ def _run_with_repository(
         )
         runtime_identity.revalidate_launch(prepared)
         if policy_scope is not None:
+            resolved_peers = _resolve_network_hosts(
+                policy_scope, request_id=request_id, source_id=source_id,
+                network_hosts=network_hosts,
+            ) if network_hosts else approved_peers
             network_invocation = policy_scope.prepare_invocation(
                 request_id=request_id,
                 source_id=source_id,
@@ -1724,7 +1944,7 @@ def _run_with_repository(
                 argv=safe_cmd,
                 environment=prepared.environment,
                 runtime_identity=prepared.record,
-                approved_peers=approved_peers,
+                approved_peers=resolved_peers,
             )
         identity_ref = (
             runtime_identity.publish_launch_identity(repository, request_id, prepared.record)
@@ -1989,7 +2209,8 @@ def run(
     env: dict | None = None,
     stderr_path: Path | None = None,
     max_output_bytes: int | None = None,
-    approved_peers=(),
+    approved_peers=_NETWORK_INPUT_UNSET,
+    network_hosts=_NETWORK_INPUT_UNSET,
 ) -> RunResult:
     """Execute with explicit repository ownership and output dispositions.
 
@@ -1997,11 +2218,21 @@ def run(
     path-based branch remains temporarily available only for unmanaged callers;
     a managed run artifact can no longer reach the legacy publisher.
     """
+    approved_peers_supplied = approved_peers is not _NETWORK_INPUT_UNSET
+    network_hosts_supplied = network_hosts is not _NETWORK_INPUT_UNSET
+    if not approved_peers_supplied:
+        approved_peers = ()
+    if not network_hosts_supplied:
+        network_hosts = ()
+    # Do not ask an untrusted container for truthiness: a host declaration is
+    # itself a managed-network request, including malformed declarations.
+    network_hosts_declared = network_hosts_supplied
     policies = (repository, stdout, stderr)
     explicit = (
         any(value is not _REPOSITORY_POLICY_UNSET for value in policies)
         or type(native_outputs) is not tuple
         or bool(native_outputs)
+        or network_hosts_declared
     )
     if explicit:
         safe_cmd, _error = _preflight_argv(cmd)
@@ -2041,6 +2272,9 @@ def run(
             env=env,
             max_output_bytes=max_output_bytes,
             approved_peers=approved_peers,
+            network_hosts=network_hosts,
+            approved_peers_supplied=approved_peers_supplied,
+            network_hosts_supplied=network_hosts_supplied,
         )
 
     return _legacy_run(

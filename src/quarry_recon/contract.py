@@ -27,7 +27,8 @@ from dataclasses import dataclass as _dataclass
 from pathlib import Path as _Path
 
 from . import events, normalize, resource_contract as _resource_contract, sources
-from .runner import Status, _preflight_argv, _preflight_environment, run as _run, skipped
+from .runner import (_NETWORK_INPUT_UNSET, Status, _preflight_argv,
+                     _preflight_environment, run as _run, skipped)
 
 # Non-clean terminal statuses that warrant a dedicated event before the normal tool_finish.
 _PARTIAL = (Status.PARTIAL, Status.TIMED_OUT)
@@ -1934,7 +1935,8 @@ def run_contract(source_id, cmd, *, repository=None, stdout=None, stderr=None,
                  native_outputs=(),
                  input_total=None, env=None, reclassify=None, work_unit=None,
                  parent_id=None, scope_distance=None, discovery_context=None,
-                 approved_peers=(),
+                 approved_peers=_NETWORK_INPUT_UNSET,
+                 network_hosts=_NETWORK_INPUT_UNSET,
                  **run_kwargs):
     """Run a source under its registry contract -> the (reclassified) RunResult.
 
@@ -1981,6 +1983,7 @@ def run_contract(source_id, cmd, *, repository=None, stdout=None, stderr=None,
         res = _run(
             tool, cmd, source_id=source_id, native_outputs=native_outputs, env=env,
             approved_peers=approved_peers,
+            network_hosts=network_hosts,
             **repository_policies, **run_kwargs,
         )
         if reclassify is not None:

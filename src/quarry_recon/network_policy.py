@@ -303,7 +303,11 @@ def broker_transport_semantics(source_id: str, tool: str) -> dict[str, str]:
     if door is None or not door.supported or type(tool) is not str:
         raise NetworkPolicyError("broker source has no canonical transport door")
     if tool == "native-dns":
-        if not door.helpers:
+        # The runner resolves finite, caller-declared host inputs before it
+        # creates an external child policy.  This remains source-derived and
+        # is parent-local; this policy is never attached to a tracee.
+        if not door.helpers and not (
+                door.broker_required and door.authority_class == "target"):
             raise NetworkPolicyError("broker DNS mediator source is not native")
     elif not door.argv0 or Path(tool).name not in door.argv0:
         raise NetworkPolicyError("broker tool does not match its transport door")
@@ -370,6 +374,8 @@ _MAX_EXECUTABLE_BYTES = 512 * 1024 * 1024
 _maximum_control_plane_cidrs = 128
 _maximum_effective_cidrs = 4096
 _maximum_resolvers = 16
+_MAX_NETWORK_HOSTS = 1024
+_RUNNER_NATIVE_DNS_AUTHORITY = object()
 
 
 def transport_door(source_id: str, *, argv=None, helper: str | None = None) -> TransportDoor | None:
@@ -844,7 +850,8 @@ class NetworkPolicyScope:
         return document
 
     def decide_peer(self, peer: str, port: int, socket_type: int,
-                    protocol: int, *, source_id: str) -> PeerDecision:
+                    protocol: int, *, source_id: str,
+                    _runner_authority=None) -> PeerDecision:
         """Re-snapshot interfaces and decide one exact kernel peer."""
         from . import netguard
 
@@ -856,8 +863,16 @@ class NetworkPolicyScope:
         socket_type = int(socket_type)
         protocol = int(protocol)
         door = TRANSPORT_DOORS.get(source_id)
-        if door is None or not door.helpers:
+        if door is None or not door.supported:
             raise NetworkPolicyError("native peer source has no exact transport door")
+        if not door.helpers:
+            # External tools never call this native classifier.  The sole
+            # exception is the runner's pre-launch literal DNS bridge, which
+            # carries an unexported in-process capability.
+            if (_runner_authority is not _RUNNER_NATIVE_DNS_AUTHORITY
+                    or not door.broker_required
+                    or door.authority_class != "target"):
+                raise NetworkPolicyError("native peer source has no exact transport door")
         try:
             normalized = netguard.canonical_ip_set((peer,))
             current_own = netguard.own_ips()
@@ -901,7 +916,8 @@ class NetworkPolicyScope:
             tuple(current_own),
         )
 
-    def host_allowed(self, host: str, *, source_id: str) -> tuple[str, str]:
+    def host_allowed(self, host: str, *, source_id: str,
+                     _runner_authority=None) -> tuple[str, str]:
         """Authorize a native transport authority before any DNS request."""
         from . import normalize
 
@@ -909,7 +925,11 @@ class NetworkPolicyScope:
                 or _source_id_re.fullmatch(source_id) is None or "%" in host):
             return "deny", "native HTTP authority is not canonical"
         door = TRANSPORT_DOORS.get(source_id)
-        if door is None or not door.helpers or not door.supported:
+        if door is None or not door.supported:
+            return "deny", "native HTTP source has no exact transport door"
+        if not door.helpers and not (
+                _runner_authority is _RUNNER_NATIVE_DNS_AUTHORITY
+                and door.broker_required and door.authority_class == "target"):
             return "deny", "native HTTP source has no exact transport door"
         try:
             address = ipaddress.ip_address(host)

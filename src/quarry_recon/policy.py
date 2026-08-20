@@ -329,6 +329,9 @@ EXCLUDED: dict[str, tuple[str, str]] = {
     "quarry_recon.network_policy:_MAX_EXECUTABLE_BYTES": (
         "resource", "the largest helper identity the parent may authorize for broker authentication; "
                     "larger launch identities are rejected before network authority"),
+    "quarry_recon.network_policy:_MAX_NETWORK_HOSTS": (
+        "resource", "the bounded exact host set a single external-tool launch may resolve and bind; "
+                    "larger work must be split before any child is started"),
     "quarry_recon.network_broker:_MAX_SOCKADDR_BYTES": (
         "resource", "the allocation bound for one copied tracee sockaddr; an oversized address is "
                     "rejected before any broker-owned socket effect"),
