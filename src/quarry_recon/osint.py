@@ -757,6 +757,7 @@ def _whois(s: OsintSession, apex: str, echo, timeout: int) -> set[str]:
         result = exec_tool(
             "whois", ["whois", apex], repository=s, stdout=s.output(raw),
             stderr=s.output(diagnostic), timeout=min(timeout, 30), ok_empty=True,
+            source_id="osint.whois",
         )
         s.record(result)
         output = result.raw_path.read_text(errors="replace") if result.raw_path is not None else ""
@@ -789,6 +790,7 @@ def _dmarc(s: OsintSession, apex: str, echo, timeout: int) -> None:
             "dig", ["dig", "+short", "TXT", f"_dmarc.{apex}"], repository=s,
             stdout=s.output(raw), stderr=s.output(diagnostic), timeout=min(timeout, 15),
             ok_empty=True,
+            source_id="osint.dmarc",
         )
         s.record(result)
         output = result.raw_path.read_text(errors="replace") if result.raw_path is not None else ""
@@ -1293,6 +1295,7 @@ def _asn_expand(s: OsintSession, profile, echo, timeout: int) -> None:
         "asnmap", ["asnmap", "-duc", "-silent"],
         repository=s, stdout=s.output(raw), stderr=s.output(),
         stdin_data="\n".join(profile.asn), timeout=min(timeout, 120),
+        source_id="osint.asnmap",
     )
     s.record(r)
     if r.raw_path:
@@ -1337,6 +1340,7 @@ def _porch_pirate(s: OsintSession, apex: str, echo, timeout: int) -> None:
     r = exec_tool(
         "porch-pirate", ["porch-pirate", "-s", apex, "--urls"],
         repository=s, stdout=s.output(pp), stderr=s.output(), timeout=timeout,
+        source_id="osint.porch_pirate",
     )
     s.record(r)
     n_urls = 0
@@ -1349,6 +1353,7 @@ def _porch_pirate(s: OsintSession, apex: str, echo, timeout: int) -> None:
     rg = exec_tool(
         "porch-pirate", ["porch-pirate", "-s", apex, "--globals"],
         repository=s, stdout=s.output(gl), stderr=s.output(), timeout=timeout,
+        source_id="osint.porch_pirate",
     )
     s.record(rg)
     n_globals = 0

@@ -6,17 +6,18 @@ passive (subfinder -all) + github-subdomains -> brute (puredns) -> permutations
 from __future__ import annotations
 
 import ipaddress as _ipaddress
-import http.client as _http_client
+import io
 import json as _json
 import os
 import re as _re
 import shutil
 import urllib.parse
+import urllib.error
 import urllib.request
 from dataclasses import replace
 from pathlib import Path
 
-from .. import budget, campaign, events, netguard, normalize, policy, remainder, secrets, settings, sweep
+from .. import budget, campaign, events, fetch, netguard, normalize, policy, remainder, secrets, settings, sweep
 from ..contract import (ProviderResult, ProviderSkip, classify_provider_error, read_bounded,
                         registered, run_contract,
                         run_provider)
@@ -125,6 +126,7 @@ def _openintel(ctx, cfg: dict, apex: str, timeout: int = 180) -> set:
         repository=ctx.run,
         stdout=RepositoryOutput.publish(*raw.relative_to(ctx.run.dir).parts),
         stderr=RepositoryOutput.discard(), timeout=timeout,
+        source_id="vertical.openintel",
     )
     ctx.run.record("vertical", r)
     if r.status not in (Status.SUCCESS, Status.EMPTY) or not (r.raw_path and Path(r.raw_path).exists()):
@@ -137,6 +139,28 @@ def _openintel(ctx, cfg: dict, apex: str, timeout: int = 180) -> set:
 #: the provider's own 403 sentence for a Free PAT hitting the org-gated Platform search API.
 CENSYS_ORG_REQUIRED = ("This endpoint requires an organization ID for API access. Free users can only "
                        "access this endpoint through the Platform UI.")
+
+
+def _provider_get(ctx, url, *, source_id, timeout, max_body, headers=None, method="GET", data=None):
+    """One bounded public-provider request through the run-bound pinned transport."""
+    if ctx is None or fetch._network_scope(ctx) is None:  # compatibility seam for unbound parser/unit tests
+        request = urllib.request.Request(url, data=data, method=method, headers=headers)
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return read_bounded(response, max_body, provider=source_id, bound=f"{source_id}_READ_LIMIT"), \
+                   int(getattr(response, "status", 200) or 200)
+    response_headers = {}
+    body, final, status = fetch.scoped_get(
+        ctx, url, timeout=timeout, max_body=max_body, headers=headers, method=method, data=data,
+        source_id=source_id, response_headers=response_headers,
+    )
+    if body is None:
+        raise RuntimeError("public-provider request refused by the run network scope")
+    if not 200 <= status < 300:
+        raise urllib.error.HTTPError(final, status, f"HTTP {status}", response_headers, io.BytesIO(body))
+    # ``scoped_get`` returns at most one byte beyond this cap; convert that sentinel into the same
+    # typed bounded-read error the old response stream produced.
+    return read_bounded(io.BytesIO(body), max_body, provider=source_id,
+                        bound=f"{source_id}_READ_LIMIT"), status
 
 
 def censys_entitlement_skip(cen: dict, apexes) -> bool:
@@ -176,7 +200,7 @@ def _censys_next_token(doc: dict) -> str | None:
     return None
 
 
-def _censys(cfg: dict, apex: str, timeout: int = 30, max_pages: int = 5) -> set:
+def _censys(cfg: dict, apex: str, timeout: int = 30, max_pages: int = 5, *, ctx=None) -> set:
     """Optional Censys Platform v3 global-search cert query for `apex` -> subdomain set. Empty (silent)
     unless both `token` and `org` are configured. Query is CenQL `cert.names: "<apex>"`. Fail-closed parse:
     names come from `certificate_v1.resource.names`, filtered to the queried apex; a missing path / non-list
@@ -196,16 +220,17 @@ def _censys(cfg: dict, apex: str, timeout: int = 30, max_pages: int = 5) -> set:
         payload = {"query": f'cert.names: "{apex}"', "page_size": 100, "fields": ["cert.names"]}
         if page_token:
             payload["page_token"] = page_token              # v3 pagination field (not `cursor`)
-        req = urllib.request.Request(
-            "https://api.platform.censys.io/v3/global/search/query", data=_json.dumps(payload).encode(),
-            method="POST",
-            headers={"Authorization": f"Bearer {token}", "X-Organization-ID": str(org),
-                     "Content-Type": "application/json", "User-Agent": "Mozilla/5.0"})
         try:
             # fetch and validate/extract in one block: a later-page schema/parse error must preserve
             # earlier pages, not propagate and lose them.
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                raw = read_bounded(r, CENSYS_READ_LIMIT, provider="censys", bound="CENSYS_READ_LIMIT").decode("utf-8", "replace")
+            body, _status = _provider_get(
+                ctx, "https://api.platform.censys.io/v3/global/search/query",
+                source_id="vertical.censys", timeout=timeout, max_body=CENSYS_READ_LIMIT,
+                method="POST", data=_json.dumps(payload).encode(),
+                headers={"Authorization": f"Bearer {token}", "X-Organization-ID": str(org),
+                         "Content-Type": "application/json", "User-Agent": "Mozilla/5.0"},
+            )
+            raw = body.decode("utf-8", "replace")
             doc = _json.loads(raw)
             # a success carries a `result` object whose `hits` is a list; anything else is malformed
             if not (isinstance(doc, dict) and isinstance(doc.get("result"), dict)
@@ -244,32 +269,27 @@ CERTSPOTTER_READ_LIMIT = 64 * 1024 * 1024
 SHODAN_DOMAIN_READ_LIMIT = 16 * 1024 * 1024
 
 
-def _shodan_domain(apex: str, key: str, timeout: int = 30, max_pages: int = 5) -> ProviderResult:
+def _shodan_domain(apex: str, key: str, timeout: int = 30, max_pages: int = 5, *, ctx=None) -> ProviderResult:
     """Shodan DNS domain lookup without exporting Quarry's API key to argv or a child environment."""
     hosts: set[str] = set()
     pages = 0
     more = False
     for page in range(1, max(1, max_pages) + 1):
-        connection = _http_client.HTTPSConnection("api.shodan.io", timeout=timeout)
         try:
             query = urllib.parse.urlencode({"key": key, "page": page})
-            path = f"/dns/domain/{urllib.parse.quote(apex, safe='')}?{query}"
-            connection.request("GET", path, headers={"Accept": "application/json"})
-            response = connection.getresponse()
-            if response.status != 200:
-                raise RuntimeError(f"Shodan DNS API returned HTTP {response.status}")
-            body = read_bounded(
-                response, SHODAN_DOMAIN_READ_LIMIT, provider="shodan-domain",
-                bound="SHODAN_DOMAIN_READ_LIMIT",
+            url = f"https://api.shodan.io/dns/domain/{urllib.parse.quote(apex, safe='')}?{query}"
+            body, status = _provider_get(
+                ctx, url, source_id="vertical.shosubgo", timeout=timeout,
+                max_body=SHODAN_DOMAIN_READ_LIMIT, headers={"Accept": "application/json"},
             )
+            if status != 200:
+                raise RuntimeError(f"Shodan DNS API returned HTTP {status}")
         except BaseException as exc:
             if not isinstance(exc, Exception):
                 raise
             # HTTP/client exceptions can retain the request path. Re-raise a value-free typed failure so
             # provider telemetry and crash data can never serialize the query credential.
             raise RuntimeError(f"Shodan DNS request failed ({type(exc).__name__})") from None
-        finally:
-            connection.close()
         try:
             document = _json.loads(body.decode("utf-8", "strict"))
         except (UnicodeError, ValueError) as exc:
@@ -294,13 +314,12 @@ def _shodan_domain(apex: str, key: str, timeout: int = 30, max_pages: int = 5) -
     )
 
 
-def _crtsh(apex: str, timeout: int = 30) -> set:
+def _crtsh(apex: str, timeout: int = 30, *, ctx=None) -> set:
     """Direct crt.sh CT-log pull for `%.apex` -> set of hostnames (SANs, wildcards stripped). Keyless,
     complements subfinder's CT sources. Errors propagate to run_provider (never a fake-empty)."""
     url = f"https://crt.sh/?q=%25.{apex}&output=json"
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        data = read_bounded(r, CRTSH_READ_LIMIT, provider="crt.sh", bound="CRTSH_READ_LIMIT")
+    data, _status = _provider_get(ctx, url, source_id="vertical.crtsh", timeout=timeout,
+                                  max_body=CRTSH_READ_LIMIT, headers={"User-Agent": "Mozilla/5.0"})
     rows = _json.loads(data.decode("utf-8", "replace"))
     # success shape is a JSON array; a non-list root is an error, not zero results
     if not isinstance(rows, list):
@@ -316,7 +335,7 @@ def _crtsh(apex: str, timeout: int = 30) -> set:
     return hosts
 
 
-def _certspotter(apex: str, token: str | None = None, timeout: int = 30, max_pages: int = 5) -> set:
+def _certspotter(apex: str, token: str | None = None, timeout: int = 30, max_pages: int = 5, *, ctx=None) -> set:
     """certspotter (SSLMate CT Search API v1) issuances for `apex` (+subdomains) -> set of hostnames.
     Keyless free tier; a token raises the rate limit. Paginates via `after=<last issuance id>` until an
     empty page (a short page is not terminal). Bounded to `max_pages`; hitting the cap with a live cursor
@@ -336,10 +355,9 @@ def _certspotter(apex: str, token: str | None = None, timeout: int = 30, max_pag
         try:
             # fetch and validate/extract in one block: a later-page schema/parse error must preserve
             # earlier pages, not propagate and discard them.
-            req = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                rows = _json.loads(read_bounded(r, CERTSPOTTER_READ_LIMIT, provider="certspotter", bound="CERTSPOTTER_READ_LIMIT")
-                                   .decode("utf-8", "replace"))
+            body, _status = _provider_get(ctx, url, source_id="vertical.certspotter", timeout=timeout,
+                                          max_body=CERTSPOTTER_READ_LIMIT, headers=headers)
+            rows = _json.loads(body.decode("utf-8", "replace"))
             # success shape is a JSON array of issuances; a non-list root is an error
             if not isinstance(rows, list):
                 raise ValueError("certspotter: non-list JSON root — not a valid empty result")
@@ -998,6 +1016,7 @@ def _wc_differentiate(ctx, _zones_all: list, *, words: list, phase: str, label: 
             repository=ctx.run,
             stdout=RepositoryOutput.publish(*hx.relative_to(ctx.run.dir).parts),
             stderr=RepositoryOutput.discard(), timeout=ctx.http_timeout,
+            source_id="vertical.wildcard_http",
         )
         # everything observable about this invocation is committed BEFORE the fallible ledger write, so a
         # `record()` that raises does not make the run forget what already happened.
@@ -1220,7 +1239,7 @@ def _github_subs(ctx, prof, scope) -> None:
                               *gh_raw.relative_to(ctx.run.dir).parts,
                           ),
                           stderr=RepositoryOutput.discard(),
-                          timeout=ctx.http_timeout)
+                          timeout=ctx.http_timeout, source_id="vertical.github_subs")
             ctx.run.record("vertical", r)
             if r.raw_path:
                 for e in normalize.hosts(r.raw_path.read_text(), "github-subdomains", str(r.raw_path)):
@@ -1257,6 +1276,7 @@ def _recursive_permute(ctx, prof, scope, trusted, resolvers, wildcard_zones) -> 
                 repository=ctx.run,
                 stdout=RepositoryOutput.publish(*perms.relative_to(ctx.run.dir).parts),
                 stderr=RepositoryOutput.discard(), timeout=600,
+                source_id="vertical.alterx_permute",
             )
             ctx.run.record("vertical", r)
             # The fixed round name may preserve an earlier invocation's final
@@ -1299,6 +1319,7 @@ def _recursive_permute(ctx, prof, scope, trusted, resolvers, wildcard_zones) -> 
                 6, *md.relative_to(ctx.run.dir).parts,
             ),),
             timeout=ctx.http_timeout,
+            source_id="vertical.puredns_resolve",
         )
         if _n_all != _n_new:                              # dedup SAVINGS is optimization telemetry, NOT a gap
             r.note = (f"frontier: {_n_new} new candidate(s), {_n_all - _n_new} already-settled skipped; "
@@ -1411,8 +1432,8 @@ def _local_provider_sources(ctx, prof, scope, *, censys_config=None) -> set[str]
                 h |= r
         return h
     _cs_acct = {"cred_fp": secrets.fingerprint(cs_token)} if cs_token else None   # certspotter token identity
-    for src, fn, acct in (("crtsh", lambda a: _crtsh(a), None),
-                          ("certspotter", lambda a: _certspotter(a, cs_token, max_pages=_max_pages), _cs_acct)):
+    for src, fn, acct in (("crtsh", lambda a: _crtsh(a, ctx=ctx), None),
+                          ("certspotter", lambda a: _certspotter(a, cs_token, max_pages=_max_pages, ctx=ctx), _cs_acct)):
         with _local_raw.lifecycle(ctx.run):
             hosts = _provider_over_apexes(f"vertical.{src}", fn, acct)
             if not hosts:
@@ -1438,7 +1459,7 @@ def _local_provider_sources(ctx, prof, scope, *, censys_config=None) -> set[str]
         with _local_raw.lifecycle(ctx.run):
             sho_hosts = _provider_over_apexes(
                 "vertical.shosubgo",
-                lambda a: _shodan_domain(a, sho_key, max_pages=_max_pages),
+                lambda a: _shodan_domain(a, sho_key, max_pages=_max_pages, ctx=ctx),
                 {"cred_fp": secrets.fingerprint(sho_key)},
             )
             if sho_hosts:
@@ -1486,7 +1507,7 @@ def _local_provider_sources(ctx, prof, scope, *, censys_config=None) -> set[str]
         cen_acct = {"org": str(cen["org"]), "cred_fp": secrets.fingerprint(cen["token"])}
         with _local_raw.lifecycle(ctx.run):
             cen_hosts = _provider_over_apexes(
-                "vertical.censys", lambda a: _censys(cen, a, max_pages=_max_pages), cen_acct,
+                "vertical.censys", lambda a: _censys(cen, a, max_pages=_max_pages, ctx=ctx), cen_acct,
             )
             if cen_hosts:
                 raw = _local_raw.replace_text(
@@ -1546,6 +1567,7 @@ def run(ctx) -> None:
                 repository=ctx.run,
                 stdout=RepositoryOutput.publish(*br.relative_to(ctx.run.dir).parts),
                 stderr=RepositoryOutput.discard(), timeout=ctx.http_timeout,
+                source_id="vertical.puredns_brute",
             )
             ctx.run.record("vertical", r)
             if r.raw_path:
@@ -1584,6 +1606,7 @@ def run(ctx) -> None:
             repository=ctx.run,
             stdout=RepositoryOutput.publish(*cn.relative_to(ctx.run.dir).parts),
             stderr=RepositoryOutput.discard(), timeout=ctx.http_timeout,
+            source_id="enrich.dnsx_cname",
         )
         ctx.run.record("vertical", r)
         if r.raw_path:

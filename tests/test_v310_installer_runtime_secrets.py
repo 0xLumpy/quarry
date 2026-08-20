@@ -1193,6 +1193,12 @@ class _ShodanResponse:
         chunk, self._body = self._body[:amount], self._body[amount:]
         return chunk
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
 
 def test_shodan_dns_adapter_is_in_process_strict_and_bounded(monkeypatch):
     canary = "V310SHODANKEY00000000000000000000"
@@ -1202,44 +1208,31 @@ def test_shodan_dns_adapter_is_in_process_strict_and_bounded(monkeypatch):
     ]
     requests = []
 
-    class Connection:
-        def __init__(self, host, timeout):
-            assert host == "api.shodan.io" and timeout == 9
+    def urlopen(request, timeout):
+        assert timeout == 9
+        requests.append((request.get_method(), request.full_url, dict(request.header_items())))
+        return pages.pop(0)
 
-        def request(self, method, path, headers):
-            requests.append((method, path, headers))
-
-        def getresponse(self):
-            return pages.pop(0)
-
-        def close(self):
-            pass
-
-    monkeypatch.setattr(vertical._http_client, "HTTPSConnection", Connection)
+    monkeypatch.setattr(vertical.urllib.request, "urlopen", urlopen)
     result = vertical._shodan_domain("Acme.Example", canary, timeout=9, max_pages=5)
 
     assert result == {"www.acme.example", "api.acme.example", "mail.acme.example"}
     assert result.pages == 2 and not result.partial and result.cursor is None
-    assert [path for _method, path, _headers in requests] == [
-        f"/dns/domain/Acme.Example?key={canary}&page=1",
-        f"/dns/domain/Acme.Example?key={canary}&page=2",
+    assert [url for _method, url, _headers in requests] == [
+        f"https://api.shodan.io/dns/domain/Acme.Example?key={canary}&page=1",
+        f"https://api.shodan.io/dns/domain/Acme.Example?key={canary}&page=2",
     ]
 
 
 def test_shodan_dns_failures_never_serialize_the_query_credential(monkeypatch):
     canary = "V310SHODANKEY00000000000000000000"
 
-    class Connection:
-        def __init__(self, *_args, **_kwargs):
-            pass
-
-        def request(self, *_args, **_kwargs):
-            raise OSError(f"request failed for ?key={canary}")
-
-        def close(self):
-            pass
-
-    monkeypatch.setattr(vertical._http_client, "HTTPSConnection", Connection)
+    monkeypatch.setattr(
+        vertical.urllib.request, "urlopen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            OSError(f"request failed for ?key={canary}"),
+        ),
+    )
     with pytest.raises(RuntimeError) as caught:
         vertical._shodan_domain("acme.example", canary)
     assert canary not in str(caught.value) and canary not in repr(caught.value)

@@ -727,11 +727,17 @@ def _open_contact(ctx, host, contact, req, timeout, *, insecure=False,
                   source_id="native-http"):
     """Persist admission, then open through one revalidated literal peer."""
     _validated_request_authority(req, host)
+    scope = _network_scope(ctx)
+    if scope is None:
+        # Unmanaged/programmatic compatibility remains on the legacy opener.
+        # Production CLI runs bind a NetworkPolicyScope before phase work and
+        # therefore cannot reach this branch.
+        opener = _INSECURE_OPENER if insecure else _NO_REDIRECT_OPENER
+        return _open_no_follow(req, timeout, opener)
     if (type(contact) is not netguard.ContactState or contact[0] != "contact"
             or not contact.approved):
         raise PermissionError("native transport has no exact approved peer set")
     approved = contact.approved
-    scope = _network_scope(ctx)
     request_id = _secrets.token_hex(16)
     attempt_ids = {}
 
@@ -1080,7 +1086,7 @@ def _walk(ctx, url, origin_host=None, *, timeout=20, data=None, method="GET", he
 
 def scoped_get(ctx, url, origin_host=None, *, max_body=DEFAULT_MAX_BODY, timeout=20,
                data=None, method="GET", headers=None, max_redirects=DEFAULT_MAX_REDIRECTS,
-               source_id="native-http"):
+               source_id="native-http", response_headers=None):
     """Fetch `url` with all guards. Returns (data|None, final_url, status):
       - data is None  => the hop was not contacted: a redirect would leave scope, or the host resolves
         to the scan box / metadata (a private answer is contacted + recorded). No body is read.
@@ -1089,12 +1095,18 @@ def scoped_get(ctx, url, origin_host=None, *, max_body=DEFAULT_MAX_BODY, timeout
     empty body (not None) so a loop is never mistaken for off-scope. Paces to profile.http_rl; caller
     must scope-gate the origin.
 
-    Reads into memory, so it is the wrong tool when the body is evidence to keep: an over-cap response
-    comes back as `max_body+1` bytes to drop, losing what was fetched. Use `scoped_get_file` instead."""
+    When `response_headers` is a dict it is populated with the terminal response headers, preserving
+    provider error classification without exposing the live response object. Reads into memory, so it is
+    the wrong tool when the body is evidence to keep: an over-cap response comes back as `max_body+1`
+    bytes to drop, losing what was fetched. Use `scoped_get_file` instead."""
+    if response_headers is not None and not isinstance(response_headers, dict):
+        raise TypeError("response_headers must be a dict when supplied")
     with _walk(ctx, url, origin_host, timeout=timeout, data=data, method=method, headers=headers,
                max_redirects=max_redirects, source_id=source_id) as (resp, final, status, contacted):
         if not contacted:
             return None, final, status
+        if response_headers is not None and resp is not None:
+            response_headers.update(getattr(resp, "headers", {}) or {})
         return (resp.read(max_body + 1) if resp else b""), final, status
 
 
@@ -1674,7 +1686,7 @@ def _receipt_bytes(doc) -> bytes:
 def _scoped_get_file_legacy(ctx, url, dest, origin_host=None, *, timeout=20, data=None, method="GET",
                             headers=None, max_redirects=DEFAULT_MAX_REDIRECTS,
                             chunk=1024 * 1024, deadline_s=300.0, policy=None, governor=None,
-                            source_id="native-http"):
+                            source_id="native-http", response_headers=None, metadata_url=None):
     """Same guards as `scoped_get`, but the body is streamed to `dest` under `governor`'s disk policy.
 
     Returns `(Acquisition|None, final_url, status)`; None means the hop was never contacted, as in
@@ -1692,6 +1704,7 @@ def _scoped_get_file_legacy(ctx, url, dest, origin_host=None, *, timeout=20, dat
     part = dest.with_name(dest.name + ".part")
     rec_path = dest.with_name(dest.name + _RECEIPT_SUFFIX)
     ident = acquisition_identity(url, method, data, policy)
+    stored_url = metadata_url or url
     try:
         _reconcile(dest, part, rec_path, ident, url)
     except AcquisitionRefused as r:
@@ -1720,12 +1733,14 @@ def _scoped_get_file_legacy(ctx, url, dest, origin_host=None, *, timeout=20, dat
                max_redirects=max_redirects, source_id=source_id) as (resp, final, status, contacted):
         if not contacted:
             return None, final, status
+        if response_headers is not None and resp is not None:
+            response_headers.update(getattr(resp, "headers", {}) or {})
         if resp is None:                       # redirect loop / headers-only 3xx: an empty body, published
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_bytes(b"")
             n, sha = 0, hashlib.sha256(b"").hexdigest()
-            note = _publish_receipt(rec_path, {"ident": ident, "url": url, "method": method,
-                                               "final": final, "status": status, "bytes": 0,
+            note = _publish_receipt(rec_path, {"ident": ident, "url": stored_url, "method": method,
+                                               "final": metadata_url or final, "status": status, "bytes": 0,
                                                "digest": sha, "complete": True})
             return (Acquisition(dest, 0, sha, True, final=final, status=status, error=note or None,
                                 disposition="complete-unowned" if note else "complete"),
@@ -1740,7 +1755,8 @@ def _scoped_get_file_legacy(ctx, url, dest, origin_host=None, *, timeout=20, dat
             psha = ""
             if partial is not None and Path(partial).exists():
                 written, psha = _digest_file(partial)     # what is on disk, not what we think we wrote
-            rec = {"ident": ident, "url": url, "method": method, "final": final, "status": status,
+            rec = {"ident": ident, "url": stored_url, "method": method,
+                   "final": metadata_url or final, "status": status,
                    "bytes": written, "digest": psha, "complete": False, "error": str(e)}
             # a policy truncation is a typed remainder: the binding layer + bound ride the receipt so a
             # raised bound is reproducible, distinct from a transport break with no configured cause.
@@ -1756,8 +1772,8 @@ def _scoped_get_file_legacy(ctx, url, dest, origin_host=None, *, timeout=20, dat
                                 final=final, status=status, truncation=trunc), final, status)
         # bind the complete acquisition too, or another method/body/policy for the same URL overwrites
         # it. Written after the artifact; a failed write leaves it complete-but-unowned (orphan-complete).
-        note = _publish_receipt(rec_path, {"ident": ident, "url": url, "method": method,
-                                           "final": final, "status": status, "bytes": n,
+        note = _publish_receipt(rec_path, {"ident": ident, "url": stored_url, "method": method,
+                                           "final": metadata_url or final, "status": status, "bytes": n,
                                            "digest": sha, "complete": True})
         return (Acquisition(dest, n, sha, True, final=final, status=status, error=note or None,
                             disposition="complete-unowned" if note else "complete"),
@@ -1837,7 +1853,7 @@ def _publication_fault_text(fault) -> str:
 
 def _scoped_get_file_managed(
     ctx, run, components, url, dest, origin_host, *, timeout, data, method,
-    headers, max_redirects, chunk, deadline_s, policy, governor, source_id,
+    headers, max_redirects, chunk, deadline_s, policy, governor, source_id, response_headers, metadata_url,
 ):
     """One authority-first managed acquisition; construct its result after settlement."""
     part = dest.with_name(dest.name + ".part")
@@ -1845,6 +1861,7 @@ def _scoped_get_file_managed(
     part_components = components[:-1] + (components[-1] + ".part",)
     receipt_components = components[:-1] + (components[-1] + _RECEIPT_SUFFIX,)
     ident = acquisition_identity(url, method, data, policy)
+    stored_url = metadata_url or url
     facts = None
     refusal = None
     transaction = None
@@ -1933,6 +1950,8 @@ def _scoped_get_file_managed(
                                     transaction.settle_precontact()
                             else:
                                 contacted = True
+                                if response_headers is not None and response is not None:
+                                    response_headers.update(getattr(response, "headers", {}) or {})
                                 source = response if response is not None else io.BytesIO(b"")
                                 writer = transaction.open_writer()
                                 stream_fault = None
@@ -2070,9 +2089,9 @@ def _scoped_get_file_managed(
                                         stream_note = "" if stream_fault is None else str(stream_fault)
                                         receipt_doc = {
                                             "ident": ident,
-                                            "url": url,
+                                            "url": stored_url,
                                             "method": method,
-                                            "final": final,
+                                            "final": metadata_url or final,
                                             "status": status,
                                             "bytes": size,
                                             "digest": digest,
@@ -2355,32 +2374,47 @@ def _scoped_get_file_managed(
 def scoped_get_file(ctx, url, dest, origin_host=None, *, timeout=20, data=None, method="GET",
                     headers=None, max_redirects=DEFAULT_MAX_REDIRECTS,
                     chunk=1024 * 1024, deadline_s=300.0, policy=None, governor=None,
-                    source_id="native-http"):
+                    source_id="native-http", response_headers=None, metadata_url=None):
     """Stream one guarded response through managed authority or proven legacy I/O."""
+    if response_headers is not None and not isinstance(response_headers, dict):
+        raise TypeError("response_headers must be a dict when supplied")
+    if metadata_url is not None:
+        expected_metadata_url = urlsplit(url)._replace(query="", fragment="").geturl()
+        if metadata_url != expected_metadata_url:
+            raise ValueError("metadata_url must be this request URL with only query and fragment removed")
     dest = Path(dest)
     classification, run, components, reason = _classify_acquisition_destination(ctx, dest)
     if classification == "legacy":
-        return _scoped_get_file_legacy(
+        result = _scoped_get_file_legacy(
             ctx, url, dest, origin_host, timeout=timeout, data=data,
             method=method, headers=headers, max_redirects=max_redirects,
             chunk=chunk, deadline_s=deadline_s, policy=policy,
-            governor=governor, source_id=source_id,
+            governor=governor, source_id=source_id, response_headers=response_headers,
+            metadata_url=metadata_url,
         )
-    if classification == "refused":
-        return _managed_refusal(reason, url)
-    headers = _preflight_managed_request(
-        url, origin_host, timeout=timeout, data=data, method=method,
-        headers=headers, max_redirects=max_redirects,
-    )
-    managed_governor = contract.preflight_stream_to_fd(
-        chunk=chunk, deadline_s=deadline_s, governor=governor,
-    )
-    return _scoped_get_file_managed(
-        ctx, run, components, url, dest, origin_host,
-        timeout=timeout, data=data, method=method, headers=headers,
-        max_redirects=max_redirects, chunk=chunk, deadline_s=deadline_s,
-        policy=policy, governor=managed_governor, source_id=source_id,
-    )
+    elif classification == "refused":
+        result = _managed_refusal(reason, url)
+    else:
+        headers = _preflight_managed_request(
+            url, origin_host, timeout=timeout, data=data, method=method,
+            headers=headers, max_redirects=max_redirects,
+        )
+        managed_governor = contract.preflight_stream_to_fd(
+            chunk=chunk, deadline_s=deadline_s, governor=governor,
+        )
+        result = _scoped_get_file_managed(
+            ctx, run, components, url, dest, origin_host,
+            timeout=timeout, data=data, method=method, headers=headers,
+            max_redirects=max_redirects, chunk=chunk, deadline_s=deadline_s,
+            policy=policy, governor=managed_governor, source_id=source_id,
+            response_headers=response_headers, metadata_url=metadata_url,
+        )
+    if metadata_url is not None:
+        acquisition, _final, status = result
+        if acquisition is not None:
+            acquisition.final = metadata_url
+        return acquisition, metadata_url, status
+    return result
 
 
 def discard_acquisition(ctx, acquisition):

@@ -478,6 +478,7 @@ def _arjun_exec(repository, url: str, rate: int, threads: int, paths: tuple, tim
             4, *out_f.relative_to(repository.dir).parts, required=False,
         ),),
         timeout=timeout,
+        source_id="params.arjun",
     )
     try:
         text = std_f.read_text(encoding="utf-8", errors="replace") if std_f.exists() else ""
@@ -1145,7 +1146,7 @@ def _nuclei_scan(ctx, live, findings, log, prof) -> RunResult:
                                         5, *cf.relative_to(ctx.run.dir).parts, required=False,
                                     ),),
                                     timeout=nuclei_timeout(len(batch), ctx.http_timeout),
-                                    work_unit=chunk_wu)
+                                    work_unit=chunk_wu, source_id="params.nuclei_scan")
                     if authority is not None:
                         authority.settle(sid, res, input_total=len(batch), work_unit=chunk_wu)
                 if res.stderr_tail:
@@ -2393,7 +2394,8 @@ def _dalfox_xss_fast(ctx, cands, prof) -> RunResult:
                                         6, *cf.relative_to(ctx.run.dir).parts, required=False,
                                     ),),
                                     ok_codes=(0, 1),
-                                    timeout=scaled_timeout(len(batch), ctx.http_timeout, 30))
+                                    timeout=scaled_timeout(len(batch), ctx.http_timeout, 30),
+                                    source_id="params.dalfox_xss_fast")
                     # proven by the runner, never inferred: a missing binary, a cancelled launch or a Popen
                     # that raised must not read as a process that ran with the armed channel
                     if _plan_for_run["armed"] and getattr(res, "started", False):
@@ -2927,6 +2929,7 @@ def _takeover_nuclei_lane(ctx, prof, scope) -> None:
             ),),
             timeout=nuclei_timeout(len(subs), ctx.http_timeout),
             work_unit=tk_wu,
+            source_id="params.nuclei_takeover",
         )
         if nuclei_authority is not None:
             nuclei_authority.settle(
@@ -3033,6 +3036,7 @@ def run(ctx) -> None:
                 repository=ctx.run,
                 stdout=RepositoryOutput.publish(*raw.relative_to(ctx.run.dir).parts),
                 stderr=RepositoryOutput.discard(), input_file=corpus_file, timeout=120,
+                source_id="params.gf",
             )
             ctx.run.record("params", r)
             if r.raw_path:

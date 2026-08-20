@@ -266,6 +266,7 @@ def _a1d_recursive_brute(ctx) -> set[str]:
             repository=ctx.run,
             stdout=RepositoryOutput.publish(*br.relative_to(ctx.run.dir).parts),
             stderr=RepositoryOutput.discard(), timeout=ctx.http_timeout,
+            source_id="enrich.a1d_brute",
         )
         ctx.run.record("enrich", r)
         if r.status is not Status.SKIPPED and apex not in apexes_run:
@@ -387,10 +388,11 @@ def run(ctx) -> None:
     if have("dnsx"):
         res = ctx.run.raw_path("enrich", "dnsx", "resolved.txt")
         r = exec_tool(
-            "dnsx", ["dnsx", "-l", str(targets), "-a", "-resp", "-json", "-silent"],
+            "dnsx", ["dnsx", "-duc", "-l", str(targets), "-a", "-resp", "-json", "-silent"],
             repository=ctx.run,
             stdout=RepositoryOutput.publish(*res.relative_to(ctx.run.dir).parts),
             stderr=RepositoryOutput.discard(), timeout=ctx.http_timeout,
+            source_id="enrich.dnsx_resolve",
         )
         ctx.run.record("enrich", r)
         if r.raw_path:
@@ -406,10 +408,11 @@ def run(ctx) -> None:
         # -a so dangling = has CNAME but no A in THIS result (enrich itself can add a no-A host
         # to `resolved` with a:[], so resolved-set membership is not a reliable dangling signal).
         r = exec_tool(
-            "dnsx", ["dnsx", "-l", str(targets), "-cname", "-a", "-json", "-silent"],
+            "dnsx", ["dnsx", "-duc", "-l", str(targets), "-cname", "-a", "-json", "-silent"],
             repository=ctx.run,
             stdout=RepositoryOutput.publish(*cn.relative_to(ctx.run.dir).parts),
             stderr=RepositoryOutput.discard(), timeout=ctx.http_timeout,
+            source_id="enrich.dnsx_cname",
         )
         ctx.run.record("enrich", r)
         if r.raw_path:
@@ -494,7 +497,7 @@ def run(ctx) -> None:
                             7, *wo.relative_to(ctx.run.dir).parts, required=False,
                         ),),
                         timeout=nuclei_timeout(len(new_live), ctx.http_timeout),
-                        work_unit=wwu)
+                        work_unit=wwu, source_id="enrich.nuclei_waf")
                     if nuclei_authority is not None:
                         nuclei_authority.settle(
                             "enrich.nuclei_waf", wr, input_total=len(new_live), work_unit=wwu,
@@ -528,7 +531,7 @@ def run(ctx) -> None:
                         ((6, ()), (9, ("gowitness.jsonl",))),
                         *shot_dir.relative_to(ctx.run.dir).parts,
                     ),),
-                    timeout=ctx.http_timeout)
+                    timeout=ctx.http_timeout, source_id="enrich.gowitness")
                 # same reclassification as probe; count this attempt's dir only, so a reused/
                 # pre-populated dir cannot inflate the count (the dir is fresh per invocation)
                 current = native_output_current(gr, shot_dir)
@@ -561,7 +564,7 @@ def run(ctx) -> None:
                     native_outputs=(RepositoryNativeOutput.file(
                         4, *sm.relative_to(ctx.run.dir).parts, required=False,
                     ),),
-                    timeout=600,
+                    timeout=600, source_id="enrich.smap",
                 )
                 # parse + reclassify + ingest via the same shared helper probe uses (-oJ structured;
                 # status reflects yield), so enrich's passive port yield is not lost as raw-only.

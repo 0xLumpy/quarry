@@ -52,6 +52,7 @@ def _wildcard_baseline(ctx, apexes: set, phase: str) -> dict:
         repository=ctx.run,
         stdout=RepositoryOutput.publish(*out.relative_to(ctx.run.dir).parts),
         stderr=RepositoryOutput.discard(), timeout=600,
+        source_id="dns.dnsx_records",
     )
     ctx.run.record(phase, r)
     baseline: dict = {}
@@ -78,6 +79,7 @@ def enrich_hosts(ctx, hosts, phase: str) -> int:
         repository=ctx.run,
         stdout=RepositoryOutput.publish(*out.relative_to(ctx.run.dir).parts),
         stderr=RepositoryOutput.discard(), timeout=ctx.http_timeout,
+        source_id="dns.dnsx_records",
     )
     ctx.run.record(phase, r)
     n = 0

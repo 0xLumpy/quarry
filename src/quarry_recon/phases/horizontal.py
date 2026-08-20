@@ -182,6 +182,7 @@ def run(ctx) -> None:
         repository=ctx.run,
         stdout=RepositoryOutput.publish(*ips_path.relative_to(ctx.run.dir).parts),
         stderr=RepositoryOutput.discard(), timeout=120,
+        source_id="horizontal.mapcidr",
     )
     ctx.run.record("horizontal", r)
     # ``raw_path`` is the runner's publication proof.  A clean process whose
@@ -200,6 +201,7 @@ def run(ctx) -> None:
             repository=ctx.run,
             stdout=RepositoryOutput.publish(*tls_raw.relative_to(ctx.run.dir).parts),
             stderr=RepositoryOutput.discard(), timeout=ctx.http_timeout,
+            source_id="horizontal.tlsx_san",
         )
         ctx.run.record("horizontal", r)
         if r.raw_path:
@@ -217,6 +219,7 @@ def run(ctx) -> None:
             repository=ctx.run,
             stdout=RepositoryOutput.publish(*ptr_raw.relative_to(ctx.run.dir).parts),
             stderr=RepositoryOutput.discard(), timeout=ctx.http_timeout,
+            source_id="horizontal.revdns",
         )
         ctx.run.record("horizontal", r)
         if r.raw_path:
@@ -234,6 +237,7 @@ def run(ctx) -> None:
             repository=ctx.run,
             stdout=RepositoryOutput.publish(*cad.relative_to(ctx.run.dir).parts),
             stderr=RepositoryOutput.discard(), timeout=ctx.http_timeout,
+            source_id="horizontal.caduceus",
         )
         ctx.run.record("horizontal", r)
         if r.raw_path:
@@ -285,5 +289,6 @@ def run(ctx) -> None:
             stdout=RepositoryOutput.publish(*asn_raw.relative_to(ctx.run.dir).parts),
             stderr=RepositoryOutput.discard(),
             stdin_data="\n".join(asn_seeds), timeout=60,
+            source_id="horizontal.asnmap",
         )
         ctx.run.record("horizontal", r)

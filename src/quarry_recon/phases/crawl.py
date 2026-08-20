@@ -104,7 +104,11 @@ def _jsluice_run(ctx, sub, files, raw, origin):
     A chunk that ends in any non-clean status is degraded and makes the whole source partial; a file with
     nothing to mine is empty, not degraded. One slow file times out only itself.
     """
-    sid = f"crawl.jsluice_{sub}"
+    # Only the two registered jsluice lanes are valid.  Keeping this finite mapping local makes the
+    # source identity explicit at the runner boundary instead of deriving authority from a basename.
+    sid = {"urls": "crawl.jsluice_urls", "secrets": "crawl.jsluice_secrets"}.get(sub)
+    if sid is None:
+        raise ValueError(f"unknown jsluice lane: {sub!r}")
     events.tool_start(sid, cmd=["jsluice", sub, "-j"], input_total=len(files), discovery_context=origin)
     t0 = time.monotonic()
     degraded = 0
@@ -124,6 +128,7 @@ def _jsluice_run(ctx, sub, files, raw, origin):
                     stdout=RepositoryOutput.publish(*chunk.relative_to(ctx.run.dir).parts),
                     stderr=RepositoryOutput.discard(), timeout=ctx.http_timeout,
                     stdin_data=f.read_bytes().decode("utf-8", "replace"),
+                    source_id=sid,
                 )
                 if res.status not in (Status.SUCCESS, Status.EMPTY):
                     degraded += 1
@@ -180,7 +185,8 @@ def _beautify_run(ctx, files, builder, expected_entries):
                             stdout=RepositoryOutput.publish(
                                 *output.relative_to(ctx.run.dir).parts,
                             ),
-                            stderr=RepositoryOutput.discard(), timeout=JS_BEAUTIFY_TIMEOUT)
+                            stderr=RepositoryOutput.discard(), timeout=JS_BEAUTIFY_TIMEOUT,
+                            source_id="crawl.js_beautify")
         except Exception:
             res = None
         cpu_total += getattr(res, "cpu_s", 0.0) or 0.0
@@ -1875,6 +1881,7 @@ def run(ctx) -> None:
             repository=ctx.run,
             stdout=RepositoryOutput.publish(*th.relative_to(ctx.run.dir).parts),
             stderr=RepositoryOutput.discard(), timeout=ctx.http_timeout,
+            source_id="crawl.trufflehog",
         )
         ctx.run.record("crawl", r)
         if r.raw_path:
@@ -2749,6 +2756,7 @@ def _xnl_run(ctx, tag: str, blob, written: int, *, spo: bool = False) -> dict:
         stderr=RepositoryOutput.discard(),
         native_outputs=native_outputs,
         timeout=ctx.http_timeout, input_file=blob, env={"PYTHONHASHSEED": "0"},
+        source_id="crawl.xnlinkfinder",
     )
     ctx.run.record("crawl", r)
     # `-ow` truncates the four artifacts at start, so a killed run leaves whatever was flushed: real

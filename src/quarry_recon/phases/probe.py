@@ -20,10 +20,11 @@ import math as _math
 import re as _re
 import time as _time
 import urllib.parse
+import urllib.error
 import urllib.request
 from pathlib import Path
 
-from .. import (budget, contract, events, netguard, normalize, nuclei_policy, pace,
+from .. import (budget, contract, events, fetch, netguard, normalize, nuclei_policy, pace,
                 resource_contract, run_manifest, secrets, settings, shodan_host,
                 shodan_sched, store)
 from ..contract import (PROVIDER_CLASSES, PROVIDER_ERROR, PROVIDER_PACE_BUSY, PROVIDER_PARSE,
@@ -262,7 +263,27 @@ def _read_bounded(r, limit: "int | None" = None) -> bytes:
                         bound="SHODAN_READ_LIMIT")
 
 
-def _shodan_count(key, facet, v):
+def _shodan_get(ctx, url, *, source_id, timeout, max_body):
+    """One guarded Shodan GET, retaining the status/body/header error shape callers already classify."""
+    if ctx is None or fetch._network_scope(ctx) is None:  # compatibility seam for unbound parser/unit tests
+        req = urllib.request.Request(url, headers={"User-Agent": SHODAN_UA})
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            return _read_bounded(response, max_body), int(getattr(response, "status", 200) or 200)
+    response_headers = {}
+    body, final, status = fetch.scoped_get(
+        ctx, url, timeout=timeout, max_body=max_body, headers={"User-Agent": SHODAN_UA},
+        source_id=source_id, response_headers=response_headers,
+    )
+    if body is None:
+        raise RuntimeError("Shodan request refused by the run network scope")
+    if not 200 <= status < 300:
+        raise urllib.error.HTTPError(final, status, f"HTTP {status}", response_headers, io.BytesIO(body))
+    # ``scoped_get`` deliberately returns one sentinel byte over its ceiling; keep the prior typed
+    # bounded-read failure instead of parsing that sentinel as provider JSON.
+    return _read_bounded(io.BytesIO(body), max_body), status
+
+
+def _shodan_count(key, facet, v, *, ctx=None, source_id="probe.favicon"):
     """ONE free `/shodan/host/count` -> `(total, raw_bytes, error)`. NEVER raises.
 
     Count is free and keeps working at a zero balance, so sizing continues when paid credits are
@@ -272,9 +293,8 @@ def _shodan_count(key, facet, v):
            f"&query={urllib.parse.quote(f'{facet}:{v}')}")
     raw = b""
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": SHODAN_UA})
-        with urllib.request.urlopen(req, timeout=20) as r:
-            raw = _read_bounded(r)
+        raw, _status = _shodan_get(ctx, url, source_id=source_id, timeout=20,
+                                   max_body=SHODAN_READ_LIMIT)
         data = _json.loads(raw.decode("utf-8", "replace"))
         if not isinstance(data, dict):
             raise ValueError("shodan: non-object count response")
@@ -354,7 +374,7 @@ def _partial_size_and_digest(path, *, fallback: int):
         return fallback, None
 
 
-def _shodan_page(key, facet, v, page, *, sink):
+def _shodan_page(key, facet, v, page, *, sink, ctx=None, source_id="probe.favicon"):
     """ONE page of a Shodan search, as the coordinator's `(matches, total, error)` triple. NEVER raises.
 
     The response is streamed to `sink` and kept whole — a paid page has no byte ceiling (see
@@ -377,9 +397,34 @@ def _shodan_page(key, facet, v, page, *, sink):
     size = 0
     digest = None
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": SHODAN_UA})
-        with urllib.request.urlopen(req, timeout=20) as r:
-            size, digest = stream_to_file(r, sink, governor=gov)
+        if ctx is None or fetch._network_scope(ctx) is None:  # compatibility seam; bound runs stream guarded
+            req = urllib.request.Request(url, headers={"User-Agent": SHODAN_UA})
+            with urllib.request.urlopen(req, timeout=20) as response:
+                size, digest = stream_to_file(response, sink, governor=gov)
+        else:
+            response_headers = {}
+            parsed_url = urllib.parse.urlsplit(url)
+            metadata_url = urllib.parse.urlunsplit(
+                (parsed_url.scheme, parsed_url.netloc, parsed_url.path, "", ""),
+            )
+            acquisition, final, status = fetch.scoped_get_file(
+                ctx, url, sink, timeout=20, headers={"User-Agent": SHODAN_UA}, governor=gov,
+                source_id=source_id, response_headers=response_headers,
+                # Request identity keeps the full query (including the key); retained acquisition/result
+                # metadata must never serialize it.
+                metadata_url=metadata_url, max_redirects=0,
+            )
+            if acquisition is None:
+                raise RuntimeError("Shodan request refused by the run network scope")
+            size, digest = acquisition.bytes, acquisition.digest
+            if not acquisition.complete:
+                raise IncompleteAcquisition(acquisition.error or "Shodan page acquisition incomplete",
+                                            bytes_written=acquisition.bytes, partial=acquisition.partial)
+            if not 200 <= status < 300:
+                # The body is retained at ``sink`` by the guarded streaming transport.  Keep its old
+                # error-artifact placement below, and preserve the status for provider classification.
+                raise urllib.error.HTTPError(final, status, f"HTTP {status}", response_headers,
+                                             sink.open("rb"))
         if size > SHODAN_PARSE_LIMIT:
             raise ShodanPageTooLargeToParse(
                 f"shodan: page is {size} bytes, beyond SHODAN_PARSE_LIMIT ({SHODAN_PARSE_LIMIT}) — the "
@@ -677,7 +722,8 @@ def _blocked_read(bal: ShodanBalance, cls: str) -> ShodanBalance:
                                reason=f"{why} — no paid search is issued ({free})")
 
 
-def _read_shodan_balance(key, timeout: int = 15, cooldown=None) -> ShodanBalance:
+def _read_shodan_balance(key, timeout: int = 15, cooldown=None, *, ctx=None,
+                         source_id="probe.favicon") -> ShodanBalance:
     """Read `/api-info` (FREE, and it works at a ZERO balance) and settle the contract.
 
     The READ OUTCOME is kept separately from the balance facts: `read_error` keeps auth/quota/transport/
@@ -685,9 +731,8 @@ def _read_shodan_balance(key, timeout: int = 15, cooldown=None) -> ShodanBalance
     yields UNKNOWN, never zero."""
     try:
         url = f"https://api.shodan.io/api-info?key={urllib.parse.quote(str(key))}"
-        req = urllib.request.Request(url, headers={"User-Agent": SHODAN_UA})
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            body = r.read(64 * 1024).decode("utf-8", "replace")
+        raw, _status = _shodan_get(ctx, url, source_id=source_id, timeout=timeout, max_body=64 * 1024)
+        body = raw.decode("utf-8", "replace")
     except Exception as e:
         # reads the body at the raise site, closes the stream, and refines 401 by body: an exhausted
         # account reads `quota` and a bad key reads `auth`
@@ -856,7 +901,8 @@ def _shodan_work_locked(ctx, key, lanes):
             # streamed under the ledger's own directory, so a page we paid for exists on disk before
             # anything decides whether we can use it
             sink = attempt_dir / "raw" / f"{shodan_sched.item_key(pivot, page)}.json"
-            matches, total, err = _shodan_page(key, pivot.facet, pivot.value, page, sink=sink)
+            matches, total, err = _shodan_page(key, pivot.facet, pivot.value, page, sink=sink, ctx=ctx,
+                                               source_id=pivot.lane)
             if err is not None and provider_error_class(err) == PROVIDER_RATE_LIMIT:
                 cooldown.note(err)
             if err is not None:
@@ -939,10 +985,11 @@ def _shodan_work_locked(ctx, key, lanes):
                 # `pace_busy` as the stop cause, so this reads as our gap rather than a quiet skip.
                 paid["pace_busy"] = str(e)
                 raise
-            bal = _read_shodan_balance(key, cooldown=cooldown)
+            balance_sid = next(spec.sid for spec, values in lanes if values)
+            bal = _read_shodan_balance(key, cooldown=cooldown, ctx=ctx, source_id=balance_sid)
             # held immediately, so a failure in sizing or later still leaves one balance record per lane
             paid["bal"] = bal
-            sizing, refused = _size_pivots(key, states, ledger=ledger, attempt_dir=attempt_dir,
+            sizing, refused = _size_pivots(ctx, key, states, ledger=ledger, attempt_dir=attempt_dir,
                                            cooldown=cooldown,
                                            refused=_SIZING_REFUSED.get(bal.stop_kind))
             paid["sizing"] = sizing
@@ -999,7 +1046,7 @@ def _shodan_page_ttl() -> float:
     return settings.policy_days("SHODAN_PAGE_TTL_DAYS", shodan_sched.PAGE_TTL_DAYS_DEFAULT)
 
 
-def _size_pivots(key, states, *, ledger, attempt_dir, cooldown, refused=None) -> tuple:
+def _size_pivots(ctx, key, states, *, ledger, attempt_dir, cooldown, refused=None) -> tuple:
     """Size EVERY eligible pivot with a free `/host/count`, every lifecycle — including pivots whose
     pages are all already owned, so results that appeared since pagination completed are found.
 
@@ -1037,7 +1084,8 @@ def _size_pivots(key, states, *, ledger, attempt_dir, cooldown, refused=None) ->
             del e
             continue
         stat(sid)["attempted"] += 1
-        total, raw, err = _shodan_count(key, st.pivot.facet, st.pivot.value)
+        total, raw, err = _shodan_count(key, st.pivot.facet, st.pivot.value, ctx=ctx,
+                                        source_id=st.pivot.lane)
         if err is not None:
             cls = provider_error_class(err)
             fbc = stat(sid)["failed_by_class"]
@@ -1704,7 +1752,7 @@ def _httpx_probe_cmd(hosts_file, ports, http_rl) -> list[str]:
     -timeout/-retries, rich response-derived flags kept. Used by the bulk probe, every prefilter port-group,
     the direct fallback, and enrich.
     """
-    cmd = ["httpx", "-l", str(hosts_file), "-json", "-silent",
+    cmd = ["httpx", "-duc", "-l", str(hosts_file), "-json", "-silent",
            "-ports", ",".join(str(p) for p in ports),
            "-td", "-title", "-sc", "-cl", "-favicon", "-cdn", "-web-server",
            "-asn", "-location", "-ip", "-cname", "-irh",
@@ -1788,6 +1836,7 @@ def _cdn_shared_ips(ctx, ips):
             7, *out.relative_to(ctx.run.dir).parts, required=False,
         ),),
         timeout=scaled_timeout(len(ips), ctx.http_timeout, per_unit=0.02),
+        source_id="probe.cdncheck",
     )
     ctx.run.record("probe", r)
     if (r.status not in (Status.SUCCESS, Status.EMPTY)
@@ -1874,18 +1923,18 @@ def _nmap_services(path):
 _SHODAN_HOST_SID = "probe.shodan_host"
 
 
-def _shodan_host_get(url: str, timeout: int):
+def _shodan_host_get(url: str, timeout: int, *, ctx=None):
     """One free GET -> `(raw_bytes, http_code, error)`. NEVER raises.
 
     The error carries `error_class` AND, for a 404, the response BODY — which is where the provider's
     measured "no information available" answer lives. Without the body a 404 is indistinguishable from a
     failure, and every address Shodan has never seen would report as a lane gap."""
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": SHODAN_UA})
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            # the status travels with the body: the no-data contract is `404 + wording` and the
-            # record contract `200 + shape`, so assuming 200 would store a 201 as the answer
-            return r.read(), int(getattr(r, "status", 0) or getattr(r, "code", 0) or 0), None
+        raw, status = _shodan_get(ctx, url, source_id=_SHODAN_HOST_SID, timeout=timeout,
+                                  max_body=SHODAN_READ_LIMIT)
+        # the status travels with the body: the no-data contract is `404 + wording` and the
+        # record contract `200 + shape`, so assuming 200 would store a 201 as the answer
+        return raw, status, None
     except Exception as e:                                   # noqa: BLE001 - classified, never swallowed
         capture_error_body(e, provider="shodan")             # keeps `body_bytes` for the 404 contract
         # the carrier holds `error_class` instead of assigning it onto the exception (which can raise), and
@@ -2115,7 +2164,7 @@ def shodan_host_lane(ctx) -> None:
             cooldown.wait()
             url = (f"https://api.shodan.io/shodan/host/{urllib.parse.quote(ip)}"
                    f"?key={urllib.parse.quote(str(key))}")
-            raw, code, err = _shodan_host_get(url, timeout)
+            raw, code, err = _shodan_host_get(url, timeout, ctx=ctx)
             if err is not None and getattr(err, "error_class", "") == PROVIDER_RATE_LIMIT:
                 cooldown.note(err)             # the provider said slow down; every later request honors it
             return raw, code, err
@@ -2276,8 +2325,8 @@ def _web_port_prefilter(ctx, hosts, phase, pubmap):
         return None
     ips_file = ctx.write_list(f"{phase}_webports_ips.txt", unique_ips)
     raw = ctx.run.raw_path(phase, "naabu-web", "open.json")
-    cmd = ["naabu", "-list", str(ips_file), "-p", ",".join(str(p) for p in prof.ports),
-           "-json", "-scan-type", "s", "-Pn", "-silent", "-o", str(raw)]   # SYN, no host-disco, web ports only
+    cmd = ["naabu", "-duc", "-list", str(ips_file), "-p", ",".join(str(p) for p in prof.ports),
+           "-json", "-scan-type", "c", "-Pn", "-silent", "-o", str(raw)]   # connect, no host-disco, web ports only
     if prof.portscan_rate:
         cmd += ["-rate", str(prof.portscan_rate)]
     to = scaled_timeout(len(unique_ips) * len(prof.ports), ctx.http_timeout, per_unit=0.02)
@@ -2290,6 +2339,7 @@ def _web_port_prefilter(ctx, hosts, phase, pubmap):
             11, *raw.relative_to(ctx.run.dir).parts, required=False,
         ),),
         timeout=to,
+        source_id="probe.naabu_web",
     )
     raw_status = res.status
     # naabu writes findings to the -o file. Parse fail-closed: any malformed row or out-of-profile
@@ -2507,7 +2557,7 @@ def run(ctx) -> None:
             # C10b resume: work_unit = the resolved-host set + probed ports. A changed host set is a new unit.
             tls_wu = events.work_unit("probe.tlsx_certs", inputs={"hosts": thosts},
                                       config={"ports": "443,8443,4443"})
-            r = run_contract("probe.tlsx_certs", ["tlsx", "-l", str(tf), "-p", "443,8443,4443",
+            r = run_contract("probe.tlsx_certs", ["tlsx", "-duc", "-l", str(tf), "-p", "443,8443,4443",
                                    "-json", "-silent"],
                              repository=ctx.run,
                              stdout=RepositoryOutput.publish(*tr.relative_to(ctx.run.dir).parts),
@@ -2575,7 +2625,7 @@ def run(ctx) -> None:
                               7, *waf_out.relative_to(ctx.run.dir).parts, required=False,
                           ),),
                           timeout=nuclei_timeout(ctx.run.count("live"), ctx.http_timeout),
-                          work_unit=waf_wu)
+                          work_unit=waf_wu, source_id="probe.nuclei_waf")
             if nuclei_authority is not None:
                 nuclei_authority.settle(
                     "probe.nuclei_waf", r, input_total=ctx.run.count("live"), work_unit=waf_wu,
@@ -2635,7 +2685,8 @@ def run(ctx) -> None:
     # ── ports: naabu (in-scope CIDR) → nmap -sV service detection ──
     if prof.portscan and prof.cidr:
         cidr_file = ctx.write_list("cidr.txt", prof.cidr)
-        cmd = ["naabu", "-list", str(cidr_file), "-top-ports", "1000", "-silent"]
+        cmd = ["naabu", "-duc", "-list", str(cidr_file), "-top-ports", "1000",
+               "-scan-type", "c", "-silent"]
         if prof.portscan_rate:
             cmd += ["-rate", str(prof.portscan_rate)]
         pr = ctx.run.raw_path("probe", "naabu", "ranges.txt")
@@ -2647,6 +2698,7 @@ def run(ctx) -> None:
             repository=ctx.run,
             stdout=RepositoryOutput.publish(*pr.relative_to(ctx.run.dir).parts),
             stderr=RepositoryOutput.discard(), timeout=naabu_to,
+            source_id="probe.naabu_infra",
         )
         ctx.run.record("probe", r)
         open_ports = {}
@@ -2678,7 +2730,7 @@ def run(ctx) -> None:
                 wu = events.work_unit("probe.nmap_service", inputs={"ports": list(ptup), "ips": sorted(ips)},
                                       config={"flags": "sV-Pn-T4"})
                 nr = run_contract("probe.nmap_service",
-                                  ["nmap", "-sV", "-Pn", "-T4", "-iL", str(g_ips),
+                                  ["nmap", "-sT", "-sV", "-Pn", "-T4", "-iL", str(g_ips),
                                    "-p", ",".join(ptup), "-oX", str(nm)],
                                   repository=ctx.run,
                                   stdout=RepositoryOutput.discard(),
@@ -2721,6 +2773,7 @@ def run(ctx) -> None:
                 4, *sm.relative_to(ctx.run.dir).parts, required=False,
             ),),
             timeout=600,
+            source_id="probe.smap",
         )
         smn = _smap_ingest(ctx, r, sm, "probe", sm_targets)
         if smn:
