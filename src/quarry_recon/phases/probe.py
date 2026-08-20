@@ -1541,6 +1541,15 @@ def _vhost_scan(ctx, base, apex, out, wl, wl_digest, mc, ffuf_to, prof):
     if prof.http_rl:
         cmd += ["-rate", str(prof.http_rl)]
     hard = ffuf_to + 60 if ffuf_to else 0        # backstop when bounded; stays unbounded when ffuf_to==0
+    network_host = normalize.host_of_url(base)
+    try:
+        network_literal = netguard.canonical_ip_set((network_host,))
+    except (TypeError, ValueError):
+        network_literal = ()
+    network_host = (network_literal[0] if network_literal
+                    else normalize.canon_host_strict(network_host))
+    if network_host is None:
+        raise ValueError("vhost base does not contain a canonical hostname")
     # the unit is base-service x apex — the base is what the scan connects through, so it is the
     # identity; match codes and the effective-wordlist digest ride along to force a re-run on change
     wu = events.work_unit("probe.ffuf_vhost", inputs={"base": base, "apex": apex},
@@ -1555,6 +1564,7 @@ def _vhost_scan(ctx, base, apex, out, wl, wl_digest, mc, ffuf_to, prof):
             17, *out.relative_to(ctx.run.dir).parts,
         ),),
         work_unit=wu, timeout=hard,
+        network_hosts=(network_host,),
         reclassify=lambda res, o=out, e=errf: reclassify_ffuf(res, o, e, ffuf_to or None),
     )   # graceful -maxtime; hard backstop
     return r
@@ -1790,25 +1800,50 @@ def _httpx_probe_cmd(hosts_file, ports, http_rl) -> list[str]:
 
 
 def _run_httpx(ctx, hosts, ports, phase, tag):
-    """Probe `hosts` on `ports` (hostnames, so Host/SNI/cert/CDN stay correct) → record + return
-    (raw_ref, lines) so each live entity keeps its OWN immutable raw evidence file (per httpx call).
-    Timeout scales with host × port-weight."""
-    hf = ctx.write_list(f"{tag}_targets.txt", sorted(set(hosts)))
-    hx = ctx.run.raw_path(phase, "httpx", f"{tag}.jsonl")
-    cmd = _httpx_probe_cmd(hf, ports, ctx.profile.http_rl)
-    to = scaled_timeout(len(hosts), ctx.http_timeout, per_unit=max(6, len(ports) // 12))
-    # this httpx group's work_unit = its exact host set + port set. The effective probe config folds in,
-    # so a flag/rate change invalidates the unit, not just the host/port set.
-    wu = events.work_unit(f"{phase}.httpx", inputs={"hosts": sorted(set(hosts)), "ports": sorted(ports)},
-                          config={"flags": "v0.3.4-probe", "rl": ctx.profile.http_rl})
-    r = run_contract(
-        f"{phase}.httpx", cmd,
-        repository=ctx.run,
-        stdout=RepositoryOutput.publish(*hx.relative_to(ctx.run.dir).parts),
-        stderr=RepositoryOutput.discard(), work_unit=wu, timeout=to,
-    )
-    ctx.run.record(phase, r)
-    return str(hx), (r.raw_path.read_text().splitlines() if r.raw_path else [])
+    """Probe `hosts` on `ports`, returning one ``(raw_ref, lines)`` per invocation.
+
+    The network-policy runner resolves at most 1024 caller-declared hosts for one
+    external launch.  Keep the split here, at the same boundary that writes the
+    HTTPX input file, so every child gets the exact canonical host tuple that its
+    work unit describes.  Chunk tags are deterministic and preserve the old tag
+    for the common one-chunk case.
+    """
+    canonical_values = []
+    for value in hosts:
+        if type(value) is not str:
+            canonical_values.append(None)
+            continue
+        try:
+            network_literal = netguard.canonical_ip_set((value,))
+        except (TypeError, ValueError):
+            network_literal = ()
+        canonical_values.append(network_literal[0] if network_literal
+                                else normalize.canon_host_strict(value))
+    if any(host is None for host in canonical_values):
+        raise ValueError("httpx target set contains a non-canonical hostname")
+    canonical = tuple(sorted(set(canonical_values)))
+    chunks = tuple(canonical[i:i + 1024] for i in range(0, len(canonical), 1024))
+    results = []
+    for chunk_index, host_chunk in enumerate(chunks):
+        chunk_tag = tag if len(chunks) == 1 else f"{tag}-{chunk_index}"
+        hf = ctx.write_list(f"{chunk_tag}_targets.txt", host_chunk)
+        hx = ctx.run.raw_path(phase, "httpx", f"{chunk_tag}.jsonl")
+        cmd = _httpx_probe_cmd(hf, ports, ctx.profile.http_rl)
+        to = scaled_timeout(len(host_chunk), ctx.http_timeout, per_unit=max(6, len(ports) // 12))
+        # this httpx group's work_unit = its exact host set + port set. The effective probe config folds in,
+        # so a flag/rate change invalidates the unit, not just the host/port set.
+        wu = events.work_unit(f"{phase}.httpx", inputs={"hosts": host_chunk, "ports": sorted(ports)},
+                              config={"flags": "v0.3.4-probe", "rl": ctx.profile.http_rl})
+        r = run_contract(
+            f"{phase}.httpx", cmd,
+            repository=ctx.run,
+            stdout=RepositoryOutput.publish(*hx.relative_to(ctx.run.dir).parts),
+            stderr=RepositoryOutput.discard(), work_unit=wu, timeout=to,
+            network_hosts=host_chunk,
+        )
+        ctx.run.record(phase, r)
+        results.append((str(hx), (r.raw_path.read_text().splitlines() if r.raw_path else [])))
+    return results
 
 
 def _host_public_ip_map(ctx, hosts):
@@ -2468,7 +2503,7 @@ def fingerprint_hosts(ctx, hosts, phase):
     no_ip = [h for h in hosts if not syn_map[h]]                         # any shared IP / no IP -> httpx by name
 
     def _direct(targets):
-        return [_run_httpx(ctx, targets, prof.ports, phase, "httpx")] if targets else []
+        return _run_httpx(ctx, targets, prof.ports, phase, "httpx") if targets else []
 
     if not prefilter_on:
         return _direct(public_hosts + no_ip)                             # direct (contactable incl. private)
@@ -2480,13 +2515,13 @@ def fingerprint_hosts(ctx, hosts, phase):
     for h, ps in host_ports.items():
         groups.setdefault(tuple(ps), []).append(h)
     for i, (ps, hs) in enumerate(sorted(groups.items())):
-        results.append(_run_httpx(ctx, hs, list(ps), phase, f"httpx-g{i}"))   # httpx on OPEN ports only
+        results.extend(_run_httpx(ctx, hs, list(ps), phase, f"httpx-g{i}"))   # httpx on OPEN ports only
     # a SYN-eligible host with zero open ports is not dropped: SYN can false-negative, so probe it directly.
     # A host's outcome must depend only on its own evidence.
     covered = set(host_ports)
     direct_targets = no_ip + [h for h in public_hosts if h not in covered]
     if direct_targets:
-        results.append(_run_httpx(ctx, direct_targets, prof.ports, phase, "httpx-direct"))
+        results.extend(_run_httpx(ctx, direct_targets, prof.ports, phase, "httpx-direct"))
     return results
 
 

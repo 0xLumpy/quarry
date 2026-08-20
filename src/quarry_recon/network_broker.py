@@ -2188,7 +2188,9 @@ class BrokerPolicy:
         # be loopback/private, and decide_dns owns those exact exceptions.
         if not mediated and port == 53:
             if (self.authority_class == "public-provider"
-                    or self.transport_profile in {"target-dns", "target-tls"}):
+                    or self.transport_profile in {
+                        "target-dns", "target-http-exact", "target-tls",
+                    }):
                 return self.decide_dns(peer, port, kind, protocol)
         try:
             current_own = netguard.own_ips()

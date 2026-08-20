@@ -63,6 +63,10 @@ def test_every_managed_production_direct_call_binds_a_registered_transport_sourc
         assert source_kw is not None, f"{path}:{call.lineno} omits source_id"
         if isinstance(source_kw.value, ast.Constant):
             source_ids = (source_kw.value.value,)
+        elif path.name == "vertical.py" and owner == "_probe_one":
+            # `_wc_differentiate` is shared by exactly these two registered
+            # wildcard lanes; its caller supplies one of this finite pair.
+            source_ids = ("vertical.wildcard_http", "enrich.wildcard_a1d")
         else:
             assert path.name == "crawl.py" and owner == "_jsluice_run"
             source_ids = ("crawl.jsluice_urls", "crawl.jsluice_secrets")
@@ -229,7 +233,9 @@ def _install_bound_policy(monkeypatch, run, scope):
     monkeypatch.setattr(network_policy, "scope_for", lambda repository: scope if repository is run else None)
     monkeypatch.setattr(
         network_policy, "transport_door",
-        lambda _source_id, *, argv: SimpleNamespace(supported=True, broker_required=True),
+        lambda _source_id, *, argv: SimpleNamespace(
+            supported=True, broker_required=True, profile="fixture",
+        ),
     )
     monkeypatch.setattr(runner, "have", lambda _name: True)
     prepared = _PreparedLaunch(("fixture", "--exact"))
@@ -374,6 +380,28 @@ def test_bound_policy_forwards_caller_owned_approved_peers(tmp_path, monkeypatch
     assert scope.prepared["approved_peers"] == (
         "8.8.8.8", "2001:4860:4860::8888",
     )
+
+
+def test_exact_http_profile_cannot_bypass_host_authority_with_peer_ips(
+        tmp_path, monkeypatch):
+    run = _running_run(tmp_path)
+    monkeypatch.setattr(network_policy, "scope_for", lambda repository: object())
+    monkeypatch.setattr(
+        network_policy, "transport_door",
+        lambda _source_id, *, argv: SimpleNamespace(
+            supported=True, broker_required=True, profile="target-http-exact",
+        ),
+    )
+    _forbid_launch(monkeypatch)
+
+    result = _managed_call(
+        run, ["httpx", "-duc", "-follow-host-redirects"],
+        source_id="probe.httpx", approved_peers=("8.8.8.8",),
+    )
+
+    assert result.status is Status.FAILED
+    assert result.started is False
+    assert "network hosts" in result.note
 
 
 def test_bound_policy_resolves_network_hosts_before_forwarding(tmp_path, monkeypatch):
@@ -521,6 +549,49 @@ def test_network_host_corpus_deadline_refuses_before_dns(monkeypatch):
         runner._resolve_network_hosts(
             scope, request_id="e" * 32, source_id="probe.tlsx_certs",
             network_hosts=("example.test",),
+        )
+
+    assert [row["record_type"] for row in traces] == ["planned", "settlement"]
+    assert traces[-1]["decision"] == "deny"
+
+
+def test_network_host_resolver_plan_is_deny_settled_on_failure(monkeypatch):
+    scope = _network_host_scope()
+    traces = []
+    monkeypatch.setattr(scope, "_trace", lambda row: traces.append(row))
+
+    def failed_resolve(_policy, _host, *, on_event, **_kwargs):
+        on_event("dns-planned", "1.1.1.1", 53, "allow", "planned")
+        raise OSError("resolver failed after plan")
+
+    monkeypatch.setattr(network_dns, "resolve", failed_resolve)
+    with pytest.raises(OSError):
+        runner._resolve_network_hosts(
+            scope, request_id="f" * 32, source_id="probe.tlsx_certs",
+            network_hosts=("example.test",),
+        )
+
+    assert [row["record_type"] for row in traces] == [
+        "planned", "planned", "settlement", "settlement",
+    ]
+    assert [row["decision"] for row in traces[-2:]] == ["deny", "deny"]
+
+
+def test_network_host_final_trace_failure_gets_best_effort_deny(monkeypatch):
+    scope = _network_host_scope()
+    traces = []
+
+    def fail_allow_settlement(row):
+        if row["record_type"] == "settlement" and row["decision"] == "allow":
+            raise OSError("final trace write failed")
+        traces.append(row)
+
+    monkeypatch.setattr(scope, "_trace", fail_allow_settlement)
+    monkeypatch.setattr(netguard, "own_ips", lambda: ("192.0.2.10",))
+    with pytest.raises(OSError):
+        runner._resolve_network_hosts(
+            scope, request_id="0" * 32, source_id="probe.tlsx_certs",
+            network_hosts=("8.8.8.8",),
         )
 
     assert [row["record_type"] for row in traces] == ["planned", "settlement"]

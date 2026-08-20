@@ -466,7 +466,17 @@ def _arjun_exec(repository, url: str, rate: int, threads: int, paths: tuple, tim
     journal, coverage generation and entity store keep their ordering guarantees. A worker only
     produces facts."""
     out_f, std_f, err_f = paths
-    cmd = ["arjun", "-u", url, "-oT", str(out_f), "-t", str(threads)]
+    network_host = normalize.host_of_url(url)
+    try:
+        network_literal = netguard.canonical_ip_set((network_host,))
+    except (TypeError, ValueError):
+        network_literal = ()
+    network_host = (network_literal[0] if network_literal
+                    else normalize.canon_host_strict(network_host))
+    if network_host is None:
+        raise ValueError("Arjun target does not contain a canonical hostname")
+    cmd = ["arjun", "-u", url, "-oT", str(out_f), "-t", str(threads),
+           "--disable-redirects"]
     if rate:
         cmd += ["--rate-limit", str(rate)]              # this process's share of the global lane rate
     r = exec_tool(
@@ -479,6 +489,7 @@ def _arjun_exec(repository, url: str, rate: int, threads: int, paths: tuple, tim
         ),),
         timeout=timeout,
         source_id="params.arjun",
+        network_hosts=(network_host,),
     )
     try:
         text = std_f.read_text(encoding="utf-8", errors="replace") if std_f.exists() else ""

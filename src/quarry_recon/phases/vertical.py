@@ -990,16 +990,17 @@ def _wc_differentiate(ctx, _zones_all: list, *, words: list, phase: str, label: 
             return False
         return True
 
-    def _probe(zone: str, unit: str, ws):
-        """One httpx invocation against one zone — what the sweep submits for a batch of its slots."""
+    def _probe_one(zone: str, unit: str, ws):
+        """One bounded httpx invocation against one zone."""
         nonlocal zones_probed
         ledger_error = None
         bogus = [f"quarry-wc-{_uuid.uuid4().hex[:10]}.{zone}" for _ in range(2)]
         # one token names the whole invocation pair, so a retry cannot overwrite the exact contacted set
         # (random baselines included) that an earlier recorded command still points at.
         attempt = _uuid.uuid4().hex[:12]
+        candidates = [f"{w}.{zone}" for w in ws] + bogus
         cf = ctx.write_list(f"{label}_cand_{zone.replace('.', '_')}_{attempt}.txt",
-                            [f"{w}.{zone}" for w in ws] + bogus)
+                            candidates)
         # immutable per-invocation path: a stable per-zone one let a timed-out retry re-read the previous
         # attempt's artifact or overwrite evidence earlier records point at.
         hx = ctx.run.raw_path(phase, label, f"{zone}-{unit}-{attempt}.jsonl")
@@ -1011,12 +1012,16 @@ def _wc_differentiate(ctx, _zones_all: list, *, words: list, phase: str, label: 
                   "-t", str(settings.workers("httpx", 15))]
         if ctx.profile.http_rl:                           # honor a configured HTTP rate
             hx_cmd += ["-rl", str(ctx.profile.http_rl)]
+        canonical_candidates = [normalize.canon_host_strict(value) for value in candidates]
+        if any(host is None for host in canonical_candidates):
+            raise ValueError("wildcard HTTP target set contains a non-canonical hostname")
         r = exec_tool(
             "httpx", hx_cmd,
             repository=ctx.run,
             stdout=RepositoryOutput.publish(*hx.relative_to(ctx.run.dir).parts),
             stderr=RepositoryOutput.discard(), timeout=ctx.http_timeout,
-            source_id="vertical.wildcard_http",
+            source_id=source_id,
+            network_hosts=tuple(sorted(set(canonical_candidates))),
         )
         # everything observable about this invocation is committed BEFORE the fallible ledger write, so a
         # `record()` that raises does not make the run forget what already happened.
@@ -1164,9 +1169,10 @@ def _wc_differentiate(ctx, _zones_all: list, *, words: list, phase: str, label: 
     swept = sweep.run_sweep(
         lane=f"wc_{source_id.replace('.', '_')}",
         state_dir=Path(ctx.run.project_dir) / "recon" / "state" / "sched" / f"v{sweep.SCHEMA}",
-        targets=zones, vocabulary=lambda _zone: list(words), execute=_probe, admit=_guard,
+        targets=zones, vocabulary=lambda _zone: list(words), execute=_probe_one, admit=_guard,
         budget_s=budget.budget_seconds("WILDCARD_BUDGET_S"), coverage_lane=source_id,
         dependency_ok=lambda: have("httpx"), max_pairs_per_target=word_spend,
+        max_words_per_invocation=1022,  # 1024 exact hosts minus two fresh wildcard controls
         max_targets_per_run=wildcard_zones_per_run())
     # the per-run withholding is a candidate-pair fact, in the unit the scheduler measures — the
     # vocabulary is retained whole, and the spend bound rotates through it rather than truncating it.

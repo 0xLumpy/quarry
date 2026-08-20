@@ -116,8 +116,8 @@ for _sid, _helper in {
 # enough to bind Host/SNI and every redirect.
 _register(("content.ffuf",), "external-http", "target", "content-ffuf",
           argv0=("ffuf",))
-_register(("probe.ffuf_vhost",), "external-http", "target", "vhost-ffuf",
-          argv0=("ffuf",))
+_register(("probe.ffuf_vhost",), "external-http", "target", "target-http-exact",
+          argv0=("ffuf",), required_argv=("-noninteractive",))
 _register(("crawl.katana_standard",), "external-http", "target",
           "target-http-proxy", argv0=("katana",), required_argv=("-duc",))
 _register(("crawl.katana_headless",), "external-browser", "target",
@@ -128,9 +128,10 @@ _register(("probe.gowitness", "enrich.gowitness"), "external-browser", "target",
           descendants=("chromium", "chrome_crashpad_handler"))
 _register(("probe.httpx", "enrich.httpx", "vertical.wildcard_http",
            "enrich.wildcard_a1d"), "external-http", "target",
-          "target-http-proxy", argv0=("httpx",), required_argv=("-duc",))
-_register(("params.arjun",), "external-http", "target", "target-http-proxy",
-          argv0=("arjun",))
+          "target-http-exact", argv0=("httpx",),
+          required_argv=("-duc", "-follow-host-redirects"))
+_register(("params.arjun",), "external-http", "target", "target-http-exact",
+          argv0=("arjun",), required_argv=("--disable-redirects",))
 _register(("params.blind_xss", "params.dalfox", "params.dalfox_xss_fast"),
           "external-http", "target", "target-http-proxy", argv0=("dalfox",))
 _register(("params.nuclei_oast", "params.nuclei_scan", "params.nuclei_takeover",
@@ -276,7 +277,7 @@ TRANSPORT_DOORS = MappingProxyType({**_registered_doors, **_auxiliary_doors})
 del _sid, _helper
 
 _PROXY_BOUND_PROFILES = frozenset({
-    "browser-pipe-proxy", "content-ffuf", "vhost-ffuf",
+    "browser-pipe-proxy", "content-ffuf",
     "target-http-proxy", "nuclei-authorized-http",
 })
 _CIDR_PEER_PROFILES = frozenset({

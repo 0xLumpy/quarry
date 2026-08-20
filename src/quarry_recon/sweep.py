@@ -295,7 +295,7 @@ _OBTAINED = (Status.SUCCESS, Status.EMPTY)
 
 def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: int,
               coverage_lane: str, dependency_ok=None, attribution=None, max_pairs_per_target: int = 0,
-              max_targets_per_run: int = 0, admit=None,
+              max_targets_per_run: int = 0, max_words_per_invocation: int | None = None, admit=None,
               now=time.time) -> SweepResult:
     """Drive one lane's sweep, emitting the three coverage records and raising nothing but cancellation.
 
@@ -350,6 +350,8 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
     try:
         max_pairs_per_target = _exact_cap(max_pairs_per_target)
         max_targets_per_run = _exact_cap(max_targets_per_run, "the per-run target allowance")
+        invocation_cap = (_exact_cap(max_words_per_invocation, "the per-invocation word bound")
+                          if max_words_per_invocation is not None else MAX_BATCH_WORDS)
     except ValueError as e:
         # nothing but cancellation escapes, so a nonsense bound is a machinery stop with nothing
         # submitted
@@ -359,7 +361,11 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
 
     # the batch maximum bounds the slot, not just the batch: applied after a slot is chosen, a lone
     # oversized slot would bypass it
-    alloc_cap = min([b for b in (max_pairs_per_target, MAX_BATCH_WORDS) if b] or [0])
+    # A lane may need a smaller payload than the global sweep ceiling. Applying it here makes each
+    # scheduler result describe exactly one tool invocation rather than forcing callers to aggregate
+    # several outcomes and corrupt slot accounting.
+    invocation_cap = min([b for b in (MAX_BATCH_WORDS, invocation_cap) if b] or [0])
+    alloc_cap = min([b for b in (max_pairs_per_target, invocation_cap) if b] or [0])
     for target, per_target in corpus.items():
         partition = allocate(per_target, cap=alloc_cap)
         placed = [word for group in partition.values() for word in group]
@@ -484,7 +490,7 @@ def run_sweep(*, lane: str, state_dir, targets, vocabulary, execute, budget_s: i
         refused_targets: set = set()                       # targets the admission hook turned away
         while not clock.exhausted() and len(picked) < len(slots):
             batch = _next_batch(progress, slots, content, members, picked, spent, out,
-                                cap=max_pairs_per_target, max_words=MAX_BATCH_WORDS,
+                                cap=max_pairs_per_target, max_words=invocation_cap,
                                 max_targets=max_targets_per_run, started=started_targets)
             if batch is None:
                 break

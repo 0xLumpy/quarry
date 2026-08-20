@@ -175,7 +175,12 @@ def test_transport_lookup_never_falls_back_to_a_tool_basename():
     ).profile == "content-ffuf"
     assert network_policy.transport_door(
         "probe.ffuf_vhost", argv=("ffuf", "-u", "https://example.test"),
-    ).profile == "vhost-ffuf"
+    ) is None
+    assert network_policy.transport_door(
+        "probe.ffuf_vhost", argv=(
+            "ffuf", "-noninteractive", "-u", "https://example.test",
+        ),
+    ).profile == "target-http-exact"
 
 
 def test_transport_lookup_requires_exact_native_helper_identity():
@@ -298,8 +303,8 @@ def test_serialized_broker_semantics_are_source_derived_and_dns_is_mediator_only
         )
     } == {
         "authority_class": "target",
-        "transport_profile": "target-http-proxy",
-        "peer_mode": "deny-all",
+        "transport_profile": "target-http-exact",
+        "peer_mode": "approved",
         "resolver_mode": "mediated-public",
     }
     parsed = BrokerPolicy.from_json(json.dumps(
@@ -307,13 +312,16 @@ def test_serialized_broker_semantics_are_source_derived_and_dns_is_mediator_only
     ))
     monkeypatch.setattr(netguard, "own_ips", lambda: ("192.0.2.10",))
     monkeypatch.setattr(netguard, "interface_snapshot", _interface_snapshot)
-    # The external HTTP child cannot use either the target or resolver directly;
-    # only the trusted validating resolver and pinned proxy use mediated calls.
+    # The exact-input HTTP child can resolve only through the configured
+    # resolver and can connect only to the complete pre-approved answer set.
     assert parsed.decide(
         "8.8.8.8", 443, socket.SOCK_STREAM, socket.IPPROTO_TCP,
-    )[0] == "deny"
+    )[0] == "allow"
     assert parsed.decide(
         "1.1.1.1", 53, socket.SOCK_DGRAM, socket.IPPROTO_UDP,
+    )[0] == "allow"
+    assert parsed.decide(
+        "8.8.4.4", 443, socket.SOCK_STREAM, socket.IPPROTO_TCP,
     )[0] == "deny"
     assert parsed.decide_dns(
         "1.1.1.1", 53, socket.SOCK_DGRAM, socket.IPPROTO_UDP,
@@ -447,6 +455,7 @@ def test_public_provider_direct_policy_is_global_tcp_only_except_exact_dns(
 
 @pytest.mark.parametrize("source_id,tool,resolver", [
     ("dns.dnsx_records", "dnsx", "127.0.0.53"),
+    ("probe.httpx", "httpx", "127.0.0.53"),
     ("probe.tlsx_certs", "tlsx", "10.203.0.53"),
     ("horizontal.asnmap", "asnmap", "127.0.0.53"),
 ])
@@ -505,7 +514,6 @@ def test_tracee_dns_delegation_retains_exact_resolver_guards(monkeypatch):
 @pytest.mark.parametrize("source_id,tool", [
     ("vertical.openintel", "openintel-subs"),
     ("horizontal.tlsx_san", "tlsx"),
-    ("probe.httpx", "httpx"),
     ("crawl.katana_headless", "katana"),
     ("params.nuclei_scan", "nuclei"),
     ("params.oob_control", "interactsh-client"),
@@ -1044,8 +1052,11 @@ def test_update_capable_tools_require_the_disable_update_flag():
     }
     for source_id, argv in cases.items():
         assert network_policy.transport_door(source_id, argv=argv) is None, source_id
+        profile_flags = (
+            ("-follow-host-redirects",) if source_id == "probe.httpx" else ()
+        )
         assert network_policy.transport_door(
-            source_id, argv=(*argv, "-duc"),
+            source_id, argv=(*argv, "-duc", *profile_flags),
         ) is not None, source_id
 
 

@@ -590,18 +590,47 @@ def _resolve_network_hosts(scope, *, request_id: str, source_id: str,
                     )
             approved.extend(canonical)
         except BaseException as exc:
+            settlement_fault = None
+            for peer, port in sorted(planned):
+                try:
+                    _trace_runner_dns(
+                        scope, request_id=request_id, source_id=source_id, host=host,
+                        record_type="settlement", decision="deny",
+                        reason="validating DNS ended before settlement", resolver=peer,
+                    )
+                except BaseException as trace_exc:
+                    if settlement_fault is None:
+                        settlement_fault = trace_exc
+            planned.clear()
+            try:
+                _trace_runner_dns(
+                    scope, request_id=request_id, source_id=source_id, host=host,
+                    record_type="settlement", decision="deny",
+                    reason=f"runner DNS/peer validation refused ({type(exc).__name__})",
+                )
+            except BaseException as trace_exc:
+                if settlement_fault is None:
+                    settlement_fault = trace_exc
+            if settlement_fault is not None:
+                raise settlement_fault from exc
+            raise
+        try:
             _trace_runner_dns(
                 scope, request_id=request_id, source_id=source_id, host=host,
-                record_type="settlement", decision="deny",
-                reason=f"runner DNS/peer validation refused ({type(exc).__name__})",
+                record_type="settlement", decision="allow",
+                reason="runner DNS/peer validation settled before external launch",
+                answers=canonical,
             )
+        except BaseException as exc:
+            try:
+                _trace_runner_dns(
+                    scope, request_id=request_id, source_id=source_id, host=host,
+                    record_type="settlement", decision="deny",
+                    reason="runner DNS/peer settlement could not be persisted",
+                )
+            except BaseException as trace_exc:
+                raise trace_exc from exc
             raise
-        _trace_runner_dns(
-            scope, request_id=request_id, source_id=source_id, host=host,
-            record_type="settlement", decision="allow",
-            reason="runner DNS/peer validation settled before external launch",
-            answers=canonical,
-        )
     return netguard.canonical_ip_set(approved)
 
 
@@ -1864,6 +1893,10 @@ def _run_with_repository(
         if door is None or not door.supported or not door.broker_required:
             return preflight_failure(
                 "bound network policy requires a supported broker source_id and exact transport door",
+            )
+        if door.profile == "target-http-exact" and not network_hosts:
+            return preflight_failure(
+                "exact target HTTP transport requires caller-declared network hosts",
             )
 
     if type(repository) is store.Run:
