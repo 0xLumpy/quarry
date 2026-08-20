@@ -1068,12 +1068,24 @@ class TestNativeLaneOutcomes:
     def test_a_v6_ONLY_apex_is_not_invisible(self, tmp_path, monkeypatch):
         """`gethostbyname_ex` is IPv4-only, so a v6-only apex resolved to nothing, contributed no
         netblock, and was recorded as a resolve failure it never had."""
-        import socket
-        monkeypatch.setattr(socket, "getaddrinfo", lambda host, _p, family, *a, **k:
-                            [] if family == socket.AF_INET
-                            else [(family, None, None, "", ("2606:4700::1111", 0, 0, 0))])
+        from types import SimpleNamespace
+        from quarry_recon import fetch, netguard, network_policy
         s = self._sess(tmp_path)
         prof = type("P", (), {"apex_domains": ["acme.com"]})()
+        ctx = osint._OsintHttpRepository(s, prof, SimpleNamespace(active_allowed=lambda _host: False))
+        scope = network_policy.NetworkPolicyScope(
+            block_private_targets=False, apex_domains=("acme.com",), own_ips=("192.0.2.10",),
+            resolver_ips=("1.1.1.1",),
+        )
+        scope.bind(ctx)
+        s._http_context = ctx
+        monkeypatch.setattr(
+            fetch, "_contact",
+            lambda *_a, **_k: netguard.ContactState(
+                "contact", [], [], answers=("2606:4700::1111",),
+                approved=("2606:4700::1111",),
+            ),
+        )
         assert osint._rdap_addresses(prof, s) == {"acme.com": ["2606:4700::1111"]}
         assert s.outcome()["gaps"] == []
 

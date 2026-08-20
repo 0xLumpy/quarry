@@ -1458,10 +1458,10 @@ def test_auxiliary_transport_exception_set_is_exact():
         "evidence.exposed_fetch", "evidence.graphql_introspect",
         "evidence.actuator_probe", "evidence.deep_evidence", "evidence.openapi",
         "evidence.framework_probe", "evidence.ssti_probe", "osint.asrank",
-        "osint.azmap", "osint.whoxy", "osint.rdap", "osint.asnmap",
+        "osint.azmap", "osint.whoxy", "osint.rdap", "osint.rdap_resolve", "osint.asnmap",
         "osint.porch_pirate", "osint.whois", "osint.dmarc", "notify.slack",
         "notify.discord", "notify.telegram", "notify.webhook", "probe.cdncheck",
-        "params.oob_control",
+        "params.oob_control", "vertical.wildcard_guard", "enrich.wildcard_guard",
     }
 
 

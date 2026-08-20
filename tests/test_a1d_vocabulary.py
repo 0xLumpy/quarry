@@ -372,7 +372,7 @@ class TestA1dVocabularyLossReachesTheVerdict:
 
     # ── audit-14 wildcard zones EXISTING is not the wildcard pass RUNNING ────────────────────────
     def _a1d_zones(self, tmp_path, monkeypatch, *, zones=("z.acme.com",), httpx=True, puredns=False,
-                   passive=False, wordlist=True, generic=b"api\nwww\n"):
+                   passive=False, wordlist=True, generic=b"api\nwww\n", guard="public"):
         from quarry_recon import store
         from quarry_recon.phases import enrich, probe, vertical
         run = store.Run.create(tmp_path, "t")
@@ -398,6 +398,12 @@ class TestA1dVocabularyLossReachesTheVerdict:
             monkeypatch.setattr(vertical, "exec_tool",
                                 lambda tool, cmd, raw_path=None, timeout=None, **k: _RR(
                                     tool, cmd, crawl.Status.EMPTY, 0, 0.1, None, 0))
+            monkeypatch.setattr(
+                vertical, "_wildcard_guard_contact",
+                lambda *_a, **_k: vertical.netguard.ContactState(
+                    guard, [], [], answers=(), approved=(),
+                ),
+            )
             # `_resolvers` writes a trusted-resolver list through `ctx.tmp` when none is configured — the
             # fixture must not depend on the host having one (it does not in the hermetic gate).
             monkeypatch.setattr(vertical, "_resolvers", lambda c: (tmp_path / "r", tmp_path / "rt"))
@@ -484,7 +490,8 @@ class TestA1dVocabularyLossReachesTheVerdict:
                             lambda host, block_private=False: ("self", True, None))
         monkeypatch.setattr(vertical.netguard, "_block_private", lambda ctx: False)
         monkeypatch.setattr(vertical.netguard, "self_deny_list", lambda: "127.0.0.1")
-        recs = self._a1d_zones(tmp_path, monkeypatch, httpx=True, puredns=True, wordlist=True)
+        recs = self._a1d_zones(tmp_path, monkeypatch, httpx=True, puredns=True, wordlist=True,
+                               guard="self")
         assert len(recs) == 1 and recs[0].status == "partial", recs
         assert "1/1 wildcard zone(s) not differentiated" in recs[0].note, recs
 
@@ -505,8 +512,12 @@ class TestA1dVocabularyLossReachesTheVerdict:
                                 tool, cmd, crawl.Status.EMPTY, 0, 0.1, None, 0))
         monkeypatch.setattr(vertical.netguard, "_block_private", lambda c: False)
         monkeypatch.setattr(vertical.netguard, "self_deny_list", lambda: "127.0.0.1")
-        monkeypatch.setattr(vertical.netguard, "contact_state",
-                            lambda host, block_private=False: (guard, guard != "public", None))
+        monkeypatch.setattr(
+            vertical, "_wildcard_guard_contact",
+            lambda *_a, **_k: vertical.netguard.ContactState(
+                guard, [], [], answers=(), approved=(),
+            ),
+        )
         return ctx
 
     def test_a_REUSED_stats_dict_never_reports_a_previous_call(self, tmp_path, monkeypatch):
@@ -2244,10 +2255,15 @@ class TestTheWildcardDifferHasItsOwnLifecycle:
             monkeypatch.setattr(vertical, "have", lambda t: httpx)
             monkeypatch.setattr(probe, "_vhost_wordlist", lambda: None)
             self._guard_hosts = []
-            monkeypatch.setattr(vertical.netguard, "contact_state",
-                                lambda host, block_private=False: (
-                                    self._guard_hosts.append(host),
-                                    (guard or "public", guard is not None, None))[1])
+            monkeypatch.setattr(
+                vertical, "_wildcard_guard_contact",
+                lambda _ctx, host, **_k: (
+                    self._guard_hosts.append(host),
+                    vertical.netguard.ContactState(
+                        guard or "public", [], [], answers=(), approved=(),
+                    ),
+                )[1],
+            )
             monkeypatch.setattr(vertical.netguard, "_block_private", lambda ctx: False)
             monkeypatch.setattr(vertical.netguard, "self_deny_list", lambda: "127.0.0.1")
             from quarry_recon.runner import RunResult as _RR
@@ -3371,7 +3387,7 @@ class TestTheDifferRotatesOverZonesAndWords:
                             lambda host, block_private=False: ("self", True, None))
         recs = TestA1dVocabularyLossReachesTheVerdict._a1d_zones(
             self, tmp_path, monkeypatch, zones=("z.acme.com",), httpx=True, puredns=True,
-            generic=b"one\ntwo\nthree\n")
+            generic=b"one\ntwo\nthree\n", guard="self")
         note = recs[0].note if recs else ""
         assert "guard" in note, note
         assert "spend bound" not in note and "rotate in on a later run" not in note, note

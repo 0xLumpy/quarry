@@ -21,6 +21,7 @@ import urllib.parse
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 from . import budget, events, fetch, osint_report, privfs, secrets, settings, whoxy_page
 from .contract import (PROVIDER_PARSE, PROVIDER_TRANSPORT, ProviderBodyError, capture_error_body,
@@ -1531,18 +1532,40 @@ def _rdap_org(obj: dict) -> str:
 
 
 def _rdap_addresses(profile, s: OsintSession) -> dict:
-    import socket
+    """Resolve RDAP inputs through this session's bound DNS authority.
+
+    RDAP is review-only, but its input addresses are still active DNS effects.
+    Keep them under the RDAP source identity so the resolver exchange has the
+    same durable plan/settlement trail as the provider request that consumes
+    its result.
+    """
+    from . import network_policy
+
+    # ``run()`` binds the scope to the session itself.  The small local face
+    # keeps accounting-only session doubles on that same authority without
+    # granting them the provider HTTP context.
+    context = getattr(s, "_http_context", None) or SimpleNamespace(
+        run=s, profile=profile,
+    )
+    effect_scope = network_policy.scope_for(context.run)
     per_apex: dict = {}
     for apex in profile.apex_domains:
         found: set = set()
-        for family in (socket.AF_INET, socket.AF_INET6):
-            try:
-                for info in socket.getaddrinfo(apex, None, family, socket.SOCK_STREAM):
-                    found.add(info[4][0])
-            except OSError:
-                continue          # one family missing is normal; only a complete failure is a gap
+        resolution_failed = False
+        if effect_scope is None:
+            s.note_failure("rdap", f"{apex}: no bound NetworkPolicyScope for DNS resolution")
+            per_apex[apex] = []
+            continue
+        try:
+            contact = fetch._contact(
+                context, apex, port=443, source_id="osint.rdap_resolve",
+            )
+            found.update(contact.approved)
+        except Exception as exc:
+            s.note_failure("rdap", f"{apex}: bound DNS resolution failed ({type(exc).__name__}: {exc})")
+            resolution_failed = True
         per_apex[apex] = sorted(found)
-        if not found:
+        if not found and not resolution_failed:
             # an apex that resolved to nothing is a gap in the verdict, not a silent continue
             s.note_failure("rdap", f"{apex}: resolved to no address (v4 or v6)")
     return per_apex

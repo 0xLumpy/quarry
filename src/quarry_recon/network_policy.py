@@ -274,6 +274,20 @@ _auxiliary_doors = {
     "osint.rdap": _door("osint.rdap", "native-provider-http", "public-provider",
                          "native-public-provider", helpers=("osint.http",),
                          broker_required=False),
+    # These are DNS/contact guards for target-owned names, not provider HTTP.
+    # Keep them distinct from ``osint.rdap`` so RDAP's public-provider door
+    # remains limited to rdap.org.
+    "osint.rdap_resolve": _door("osint.rdap_resolve", "native-pinned-http", "target",
+                                 "native-target-http", helpers=("osint.rdap_resolve",),
+                                 broker_required=False),
+    "vertical.wildcard_guard": _door(
+        "vertical.wildcard_guard", "native-pinned-http", "target", "native-target-http",
+        helpers=("vertical.wildcard_guard",), broker_required=False,
+    ),
+    "enrich.wildcard_guard": _door(
+        "enrich.wildcard_guard", "native-pinned-http", "target", "native-target-http",
+        helpers=("enrich.wildcard_guard",), broker_required=False,
+    ),
     "osint.asnmap": _door("osint.asnmap", "external-provider", "public-provider",
                            "public-provider", argv0=("asnmap",), required_argv=("-duc",)),
     "osint.porch_pirate": _door("osint.porch_pirate", "external-provider",

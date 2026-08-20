@@ -13,7 +13,7 @@ import pytest
 
 pytestmark = pytest.mark.offline
 
-from quarry_recon import notify, osint, policy, settings
+from quarry_recon import fetch, netguard, network_policy, notify, osint, policy, settings
 from quarry_recon.runner_repository import ArtifactDisposition, RepositoryOutput
 
 
@@ -26,6 +26,14 @@ class _Sess:
         self.intel_rows: list = []
         self.records: list = []
         self.failures: list = []
+        # RDAP address discovery is now a bound, mediated DNS effect even in
+        # these small lane-accounting doubles.
+        scope = network_policy.NetworkPolicyScope(
+            block_private_targets=False, apex_domains=(), own_ips=("192.0.2.10",),
+            resolver_ips=("1.1.1.1",),
+        )
+        scope._trace = lambda _document: None
+        self._network_policy_scope = scope
 
     def raw_path(self, source, name):
         p = self.dir / "raw" / source
@@ -54,18 +62,12 @@ class _Sess:
 class TestTheRDAPLaneBoundsTHROUGHPUTNotMembership:
     @staticmethod
     def _addresses(monkeypatch, mapping):
-        import socket
-
-        def fake(host, _port, family, *a, **k):
-            out = []
-            for ip in mapping.get(host, []):
-                v6 = ":" in ip
-                if (family == socket.AF_INET6) == v6:
-                    out.append((family, None, None, "", (ip, 0)))
-            if not out:
-                raise OSError("no address")
-            return out
-        monkeypatch.setattr(socket, "getaddrinfo", fake)
+        def fake(_scope, host, **_kwargs):
+            answers = tuple(mapping.get(host, ()))
+            return netguard.ContactState(
+                "contact", [], [], answers=answers, approved=answers,
+            )
+        monkeypatch.setattr(fetch, "_contact", fake)
 
     def test_every_resolved_address_is_ELIGIBLE(self, tmp_path, monkeypatch):
         self._addresses(monkeypatch, {"a.com": [f"10.0.0.{i}" for i in range(30)]})
@@ -369,9 +371,13 @@ class TestThePreflightBoundIsReachable:
         assert policy.limit("RDAP_LOOKUPS") == osint.RDAP_LOOKUPS
 
     def test_the_withheld_message_names_a_command_that_EXISTS(self, tmp_path, monkeypatch):
-        import socket
-        monkeypatch.setattr(socket, "getaddrinfo", lambda host, *a, **k:
-                            [(None, None, None, "", (f"10.0.0.{i}", 0)) for i in range(25)])
+        monkeypatch.setattr(
+            fetch, "_contact",
+            lambda *_a, **_k: netguard.ContactState(
+                "contact", [], [], answers=tuple(f"10.0.0.{i}" for i in range(25)),
+                approved=tuple(f"10.0.0.{i}" for i in range(25)),
+            ),
+        )
         monkeypatch.setattr(osint, "_http", lambda url, timeout=25: "{}")
         s = _Sess(tmp_path)
         osint._rdap(s, type("P", (), {"apex_domains": ["a.com"]})(), lambda _m: None, 30)

@@ -916,6 +916,30 @@ def _wc_vocabulary(extra_words, st: dict) -> list:
     return usable
 
 
+def _wildcard_guard_contact(ctx, host: str, *, source_id: str):
+    """Return a wildcard guard classification without falling back to NSS.
+
+    Production phase contexts carry a bound policy scope.  The deliberately
+    small legacy/test contexts do not own DNS authority, so treat that guard as
+    indeterminate rather than invoking ``netguard.contact_state`` (which would
+    resolve through the process resolver).  That preserves the historical
+    "do not reject on inconclusive DNS" behavior without creating a bypass.
+    """
+    from .. import network_policy
+
+    if network_policy.scope_for(getattr(ctx, "run", None)) is None:
+        return netguard.ContactState("indeterminate", [], [], answers=(), approved=())
+    guard_source = {
+        "vertical.wildcard_http": "vertical.wildcard_guard",
+        "enrich.wildcard_a1d": "enrich.wildcard_guard",
+    }.get(source_id)
+    if guard_source is None:
+        raise PermissionError("wildcard guard source has no exact native authority")
+    return fetch._contact(
+        ctx, host, port=443, source_id=guard_source,
+    )
+
+
 def _wc_differentiate(ctx, _zones_all: list, *, words: list, phase: str, label: str, source: str,
                       st: dict, source_id: str, kept: set, novel: set, word_spend: int) -> None:
     """A1 — recover the distinct vhosts hidden behind a wildcard zone. A `*.zone` cert makes every
@@ -951,8 +975,6 @@ def _wc_differentiate(ctx, _zones_all: list, *, words: list, phase: str, label: 
         return _gate("httpx is not installed")
     if not words:
         return _gate("no usable vocabulary")       # nothing to probe with -> zero zones attempted
-    block_private = netguard._block_private(ctx)
-
     def _sig(o):
         return (o.get("status_code"), o.get("content_length"),
                 (o.get("title") or "").strip(), o.get("favicon"))
@@ -980,8 +1002,10 @@ def _wc_differentiate(ctx, _zones_all: list, *, words: list, phase: str, label: 
     def _guard(zone: str) -> bool:
         # self-attack guard: if the wildcard resolves to the scan box / metadata, don't vhost-scan the
         # zone (record it as intel). A private wildcard is contacted by default.
-        _wstate, _wdeny, _wintel = netguard.contact_state(f"quarry-wc-guard-{_uuid.uuid4().hex[:8]}.{zone}",
-                                                          block_private=block_private)
+        _wstate, _wdeny, _wintel = _wildcard_guard_contact(
+            ctx, f"quarry-wc-guard-{_uuid.uuid4().hex[:8]}.{zone}",
+            source_id=source_id,
+        )
         if _wintel:
             netguard.record_internal(ctx, f"*.{zone}", _wintel)
         if _wstate in ("self", "private_blocked"):
