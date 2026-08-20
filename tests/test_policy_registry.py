@@ -12,7 +12,6 @@ import ast
 import importlib
 import json
 import pathlib
-import pathlib
 
 import pytest
 
@@ -697,11 +696,11 @@ class TestUnboundIsDrivenByTheRegistry:
         seen: list = []
 
         def tool(t_, cmd, raw_path=None, timeout=None, **k):
-            from quarry_recon.runner import RunResult as _RR
+            from quarry_recon.runner import RunResult as _RR, Status as _Status
             seen.extend(pathlib.Path(cmd[cmd.index("-l") + 1]).read_text().split())
             if raw_path is not None:
                 raw_path.write_text("")
-            return _RR(t_, cmd, crawl.Status.EMPTY, 0, 0.1, raw_path, 0)
+            return _RR(t_, cmd, _Status.EMPTY, 0, 0.1, raw_path, 0)
 
         bounded = L._differ(L(), tmp_path / "a", monkeypatch, zones=("z.acme.com",), words=words,
                             rows=None, tool=tool)

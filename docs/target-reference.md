@@ -65,6 +65,7 @@ group is **consent-sensitive** — it arms active or credential-using work and s
 | `TAKEOVER` | `true` | collect CNAMEs and run subdomain-takeover templates |
 | `PORTSCAN` | `false` | infra port scan (naabu top-1000 → nmap). Needs `true` **and** `CIDR`. Distinct from the web-port SYN prefilter, which is machine config. |
 | `BLOCK_PRIVATE_TARGETS` | `false` | when `false`, in-scope names resolving to private / CGNAT / ULA addresses are contacted and recorded as leads. Scanner-self, loopback, link-local and metadata destinations remain protected by policy; complete connect-time enforcement across every lane is an open `v0.3.9` release gate. |
+| `OOB_ENABLED` | `true` | global network-OOB transport switch. `false` adds Nuclei's no-Interactsh flag and disables Quarry-issued/polled callbacks plus Dalfox blind OOB, while leaving local import available. It does not change `BLOCK_PRIVATE_TARGETS`. |
 | `CONTENT_DISCOVERY` | `"off"` | ffuf content discovery intensity: `off` \| `light` \| `balanced` \| `deep` |
 | `CONTENT_RECURSION` | `0` | recursion depth for balanced/deep content discovery (capped at 5) |
 | `JS_AST` | `false` | AST analysis of downloaded JS bundles (local, memory-hungry) → path/sink observations |

@@ -376,7 +376,8 @@ class TestVerificationJobMapReader:
 
     def test_instance_matrix_order_and_identity_are_canonical(self):
         document = _job_map_document()
-        matrix = document["jobs"][0]["instances"][0]["matrix"]
+        offline = next(job for job in document["jobs"] if job["lane"] == "H0-hermetic")
+        matrix = offline["instances"][0]["matrix"]
         matrix.extend([
             {"name": "z-axis", "value": "a"},
             {"name": "a-axis", "value": "b"},
@@ -388,7 +389,8 @@ class TestVerificationJobMapReader:
             )
 
         document = _job_map_document()
-        document["jobs"][0]["instances"].reverse()
+        offline = next(job for job in document["jobs"] if job["lane"] == "H0-hermetic")
+        offline["instances"].reverse()
         with pytest.raises(evidence.EvidenceError, match="sorted by id"):
             evidence.validate_verification_job_map(
                 document,
@@ -397,7 +399,8 @@ class TestVerificationJobMapReader:
 
     def test_lane_selection_and_capability_semantics_fail_closed(self):
         document = _job_map_document()
-        document["jobs"][0]["selection"]["mark_expression"] = "integration"
+        offline = next(job for job in document["jobs"] if job["lane"] == "H0-hermetic")
+        offline["selection"]["mark_expression"] = "integration"
         with pytest.raises(evidence.EvidenceError, match="primary lane marker"):
             evidence.validate_verification_job_map(
                 document,
@@ -405,7 +408,8 @@ class TestVerificationJobMapReader:
             )
 
         document = _job_map_document()
-        document["jobs"][0]["capabilities"] = ["git"]
+        offline = next(job for job in document["jobs"] if job["lane"] == "H0-hermetic")
+        offline["capabilities"] = ["git"]
         with pytest.raises(evidence.EvidenceError, match="only for H1/P0"):
             evidence.validate_verification_job_map(
                 document,
@@ -413,8 +417,9 @@ class TestVerificationJobMapReader:
             )
 
         document = _job_map_document()
-        document["jobs"][0]["lane"] = "H1-tool-integration"
-        document["jobs"][0]["selection"]["mark_expression"] = "integration"
+        offline = next(job for job in document["jobs"] if job["lane"] == "H0-hermetic")
+        offline["lane"] = "H1-tool-integration"
+        offline["selection"]["mark_expression"] = "integration"
         with pytest.raises(evidence.EvidenceError, match="every H1"):
             evidence.validate_verification_job_map(
                 document,
@@ -645,8 +650,23 @@ class TestCommittedWorkflowParity:
         assert mapped_offline["lane"] == "H0-hermetic"
         assert mapped_offline["capabilities"] == []
         assert offline["strategy"]["matrix"]["python-version"] == ["3.10", "3.12"]
-        setup = next(step for step in offline["steps"] if step.get("uses") == "actions/setup-python@v5")
+        setup = next(
+            step for step in offline["steps"]
+            if str(step.get("uses", "")).startswith("actions/setup-python@")
+        )
+        assert setup["uses"] == \
+            "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065"
         assert setup["with"]["python-version"] == "${{ matrix.python-version }}"
+        for workflow in parsed_workflows.values():
+            for configured in workflow["jobs"].values():
+                for step in configured["steps"]:
+                    uses = str(step.get("uses", ""))
+                    if uses.startswith("actions/checkout@"):
+                        assert uses == \
+                            "actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5"
+                    if uses.startswith("actions/setup-python@"):
+                        assert uses == \
+                            "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065"
         test_step = next(step for step in offline["steps"] if step.get("name") == "H0 tests (deny guard)")
         arguments = shlex.split(test_step["run"])
         assert arguments[arguments.index("-m") + 1] == \

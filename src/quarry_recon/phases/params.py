@@ -37,6 +37,19 @@ from . import _local_raw
 GF_PATTERNS = ["xss", "sqli", "ssrf", "redirect", "lfi", "idor", "rce", "ssti", "interestingparams"]
 
 
+def _add_exception_note(error: BaseException, message: str) -> None:
+    """Use Python 3.11 notes while preserving the same evidence on Python 3.10."""
+    add_note = getattr(error, "add_note", None)
+    if add_note is not None:
+        add_note(message)
+        return
+    notes = getattr(error, "__notes__", None)
+    if notes is None:
+        error.__notes__ = [message]
+    else:
+        notes.append(message)
+
+
 def _provider_jsonl_records(ctx, path: Path) -> list[dict]:
     """Read a bounded stable provider JSONL artifact without following its name.
 
@@ -1678,7 +1691,8 @@ def blind_oob_credential(secret: str):
         if primary is not None:
             if not isinstance(primary, Exception):
                 if cleanup_fault is not None:
-                    primary.add_note(
+                    _add_exception_note(
+                        primary,
                         f"OOB credential cleanup also failed: {type(cleanup_fault).__name__}: "
                         f"{cleanup_fault}"
                     )
@@ -1686,7 +1700,8 @@ def blind_oob_credential(secret: str):
             if cleanup_fault is not None and not isinstance(cleanup_fault, Exception):
                 raise cleanup_fault.with_traceback(cleanup_fault.__traceback__)
             if cleanup_fault is not None:
-                primary.add_note(
+                _add_exception_note(
+                    primary,
                     f"OOB credential cleanup also failed: {type(cleanup_fault).__name__}: "
                     f"{cleanup_fault}"
                 )

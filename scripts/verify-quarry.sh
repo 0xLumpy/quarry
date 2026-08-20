@@ -2,9 +2,9 @@
 # Quarry verification key — fast, targeted regression checks per shipped fix.
 # Run "every now and then" (in convolute) instead of a full pipeline run after each fix.
 #
-# Usage:   bash notes/verify-quarry.sh
-# Prereqs: this box can import the Quarry source, and (for DNS checks) reach the live range.
-#          QUARRY_SRC defaults to ~/workspace/quarry/src ; RANGE_APEX defaults to 0xlumpy.cc.
+# Usage:   bash scripts/verify-quarry.sh
+# Prereqs: this box can import the Quarry source. This script makes no target contact.
+#          Authorized live diagnostics live in scripts/verify-quarry-live.sh.
 #
 # Each check prints PASS / FAIL / SKIP. Exit code is nonzero if anything FAILED.
 
@@ -14,7 +14,6 @@ QUARRY_SRC="${QUARRY_SRC:-$HOME/workspace/quarry/src}"
 # not land in the operator's installation (~/.config/quarry/pace).
 export QUARRY_PACE_DIR="$(mktemp -d)"
 trap 'rm -rf "$QUARRY_PACE_DIR"' EXIT
-RANGE_APEX="${RANGE_APEX:-0xlumpy.cc}"
 PY="python3"
 pass=0; fail=0; skip=0
 ok(){ echo "  PASS  $1"; pass=$((pass+1)); }
@@ -22,7 +21,7 @@ no(){ echo "  FAIL  $1"; fail=$((fail+1)); }
 sk(){ echo "  SKIP  $1"; skip=$((skip+1)); }
 
 echo "== Quarry verification key =="
-echo "src=$QUARRY_SRC  range=$RANGE_APEX"
+echo "src=$QUARRY_SRC  contact=disabled"
 echo
 
 # ── Check 0: touched modules import cleanly ────────────────────────────────────
@@ -58,73 +57,6 @@ for label,got,want in cases:
 sys.exit(1 if bad else 0)
 PYEOF
 
-# ── Check 2: dangling-CNAME takeover detection (vertical.py) — needs range ──────
-# A host with a CNAME but no A of its own = takeover candidate; A-resolving hosts must not be.
-echo "[2] dangling-CNAME takeover detection (assets vs admin/www)"
-if ! command -v dnsx >/dev/null 2>&1; then
-  sk "dnsx not on PATH"
-elif ! timeout 20 dnsx -silent -a -l <(printf 'admin.%s\n' "$RANGE_APEX") 2>/dev/null | grep -q .; then
-  sk "range $RANGE_APEX not reachable / not resolving from here"
-else
-  TMP=$(mktemp); CN=$(mktemp)
-  printf 'assets.%s\nadmin.%s\nwww.%s\n' "$RANGE_APEX" "$RANGE_APEX" "$RANGE_APEX" > "$TMP"
-  # -cname -a so each result carries A records; dangling = has CNAME but no A in THIS result
-  # (matches the code — NOT resolved-set membership, which a no-A CNAME host can pollute).
-  dnsx -l "$TMP" -cname -a -json -silent -retry 3 2>/dev/null > "$CN"
-  RESULT=$($PY - "$RANGE_APEX" "$CN" <<'PYEOF'
-import sys,json
-path = sys.argv[2]
-dang=[]
-for line in open(path):
-    try: o=json.loads(line)
-    except: continue
-    if o.get("cname") and not o.get("a"):       # has CNAME, no A = dangling
-        dang.append(o.get("host"))
-print(",".join(sorted(dang)))
-PYEOF
-)
-  rm -f "$TMP" "$CN"
-  if [ "$RESULT" = "assets.$RANGE_APEX" ]; then
-    ok "assets flagged dangling/takeover; admin+www not ($RESULT)"
-  else
-    no "expected only assets.$RANGE_APEX dangling, got: '${RESULT:-<none>}'"
-  fi
-fi
-
-# ── Check 3: CSP-sibling discovery from live response headers (probe.py) ───────
-# httpx -irh carries the CSP; an in-scope host named in www's CSP must be discovered.
-echo "[3] CSP-sibling discovery (internal via www CSP)"
-if ! command -v httpx >/dev/null 2>&1; then
-  sk "httpx not on PATH"
-elif ! timeout 20 httpx -silent -ports 443 -l <(printf 'www.%s\n' "$RANGE_APEX") 2>/dev/null | grep -q .; then
-  sk "range $RANGE_APEX not reachable from here"
-else
-  HX=$(mktemp)
-  printf 'www.%s\n' "$RANGE_APEX" > "$HX.in"
-  timeout 30 httpx -l "$HX.in" -json -silent -ports 443 -irh 2>/dev/null > "$HX"
-  RESULT=$($PY - "$RANGE_APEX" "$HX" <<'PYEOF'
-import sys,json,re
-apex,path=sys.argv[1],sys.argv[2]
-rx=re.compile(r"\b(?:https?://)?((?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,})\b", re.I)
-def in_scope(h): return h==apex or h.endswith("."+apex)
-found=set()
-for line in open(path):
-    try: o=json.loads(line)
-    except: continue
-    csp=(o.get("header") or {}).get("content_security_policy")
-    if not csp: continue
-    found |= {h for h in {m.lower() for m in rx.findall(csp)} if in_scope(h)}
-print(",".join(sorted(found)))
-PYEOF
-)
-  rm -f "$HX" "$HX.in"
-  # range's CSP-only host was renamed internal -> cf-edge-9d2c (non-wordlist, post-Test-1)
-  case ",$RESULT," in
-    *",cf-edge-9d2c.$RANGE_APEX,"*) ok "cf-edge-9d2c discovered via www CSP ($RESULT)";;
-    *) no "expected cf-edge-9d2c.$RANGE_APEX in CSP siblings, got: '${RESULT:-<none>}'";;
-  esac
-fi
-
 # ── Check 4: arjun → dalfox handoff (params.py) — hermetic ─────────────────────
 # arjun writes param-bearing URLs (".../v1/search?q=7101"); params.py must turn each into a
 # url + parameter + xss review so dalfox gets a candidate. (arjun actually finding `q` on the
@@ -132,23 +64,23 @@ fi
 echo "[4] arjun -> dalfox candidate handoff"
 PYTHONPATH="$QUARRY_SRC" $PY - <<'PYEOF' && ok "arjun param URL becomes a dalfox xss candidate" || no "handoff parse broken"
 import sys
-line="https://api.0xlumpy.cc/v1/search?q=7101"
+line="https://api.inscope.test/v1/search?q=7101"
 u=line.strip()
 if "?" not in u: sys.exit(1)
 base,qs=u.split("?",1)
 review={"klass":"xss","value":u}
 dalfox_in=[review["value"]] if review["klass"] in ("xss","redirect") else []
-sys.exit(0 if dalfox_in==["https://api.0xlumpy.cc/v1/search?q=7101"] else 1)
+sys.exit(0 if dalfox_in==["https://api.inscope.test/v1/search?q=7101"] else 1)
 PYEOF
 
 # ── Check 5: crawl-link host promotion (crawl.py) — hermetic ───────────────────
 # A host first seen via a crawl link (link-only needle) must be registered as a subdomain,
 # not left only in the URL corpus. Asserts host extraction + in-scope gate for the needle.
 echo "[5] crawl-link host promoted to subdomain (s3-backup needle)"
-PYTHONPATH="$QUARRY_SRC" RANGE_APEX="$RANGE_APEX" $PY - <<'PYEOF' && ok "link-only host extracted + in-scope -> would register" || no "host extraction/scope broken"
-import os,sys
+PYTHONPATH="$QUARRY_SRC" $PY - <<'PYEOF' && ok "link-only host extracted + in-scope -> would register" || no "host extraction/scope broken"
+import sys
 from quarry_recon import normalize
-apex=os.environ["RANGE_APEX"]
+apex="inscope.test"
 host=normalize.host_of_url(f"https://s3-backup-7f3a.{apex}/")
 in_scope = host==apex or host.endswith("."+apex)
 sys.exit(0 if (host==f"s3-backup-7f3a.{apex}" and in_scope) else 1)

@@ -807,8 +807,9 @@ def test_resolver_remainder_reader_refuses_final_name_replacement(tmp_path, monk
         return chunk
 
     monkeypatch.setattr(resource_contract.os, "read", read_then_replace_name)
-    with pytest.raises(ValueError, match="name changed"):
+    with pytest.raises(ValueError, match="changed while"):
         netguard.read_resolution_remainder(record)
+    assert fired["value"] is True
 
 
 def test_resolver_remainder_reader_refuses_parent_rename_substitution(tmp_path, monkeypatch):

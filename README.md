@@ -344,14 +344,17 @@ python3 -m venv .venv && source .venv/bin/activate   # Debian/Ubuntu/Kali enforc
 pip install -e '.[dev]'
 pytest                        # positive H0 default (`-m offline`)
 pytest -m integration         # H1 named-tool diagnostics; no live target
-bash scripts/verify-quarry.sh # mixed development diagnostics; SKIP is not a release pass
+bash scripts/verify-quarry.sh # offline-only development diagnostics
+# authorized operator only; never CI:
+QUARRY_LIVE_APPROVED=1 RANGE_APEX=fixture.example bash scripts/verify-quarry-live.sh
 ```
 
 Every collected pytest node must carry exactly one primary marker: `offline`, `integration`, `corpus`,
 `packaging`, or `live`. `requires_tool("name")` is a named H1/P0 capability, not a selectable safety lane;
 `synthetic_process` is a constrained H0-only exception for a controlled current-interpreter child. The
-default and current CI select H0 positively. Their Python deny hooks are development tripwires, not the
-OS containment or candidate-bound evidence required by the still-open
+default development runs select H0 positively; CI separately selects H0, H1, and P0 and never selects
+the live lane. The H0 Python deny hooks are development tripwires, not the OS containment or
+candidate-bound evidence required by the still-open
 [release gates](docs/releases/RELEASE-GATES.md). A separate Linux runner now produces an exact-candidate,
 bubblewrap-isolated collect-only development diagnostic; its host runtime is untrusted and it emits no
 release-gate record. See [tests/README.md](tests/README.md) for exact counts, commands, and limitations.

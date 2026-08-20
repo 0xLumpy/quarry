@@ -33,6 +33,19 @@ class SecretStoreError(RuntimeError):
     """The configured credential store is not an exact owner-private regular file."""
 
 
+def _add_exception_note(error: BaseException, message: str) -> None:
+    """Use Python 3.11 notes while preserving the same evidence on Python 3.10."""
+    add_note = getattr(error, "add_note", None)
+    if add_note is not None:
+        add_note(message)
+        return
+    notes = getattr(error, "__notes__", None)
+    if notes is None:
+        error.__notes__ = [message]
+    else:
+        notes.append(message)
+
+
 def _identity(observed: os.stat_result) -> tuple[int, int]:
     return observed.st_dev, observed.st_ino
 
@@ -125,14 +138,18 @@ def _raise_primary_or_cleanup(primary: "BaseException | None",
     if primary is not None:
         if not isinstance(primary, Exception):
             if cleanup is not None:
-                primary.add_note(
+                _add_exception_note(
+                    primary,
                     f"{label} cleanup also failed: {type(cleanup).__name__}: {cleanup}"
                 )
             raise primary.with_traceback(primary.__traceback__)
         if cleanup is not None and not isinstance(cleanup, Exception):
             raise cleanup.with_traceback(cleanup.__traceback__)
         if cleanup is not None:
-            primary.add_note(f"{label} cleanup also failed: {type(cleanup).__name__}: {cleanup}")
+            _add_exception_note(
+                primary,
+                f"{label} cleanup also failed: {type(cleanup).__name__}: {cleanup}",
+            )
         raise primary.with_traceback(primary.__traceback__)
     if cleanup is not None:
         raise cleanup.with_traceback(cleanup.__traceback__)

@@ -1,0 +1,37 @@
+{
+  "exceptions": [
+    {
+      "code_sha256": "0c8f16162bb088c2b3902f52918821a78f048be3a02e09738424433391297d59",
+      "expires_before": "0.4.0",
+      "line": 88,
+      "owner": "release-engineering",
+      "path": "src/quarry_recon/bootstrap.py",
+      "rationale": "Legacy package-controlled bootstrap command strings require a structured argv migration; any byte or location change forces review.",
+      "test_id": "B602"
+    },
+    {
+      "code_sha256": "cddae1dc7ff49b1ef9e9c30a98de3fa8e5f1055c73b740ff2fd6afe0176b211a",
+      "expires_before": "0.4.0",
+      "line": 256,
+      "owner": "release-engineering",
+      "path": "src/quarry_recon/registry.py",
+      "rationale": "Legacy registry probes require a structured argv migration; any byte or location change forces review.",
+      "test_id": "B602"
+    },
+    {
+      "code_sha256": "7bd114a36594e5b0c3b5ff30ad32ef407a0e578758c584f84ff615ba933931a5",
+      "expires_before": "0.4.0",
+      "line": 1573,
+      "owner": "release-engineering",
+      "path": "src/quarry_recon/registry.py",
+      "rationale": "Legacy registry install commands require a structured argv migration; any byte or location change forces review.",
+      "test_id": "B602"
+    }
+  ],
+  "policy": {
+    "bandit_confidence": "HIGH",
+    "bandit_severity": "HIGH",
+    "unexpected_findings": "fail"
+  },
+  "schema_version": "quarry.security-exceptions.v1"
+}

@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools==80.9.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,7 +8,8 @@ version = "0.3.9"
 description = "Quarry — methodology-driven reconnaissance automation framework"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [{ name = "0xlumpy" }]
 dependencies = [
     "click>=8.2",
@@ -17,11 +18,25 @@ dependencies = [
     "tomli>=2.0; python_version < '3.11'",  # semantic release-candidate metadata parsing on Python 3.10
 ]
 
+[project.urls]
+Homepage = "https://github.com/0xLumpy/quarry"
+Issues = "https://github.com/0xLumpy/quarry/issues"
+Security = "https://github.com/0xLumpy/quarry/security/policy"
+
 [project.scripts]
 quarry = "quarry_recon.cli:cli"
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "jsonschema>=4.23"]
+ci = [
+    "bandit==1.9.4",
+    "build==1.5.0",
+    "detect-secrets==1.5.0",
+    "mypy==2.3.1",
+    "pip-audit==2.10.1",
+    "ruff==0.16.3",
+    "twine==7.0.0",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]

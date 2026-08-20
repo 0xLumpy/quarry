@@ -90,15 +90,21 @@ H0_DEVELOPMENT_PROFILE_SCHEMA_PATH = \
     "release/evidence/schemas/h0-development-profile-v1.schema.json"
 H0_DEVELOPMENT_PROFILE_PATH = "release/evidence/h0-development-profile-v1.json"
 FUTURE_RUNNER_INPUTS = {
+    "build-comparator": "scripts/compare_builds.py",
     "h0-development-profile": H0_DEVELOPMENT_PROFILE_PATH,
     "h0-development-profile-schema": H0_DEVELOPMENT_PROFILE_SCHEMA_PATH,
     "h0-inner-launcher": "src/quarry_recon/release_h0_inner.py",
     "h0-private-identity-worker": "src/quarry_recon/release_h0_identity.py",
     "h0-runner": "src/quarry_recon/release_h0.py",
+    "live-verification-script": "scripts/verify-quarry-live.sh",
+    "offline-verification-script": "scripts/verify-quarry.sh",
     "pytest-taxonomy-schema": PYTEST_TAXONOMY_SCHEMA_PATH,
+    "secret-baseline": ".secrets.baseline",
+    "security-exception-checker": "scripts/check_security_exceptions.py",
+    "security-exceptions": "release/evidence/security-exceptions-v1.json",
     "verification-job-map": VERIFICATION_JOB_MAP_PATH,
     "verification-job-map-schema": VERIFICATION_JOB_MAP_SCHEMA_PATH,
-    "verification-workflow-offline-ci": ".github/workflows/ci.yml",
+    "verification-workflow-ci": ".github/workflows/ci.yml",
 }
 
 GATE_STATUSES = frozenset({"pass", "fail", "open", "blocked", "not_applicable"})

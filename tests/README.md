@@ -1,9 +1,10 @@
 # Quarry tests
 
-Pytest development workflow for Quarry. Collection now enforces exactly one primary execution lane for
-every test before marker deselection. This closes the structural marker gap, but the current CI Python
-guard and development diagnostics are not release evidence. The authoritative isolation, evidence, and
-promotion requirements are in the [release-gate contract](../docs/releases/RELEASE-GATES.md).
+Pytest development workflow for Quarry. Collection enforces exactly one primary execution lane for every
+test before marker deselection. CI positively selects H0, H1, and P0 in separate jobs; it never selects
+the live lane. These development jobs are not candidate release evidence. The authoritative isolation,
+evidence, and promotion requirements are in the
+[release-gate contract](../docs/releases/RELEASE-GATES.md).
 
 ## Run
 
@@ -13,7 +14,7 @@ pytest                      # positive H0 default (`-m offline` from pyproject.t
 pytest -m offline           # explicit equivalent of the default H0 selection
 pytest -m integration       # H1: named real tools against synthetic/local fixtures
 pytest -m corpus            # C0: controlled private-corpus runner; currently no nodes
-pytest -m packaging         # P0: package/supply verification; currently no nodes
+pytest -m packaging         # P0: package/supply verification (requires a built candidate)
 pytest -m live              # L0: explicitly authorized live range; currently no nodes
 ```
 
@@ -26,7 +27,7 @@ Each collected node must have exactly one primary marker:
 
 | Primary marker | Lane | Meaning |
 |---|---|---|
-| `offline` | `H0-hermetic` | Repository fixtures only; no network or undeclared external binary. The default and current CI select this marker positively. |
+| `offline` | `H0-hermetic` | Repository fixtures only; no network or undeclared external binary. The default and H0 CI job select this marker positively. |
 | `integration` | `H1-tool-integration` | Named real tool against synthetic/local fixtures; no live target. Release evidence additionally requires an attested identity. |
 | `corpus` | `C0-private-corpus` | Controlled private-corpus replay. |
 | `packaging` | `P0-package-supply` | Candidate package and supply-chain verification. |
@@ -83,8 +84,9 @@ recorded in the
 
 ## Other verification
 
-`scripts/verify-quarry.sh` is a mixed diagnostic harness: it includes checks with external prerequisites
-and may report `SKIP`. It is useful during development, but a skipped or unavailable required check is not
-a release-gate pass. New offline-testable behavior belongs in pytest with the correct marker and in the
-corresponding gate evidence, not only in the shell script. Private historical-run regression is governed
-separately by the [golden-corpus contract](../docs/design/GOLDEN-CORPUS.md).
+`scripts/verify-quarry.sh` makes no target contact. Optional local binaries can still produce `SKIP`, so
+its output is a development diagnostic rather than a release-gate pass. Authorized live fixture checks
+live in `scripts/verify-quarry-live.sh`, which refuses to run without both an explicit approval flag and a
+canonical `RANGE_APEX`; CI never invokes it. New offline-testable behavior belongs in pytest with the
+correct marker and corresponding gate evidence. Private historical-run regression is governed separately
+by the [golden-corpus contract](../docs/design/GOLDEN-CORPUS.md).
