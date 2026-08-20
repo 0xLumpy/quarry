@@ -2893,39 +2893,48 @@ def _oob_probe(ctx, scope, prof):
     if opened is None:
         ctx.run.record("params", skipped("oob_probe", "interactsh session did not open"))
         return None
-    session, proc = opened
+    session = opened
     events.tool_start(sid, cmd=["<oob probe>", "interactsh"], input_total=len(probes),
                       work_unit=probe_wu)
     t0 = time.monotonic()
     issued = added = correlated = 0
-    try:
-        for i, (u, s, pairs, k) in enumerate(probes, 1):
-            # persist the mapping BEFORE the probe leaves (crash-safe: a later callback still correlates)
-            token = oob.issue_token(session, sid, u, k, "ssrf-callback", run=ctx.run)
-            cb = oob.callback_url(session, token, scheme="http")
-            probe_url = urlunsplit((s.scheme, s.netloc, s.path,
-                                    urlencode([(kk, cb if kk == k else vv) for kk, vv in pairs]), ""))
-            issued += 1
-            try:
-                                # no-follow + header-only: if the target 302s to Location: <our-callback> we must not
-                                # follow it, or Quarry fetches its own collector; the server-side SSRF still fires
-                fetch.redirect_location(
-                    ctx, probe_url, normalize.host_of_url(probe_url), timeout=10,
-                    source_id="params.oob_probe",
-                )
-            except Exception:
-                pass                               # a target that doesn't SSRF-fetch is the common case
-            events.tool_progress(sid, current_index=i, input_total=len(probes),
-                                 work_unit=probe_wu)
-        time.sleep(3)                              # brief window for a server-side callback to arrive
-        for row in oob.poll_session(ctx.run, session):
-            row.setdefault("raw_ref", session.get("log"))
-            if ctx.run.add("oob_interaction", row):
-                added += 1
-                correlated += 1 if row.get("correlation") == "correlated" else 0
-    finally:
-        oob.close_session(proc)
-    events.tool_finish(sid, status=Status.SUCCESS.value, duration=round(time.monotonic() - t0, 2),
+    poll_failed = False
+    for i, (u, s, pairs, k) in enumerate(probes, 1):
+        # Persist the mapping before the probe leaves, so a later callback is
+        # still attributable after a crash.
+        token = oob.issue_token(session, sid, u, k, "ssrf-callback", run=ctx.run)
+        cb = oob.callback_url(session, token, scheme="http")
+        probe_url = urlunsplit((s.scheme, s.netloc, s.path,
+                                urlencode([(kk, cb if kk == k else vv) for kk, vv in pairs]), ""))
+        issued += 1
+        try:
+            # Never follow the target's redirect to Quarry's own collector.
+            fetch.redirect_location(
+                ctx, probe_url, normalize.host_of_url(probe_url), timeout=10,
+                source_id="params.oob_probe",
+            )
+        except Exception:
+            pass                                   # no SSRF is the common result
+        events.tool_progress(sid, current_index=i, input_total=len(probes),
+                             work_unit=probe_wu)
+    resumed = oob.resume_session(
+        ctx.run, server=frozen_oob.get("callback_server"),
+        token=frozen_oob.get("auth_token"), wait=3,
+        expected_server=frozen_oob.get("callback_server"),
+    )
+    if resumed is None:
+        poll_failed = True
+    else:
+        session = resumed
+    for row in oob.poll_session(ctx.run, session):
+        row.setdefault("raw_ref", session.get("log"))
+        if ctx.run.add("oob_interaction", row):
+            added += 1
+            correlated += 1 if row.get("correlation") == "correlated" else 0
+    final_status = Status.PARTIAL if poll_failed else Status.SUCCESS
+    events.tool_finish(sid, status=final_status.value,
+                       reason=("OOB poll window did not settle" if poll_failed else None),
+                       duration=round(time.monotonic() - t0, 2),
                        discovery_context="params", work_unit=probe_wu)
     events.ledger(sid, produced={"oob_interaction": added, "correlated": correlated},
                   consumed={"probe": issued}, work_unit=probe_wu,
@@ -2934,7 +2943,8 @@ def _oob_probe(ctx, scope, prof):
                   policy_digest=channel_cfg.get("policy_digest"),
                   channel_digest=channel_cfg.get("channel_digest"))
     ctx.echo(f"  oob_probe: {issued} callback probe(s) -> {added} interaction(s) ({correlated} correlated)")
-    return RunResult("oob_probe", ["<oob probe>"], Status.SUCCESS, 0, round(time.monotonic() - t0, 2),
+    return RunResult("oob_probe", ["<oob probe>"], final_status, 0,
+                     round(time.monotonic() - t0, 2),
                      None, added, note=f"{issued} probe(s), {added} interaction(s), {correlated} correlated")
 
 

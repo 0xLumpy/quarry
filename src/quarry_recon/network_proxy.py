@@ -367,6 +367,7 @@ class PinnedBrowserProxy:
                     self._policy.control_clients
                     if self._policy.transport_profile in {
                         "target-http-proxy", "nuclei-authorized-http",
+                        "oob-control-proxy",
                     }
                     else self._policy.control_helpers
                 )

@@ -357,6 +357,9 @@ class WorkerRequest:
     descriptor_claims: tuple[DescriptorClaim, ...]
     max_output_bytes: int | None
     clean_settlement_policy: CleanSettlementPolicy
+    # Private execution posture selected by the runner facade from an exact
+    # source identity.  It is not a general caller-controlled signal knob.
+    deadline_sigint: bool = False
 
     def __post_init__(self) -> None:
         _request_id(self.request_id)
@@ -427,6 +430,8 @@ class WorkerRequest:
                 raise ProtocolError("output cap requires stdout", "max_output_bytes")
         if type(self.clean_settlement_policy) is not CleanSettlementPolicy:
             raise ProtocolError("invalid enum", "clean_settlement_policy")
+        if type(self.deadline_sigint) is not bool:
+            raise ProtocolError("invalid boolean", "deadline_sigint")
         digest = _optional_digest(self.stdin_sha256, "stdin_sha256")
         if self.stdin_mode is StdinMode.DATA:
             if self.stdin_bytes is None:
@@ -456,7 +461,7 @@ class WorkerRequest:
                 f"stdin_mode={self.stdin_mode.value!r})")
 
     def to_dict(self) -> dict:
-        return {
+        record = {
             "request_id": self.request_id,
             "tool": self.tool,
             "argv": list(self.argv),
@@ -472,6 +477,11 @@ class WorkerRequest:
             "max_output_bytes": self.max_output_bytes,
             "clean_settlement_policy": self.clean_settlement_policy.value,
         }
+        # Keep the normal v1 request shape stable.  The additional posture is
+        # frame-bound only when the exact source requires it.
+        if self.deadline_sigint:
+            record["deadline_sigint"] = True
+        return record
 
     @classmethod
     def from_dict(cls, doc: dict) -> "WorkerRequest":
@@ -480,7 +490,9 @@ class WorkerRequest:
             "environment", "cwd", "stdin_mode", "stdin_bytes", "stdin_sha256",
             "descriptor_claims", "max_output_bytes", "clean_settlement_policy",
         })
-        _exact_keys(doc, expected, "request")
+        extended_expected = expected | {"deadline_sigint"}
+        if frozenset(doc) not in {expected, extended_expected}:
+            raise ProtocolError("object keys do not match schema", "request")
         if (type(doc["argv"]) is not list or type(doc["ok_codes"]) is not list
                 or type(doc["descriptor_claims"]) is not list):
             raise ProtocolError("expected array", "request")
@@ -518,6 +530,7 @@ class WorkerRequest:
             clean_settlement_policy=_enum(
                 CleanSettlementPolicy, doc["clean_settlement_policy"],
                 "clean_settlement_policy"),
+            deadline_sigint=doc.get("deadline_sigint", False),
         )
 
 
@@ -570,6 +583,7 @@ def normalize_invocation(*, request_id, tool, cmd, timeout=1800, stdin_data=None
                          max_output_bytes=None,
                          clean_settlement_policy: CleanSettlementPolicy =
                          CleanSettlementPolicy.COOPERATIVE_SCOPE,
+                         _deadline_sigint: bool = False,
                          ) -> NormalizedInvocation:
     """Validate and normalize the current runner facade without side effects."""
     rid = _request_id(request_id)
@@ -591,6 +605,8 @@ def normalize_invocation(*, request_id, tool, cmd, timeout=1800, stdin_data=None
         raise ProtocolError("invalid boolean", "ok_empty")
     if type(clean_settlement_policy) is not CleanSettlementPolicy:
         raise ProtocolError("invalid enum", "clean_settlement_policy")
+    if type(_deadline_sigint) is not bool:
+        raise ProtocolError("invalid boolean", "deadline_sigint")
     if type(ok_codes) not in (list, tuple) or not ok_codes:
         raise ProtocolError("invalid exit-code set", "ok_codes")
     codes = tuple(ok_codes)
@@ -667,6 +683,7 @@ def normalize_invocation(*, request_id, tool, cmd, timeout=1800, stdin_data=None
         descriptor_claims=claims,
         max_output_bytes=max_output_bytes,
         clean_settlement_policy=clean_settlement_policy,
+        deadline_sigint=_deadline_sigint,
     )
     # A normalized invocation must be frameable; callers may not discover a
     # control-plane size failure after staging descriptors or launching a worker.

@@ -422,7 +422,8 @@ def _validate_inputs(
             or launcher.pid <= 0
             or launcher.pgid != launcher.pid
             or not callable(getattr(launcher, "release_for_exec", None))
-            or not callable(getattr(launcher, "abort_and_reap", None))):
+            or not callable(getattr(launcher, "abort_and_reap", None))
+            or not callable(getattr(launcher, "send_deadline_sigint", None))):
         raise RuntimeError("stream_launcher_invalid")
 
     launcher_fds = tuple(
@@ -619,6 +620,7 @@ def _run_stream_engine(
     exit_code: int | None = None
     execution_cutoff = False
     settlement_cutoff = False
+    deadline_sigint_sent = False
     stdin_state: _InputState | None = None
     outputs: tuple[_OutputState, ...] = ()
     drain_deadline: float | None = None
@@ -676,14 +678,23 @@ def _run_stream_engine(
                     stdin_state.stop(selector, StreamTerminal.PEER_CLOSED)
                 break
             if execution_deadline is not None and now >= execution_deadline:
-                execution_cutoff = True
-                _abort_and_reap(launcher)
-                reaped = True
-                assert settlement_deadline is not None
-                drain_deadline = settlement_deadline
-                if stdin_state.open:
-                    stdin_state.stop(selector, StreamTerminal.DEADLINE)
-                break
+                if request.deadline_sigint and not deadline_sigint_sent:
+                    # This request-bound posture leaves the pipe readers alive
+                    # for the fixed settlement window.  The hard-kill/reap
+                    # branch below remains the fallback for every survivor.
+                    launcher.send_deadline_sigint()
+                    deadline_sigint_sent = True
+                    if stdin_state.open:
+                        stdin_state.stop(selector, StreamTerminal.DEADLINE)
+                elif not deadline_sigint_sent:
+                    execution_cutoff = True
+                    _abort_and_reap(launcher)
+                    reaped = True
+                    assert settlement_deadline is not None
+                    drain_deadline = settlement_deadline
+                    if stdin_state.open:
+                        stdin_state.stop(selector, StreamTerminal.DEADLINE)
+                    break
             if (settlement_deadline is not None
                     and now >= settlement_deadline):
                 settlement_cutoff = True
@@ -694,7 +705,7 @@ def _run_stream_engine(
                     stdin_state.stop(selector, StreamTerminal.DEADLINE)
                 break
 
-            nearest = execution_deadline
+            nearest = None if deadline_sigint_sent else execution_deadline
             if settlement_deadline is not None:
                 nearest = (
                     settlement_deadline if nearest is None
@@ -757,7 +768,7 @@ def _run_stream_engine(
             reported_exit_code = exit_code
         else:
             terminal = ExecutionTerminal.COMPLETE
-            detail = None
+            detail = "sigint_deadline_exit" if deadline_sigint_sent else None
             reported_exit_code = exit_code
         return WorkerSettlement(
             request_id=request.request_id,

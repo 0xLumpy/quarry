@@ -10,6 +10,7 @@ import pytest
 from quarry_recon import (cli, config, exit_contract, nuclei_policy, oob, registry, run_manifest,
                           runtime_identity, settings, store, views)
 from quarry_recon.phases import PhaseContext, params
+from quarry_recon.state import ContractError
 
 
 pytestmark = pytest.mark.offline
@@ -1113,12 +1114,14 @@ def test_quarry_probe_uses_frozen_channel_in_work_unit_and_event_without_reread(
     )
     monkeypatch.setattr(
         params.oob, "open_session",
-        lambda _run, **kwargs: (opened.update(kwargs) or ({"log": "raw/oob/log"}, object())),
+        lambda _run, **kwargs: (opened.update(kwargs) or {"log": "raw/oob/log"}),
+    )
+    monkeypatch.setattr(
+        params.oob, "resume_session", lambda *_args, **_kwargs: {"log": "raw/oob/log"},
     )
     monkeypatch.setattr(params.oob, "issue_token", lambda *_args, **_kwargs: "issued")
     monkeypatch.setattr(params.oob, "callback_url", lambda *_args, **_kwargs: "http://issued.oast")
     monkeypatch.setattr(params.oob, "poll_session", lambda *_args, **_kwargs: [])
-    monkeypatch.setattr(params.oob, "close_session", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(params.fetch, "redirect_location", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(params.time, "sleep", lambda _seconds: None)
     monkeypatch.setattr(
@@ -1207,11 +1210,14 @@ def test_oob_poll_passes_only_authenticated_frozen_server_and_token(
         cli._oob_poll(str(profile.path), run.run_id, 0, {})
     assert captured == {
         "token": token, "server": "https://oob.example",
+        "wait": 0,
         "expected_server": "https://oob.example",
     }
 
 
-def test_resume_expected_server_mismatch_returns_before_binary_or_launch(monkeypatch):
+def test_resume_expected_server_mismatch_returns_before_binary_or_launch(
+        tmp_path, monkeypatch):
+    run = store.Run.create(tmp_path, "example.test", run_id="oob-server-mismatch")
     monkeypatch.setattr(oob, "load_session", lambda _run: {
         "session_file": "/tmp/session", "server": "https://old.example",
     })
@@ -1219,34 +1225,17 @@ def test_resume_expected_server_mismatch_returns_before_binary_or_launch(monkeyp
         oob.shutil, "which", lambda _name: pytest.fail("mismatch queried a launch dependency"),
     )
     assert oob.resume_session(
-        object(), server="https://frozen.example", expected_server="https://frozen.example",
+        run, server="https://frozen.example", expected_server="https://frozen.example",
     ) is None
 
 
-def test_resume_expected_server_match_preserves_normal_resume(monkeypatch):
-    captured = {}
-
-    class Proc:
-        pass
-
-    monkeypatch.setattr(oob, "load_session", lambda _run: {
-        "session_file": "/tmp/session", "log": "/tmp/log",
-        "server": "https://frozen.example", "domain": "id.oast.example",
-    })
-    monkeypatch.setattr(oob.shutil, "which", lambda _name: "/usr/bin/interactsh-client")
+def test_resume_refuses_a_nonrepository_adapter_before_launch(monkeypatch):
     monkeypatch.setattr(
-        oob, "_prepare_client_launch",
-        lambda _run, command, **_kwargs: (captured.setdefault("command", list(command)), {}),
+        oob, "load_session",
+        lambda _run: pytest.fail("nonrepository adapter reached session loading"),
     )
-    monkeypatch.setattr(oob, "_spawn_client", lambda *_args, **_kwargs: Proc())
-    monkeypatch.setattr(
-        oob, "_await_register", lambda _proc, _server, _wait: ("id.oast.example", "uid"),
-    )
-    resumed = oob.resume_session(
-        object(), server="https://frozen.example", expected_server="https://frozen.example", wait=0,
-    )
-    assert resumed is not None
-    assert captured["command"][captured["command"].index("-server") + 1] == "frozen.example"
+    with pytest.raises(ContractError, match="exact repository run"):
+        oob.resume_session(object(), wait=0)
 
 
 @pytest.mark.parametrize(("mixed", "marker"), [

@@ -600,6 +600,15 @@ def test_nuclei_self_hosted_oob_endpoint_is_exact(tmp_path, monkeypatch):
     monkeypatch.setattr(netguard, "own_ips", lambda: ("192.0.2.10",))
     assert parsed.host_allowed("oob.operator.test", 8443)[0] == "allow"
     assert parsed.host_allowed("oob.operator.test", 443)[0] == "deny"
+    bare = scope.prepare_invocation(
+        request_id="c" * 32, source_id="params.oob_control",
+        tool="interactsh-client",
+        argv=("interactsh-client", "-duc", "-json", "-server",
+              "oob.operator.test"), environment={},
+    )
+    assert bare.policy["operator_control_endpoints"] == [
+        "oob.operator.test:443", "oob.operator.test:80",
+    ]
     assert parsed.decide_proxy_resolved(
         "oob.operator.test", "10.0.0.8", 8443,
         socket.SOCK_STREAM, socket.IPPROTO_TCP,
@@ -1457,9 +1466,12 @@ def test_auxiliary_transport_exception_set_is_exact():
 
 
 def test_oob_control_and_target_probe_have_disjoint_effect_authorities():
-    assert network_policy.transport_door(
+    control = network_policy.transport_door(
         "params.oob_control", argv=("interactsh-client", "-duc", "-json"),
-    ).authority_class == "operator-infrastructure"
+    )
+    assert (control.authority_class, control.profile) == (
+        "operator-infrastructure", "oob-control-proxy",
+    )
     target = network_policy.transport_door(
         "params.oob_probe", helper="fetch.redirect_location",
     )
@@ -1467,6 +1479,143 @@ def test_oob_control_and_target_probe_have_disjoint_effect_authorities():
     assert network_policy.transport_door(
         "params.oob_probe", argv=("interactsh-client", "-duc", "-json"),
     ) is None
+
+
+def test_oob_control_is_proxy_only_and_freezes_the_public_pool(tmp_path, monkeypatch):
+    scope = _native_scope()
+    run = store.Run.create(tmp_path, "example.test")
+    scope.bind(run)
+    invocation = scope.prepare_invocation(
+        request_id="8" * 32, source_id="params.oob_control",
+        tool="interactsh-client",
+        argv=("interactsh-client", "-duc", "-json"), environment={},
+    )
+    assert invocation.policy["transport_profile"] == "oob-control-proxy"
+    assert invocation.policy["peer_mode"] == "deny-all"
+    assert invocation.policy["resolver_mode"] == "mediated-public"
+    assert invocation.policy["public_control_endpoints"] == sorted(
+        f"{host}:{port}"
+        for host in network_policy._NUCLEI_PUBLIC_OOB_HOSTS
+        for port in (80, 443)
+    )
+    parsed = BrokerPolicy.from_json(json.dumps(
+        invocation.policy, ensure_ascii=True, sort_keys=True, separators=(",", ":"),
+    ))
+    monkeypatch.setattr(netguard, "own_ips", lambda: ("192.0.2.10",))
+    monkeypatch.setattr(netguard, "interface_snapshot", _interface_snapshot)
+    assert parsed.decide(
+        "8.8.8.8", 443, socket.SOCK_STREAM, socket.IPPROTO_TCP,
+    )[0] == "deny"
+    assert parsed.decide(
+        "8.8.8.8", 53, socket.SOCK_DGRAM, socket.IPPROTO_UDP,
+    )[0] == "deny"
+    assert parsed.host_allowed("oast.pro", 80)[0] == "allow"
+    assert parsed.host_allowed("oast.pro", 443)[0] == "allow"
+    assert parsed.host_allowed("oast.pro", 8443)[0] == "deny"
+    assert parsed.host_allowed("evil-oast.pro", 443)[0] == "deny"
+    assert parsed.decide_proxy_resolved(
+        "oast.pro", "8.8.8.8", 443,
+        socket.SOCK_STREAM, socket.IPPROTO_TCP,
+    )[0] == "allow"
+    assert parsed.decide_proxy_resolved(
+        "oast.pro", "10.0.0.8", 443,
+        socket.SOCK_STREAM, socket.IPPROTO_TCP,
+    )[0] == "deny"
+
+
+def test_oob_control_self_host_authority_is_exact_and_canonical(tmp_path, monkeypatch):
+    scope = _native_scope(block_private=True)
+    run = store.Run.create(tmp_path, "example.test")
+    scope.bind(run)
+    invocation = scope.prepare_invocation(
+        request_id="9" * 32, source_id="params.oob_control",
+        tool="interactsh-client",
+        argv=("interactsh-client", "-duc", "-json", "-server",
+              "https://oob.operator.test:8443"), environment={},
+    )
+    assert invocation.policy["public_control_endpoints"] == []
+    assert invocation.policy["operator_control_endpoints"] == [
+        "oob.operator.test:8443",
+    ]
+    parsed = BrokerPolicy.from_json(json.dumps(
+        invocation.policy, ensure_ascii=True, sort_keys=True, separators=(",", ":"),
+    ))
+    monkeypatch.setattr(netguard, "own_ips", lambda: ("192.0.2.10",))
+    assert parsed.host_allowed("oob.operator.test", 8443)[0] == "allow"
+    assert parsed.host_allowed("oob.operator.test", 443)[0] == "deny"
+    assert parsed.decide_proxy_resolved(
+        "oob.operator.test", "10.0.0.8", 8443,
+        socket.SOCK_STREAM, socket.IPPROTO_TCP,
+    )[0] == "allow"
+    assert parsed.decide_proxy_resolved(
+        "oob.operator.test", "192.0.2.10", 8443,
+        socket.SOCK_STREAM, socket.IPPROTO_TCP,
+    )[0] == "deny"
+    assert parsed.decide_proxy_resolved(
+        "oob.operator.test", "169.254.169.254", 8443,
+        socket.SOCK_STREAM, socket.IPPROTO_TCP,
+    )[0] == "deny"
+    for server in (
+        "https://oob.operator.test:8443/path",
+        "https://oob.operator.test:08443",
+        "-server=https://oob.operator.test:8443",
+    ):
+        argv = ("interactsh-client", "-duc", "-json", "-server", server)
+        if server.startswith("-server="):
+            argv = ("interactsh-client", "-duc", "-json", server)
+        with pytest.raises(network_policy.NetworkPolicyError):
+            scope.prepare_invocation(
+                request_id="a" * 32, source_id="params.oob_control",
+                tool="interactsh-client", argv=argv, environment={},
+            )
+
+
+def test_oob_control_refuses_caller_proxy_configuration(tmp_path):
+    scope = _native_scope()
+    run = store.Run.create(tmp_path, "example.test")
+    scope.bind(run)
+    common = dict(
+        request_id="b" * 32, source_id="params.oob_control",
+        tool="interactsh-client", argv=("interactsh-client", "-duc", "-json"),
+    )
+    with pytest.raises(network_policy.NetworkPolicyError, match="ambient proxy"):
+        scope.prepare_invocation(**common, environment={"HTTPS_PROXY": "http://caller"})
+    with pytest.raises(network_policy.NetworkPolicyError, match="proxy flags"):
+        scope.prepare_invocation(
+            request_id=common["request_id"], source_id=common["source_id"],
+            tool=common["tool"],
+            argv=("interactsh-client", "-duc", "-json", "-proxy", "caller"),
+            environment={},
+        )
+
+
+def test_oob_control_uses_the_adapter_identity_for_proxy_authentication(tmp_path):
+    scope = _native_scope()
+    run = store.Run.create(tmp_path, "example.test")
+    scope.bind(run)
+    runtime_identity = {
+        "identities": [{
+            "role": "adapter",
+            "executable": {"sha256": "d" * 64, "bytes": 123},
+        }],
+    }
+    invocation = scope.prepare_invocation(
+        request_id="c" * 32, source_id="params.oob_control",
+        tool="interactsh-client",
+        argv=("interactsh-client", "-duc", "-json"), environment={},
+        runtime_identity=runtime_identity,
+    )
+    assert invocation.policy["control_helpers"] == []
+    assert invocation.policy["control_clients"] == [
+        {"sha256": "d" * 64, "bytes": 123},
+    ]
+    with pytest.raises(network_policy.NetworkPolicyError, match="adapter identity"):
+        scope.prepare_invocation(
+            request_id="e" * 32, source_id="params.oob_control",
+            tool="interactsh-client",
+            argv=("interactsh-client", "-duc", "-json"), environment={},
+            runtime_identity={"identities": []},
+        )
 
 
 def test_redirect_confirm_binds_its_exact_native_transport_source(monkeypatch, tmp_path):
@@ -1508,14 +1657,14 @@ def test_oob_target_probe_binds_native_source_separately_from_control(
     )
     session = {"log": "fixture"}
     monkeypatch.setattr(
-        params_phase.oob, "open_session", lambda *_args, **_kwargs: (session, object()),
+        params_phase.oob, "open_session", lambda *_args, **_kwargs: session,
     )
+    monkeypatch.setattr(params_phase.oob, "resume_session", lambda *_args, **_kwargs: session)
     monkeypatch.setattr(params_phase.oob, "issue_token", lambda *_args, **_kwargs: "token")
     monkeypatch.setattr(
         params_phase.oob, "callback_url", lambda *_args, **_kwargs: "http://callback.test/x",
     )
     monkeypatch.setattr(params_phase.oob, "poll_session", lambda *_args: ())
-    monkeypatch.setattr(params_phase.oob, "close_session", lambda *_args: None)
     monkeypatch.setattr(params_phase.time, "sleep", lambda _seconds: None)
     for name in ("emit", "tool_start", "tool_progress", "tool_finish", "ledger"):
         monkeypatch.setattr(params_phase.events, name, lambda *_args, **_kwargs: None)
@@ -2542,6 +2691,7 @@ def test_proxy_listener_registration_is_owned_before_cancel_can_return(monkeypat
     ("profile", "expected_field"),
     (("target-http-proxy", "control_clients"),
      ("nuclei-authorized-http", "control_clients"),
+     ("oob-control-proxy", "control_clients"),
      ("browser-pipe-proxy", "control_helpers")),
 )
 def test_proxy_registration_uses_profile_specific_client_identity(

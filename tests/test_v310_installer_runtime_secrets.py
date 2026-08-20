@@ -561,13 +561,11 @@ def test_receipted_internal_link_swap_and_restore_cannot_poison_private_payload(
         runtime_identity._copy_receipt_payload(source, receipt, launch, 0)
 
 
-@pytest.mark.synthetic_process
-def test_oob_popen_constructor_after_effect_reaps_child_and_settles_credential(
-        tmp_path, monkeypatch):
-    run = store.Run.create(tmp_path, "acme.example", run_id="v310-oob-constructor")
-    run.write_state("running")
-    captured = {"processes": [], "directories": []}
-    real_execute = oob._POPEN_TYPE._execute_child
+@pytest.mark.parametrize("fault", [KeyboardInterrupt("window cancellation"), SystemExit(71)])
+def test_oob_managed_window_fault_still_settles_private_credential(
+        tmp_path, monkeypatch, fault):
+    token = "V310-OOB-CONSTRUCTOR-CANARY"
+    captured = {"directories": []}
     real_mkdtemp = secrets.tempfile.mkdtemp
 
     def private_directory(*args, **kwargs):
@@ -576,56 +574,21 @@ def test_oob_popen_constructor_after_effect_reaps_child_and_settles_credential(
         captured["directories"].append(Path(name))
         return name
 
-    def execute_then_cancel(process, *args, **kwargs):
-        real_execute(process, *args, **kwargs)
-        captured["processes"].append(process)
-        raise KeyboardInterrupt("cancel after child creation")
-
     monkeypatch.setattr(secrets.tempfile, "mkdtemp", private_directory)
-    monkeypatch.setattr(oob.shutil, "which", lambda _name: sys.executable)
+    monkeypatch.setattr(oob.secrets, "values", lambda: [token])
     monkeypatch.setattr(
-        oob, "_prepare_client_launch",
-        lambda _run, _command, **_kwargs: (
-            [sys.executable, "-c", "import time; time.sleep(30)"],
-            {"HOME": str(tmp_path), "PATH": ""},
-        ),
-    )
-    monkeypatch.setattr(oob._POPEN_TYPE, "_execute_child", execute_then_cancel)
-
-    with pytest.raises(KeyboardInterrupt, match="cancel after child creation"):
-        oob.open_session(run, token="V310-OOB-CONSTRUCTOR-CANARY", wait=1)
-
-    assert len(captured["processes"]) == 1
-    process = captured["processes"][0]
-    assert process.returncode is not None
-    if Path("/proc").is_dir():
-        assert not Path(f"/proc/{process.pid}").exists()
-    assert captured["directories"] and all(not path.exists() for path in captured["directories"])
-    assert run._live_artifact_claim_count() == 0
-
-
-@pytest.mark.parametrize("fault", [KeyboardInterrupt("close cancellation"), SystemExit(71)])
-def test_oob_close_cancellation_still_settles_private_claims(tmp_path, monkeypatch, fault):
-    from contextlib import ExitStack
-    import io
-
-    claims = ExitStack()
-    config = claims.enter_context(
-        secrets.private_tool_config("interactsh", {"token": "V310-OOB-CLOSE-CANARY"}),
-    )
-    directory = config.parent
-    process = type("Process", (), {"stdout": io.StringIO("diagnostic")})()
-    process._quarry_oob_claims = claims
-    monkeypatch.setattr(
-        oob.runner, "terminate_group",
-        lambda _process, **_kwargs: (_ for _ in ()).throw(fault),
+        oob.runner, "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(fault),
     )
 
     with pytest.raises(type(fault)):
-        oob.close_session(process)
-    assert process.stdout.closed
-    assert not directory.exists()
-    assert not hasattr(process, "_quarry_oob_claims")
+        oob._run_client_window(
+            object(), log=tmp_path / "log", session_file=tmp_path / "session",
+            server="oob.example", token=token,
+            wait=1, seed_prior=False, managed_outputs=False,
+        )
+
+    assert captured["directories"] and all(not path.exists() for path in captured["directories"])
 
 
 def test_launch_anchor_cleanup_failure_is_loud_until_absence_is_proven(tmp_path, monkeypatch):

@@ -44,32 +44,28 @@ def test_resume_selfhosted_reuses_token_only_on_matching_server():
 
 
 def _resume_argv(monkeypatch, saved_server, current_server, token):
-    """Drive resume_session() end-to-end with a mocked Popen and return the argv it built."""
+    """Build one managed resume window and return its secret-free argv."""
     from quarry_recon import oob
+    from types import SimpleNamespace
+    from pathlib import Path
     captured = {}
 
-    class _FakeProc:
-        stdout = None
+    def execute(_tool, cmd, **_kwargs):
+        captured["cmd"] = list(cmd)
+        return SimpleNamespace(
+            status=oob.runner.Status.EMPTY,
+            meta={"deadline_sigint": True},
+        )
 
-    def _fake_popen(cmd, **kw):
-        captured["cmd"] = cmd
-        return _FakeProc()
-
-    monkeypatch.setattr(oob.shutil, "which", lambda _b: "/usr/bin/interactsh-client")
-    monkeypatch.setattr(
-        oob, "_prepare_client_launch",
-        lambda _run, command, **_kwargs: (list(command), {}),
+    monkeypatch.setattr(oob.runner, "run", execute)
+    effective = oob._resume_token(saved_server, current_server, token)
+    monkeypatch.setattr(oob.secrets, "values", lambda: [effective] if effective else [])
+    result = oob._run_client_window(
+        object(), log=Path("/tmp/i.jsonl"), session_file=Path("/tmp/s.session"),
+        server=saved_server, token=effective, wait=0, seed_prior=True,
+        managed_outputs=False,
     )
-    monkeypatch.setattr(oob, "load_session", lambda _run: {
-        "session_file": "/tmp/s.session", "log": "/tmp/i.jsonl", "server": saved_server, "domain": "D.oast.pro"})
-    monkeypatch.setattr(oob.subprocess, "Popen", _fake_popen)
-    monkeypatch.setattr(oob, "_await_register", lambda _p, _s, _w: ("D.oast.pro", "uid"))
-    monkeypatch.setattr(
-        oob.runner, "terminate_group", lambda _p, **_kwargs: None,
-    )
-    resumed = oob.resume_session(object(), token=token, server=current_server, wait=0)
-    assert resumed is not None
-    oob.close_session(resumed[1])
+    assert result is not None
     return captured["cmd"]
 
 
@@ -79,11 +75,33 @@ def test_resume_session_argv_public_saved_sends_no_token(monkeypatch):
 
 
 def test_resume_session_argv_matching_server_sends_both(monkeypatch):
-    cmd = _resume_argv(monkeypatch, "oob.example.com", "https://oob.example.com/x", "T")
+    token = "PRIVATE-TOKEN"
+    cmd = _resume_argv(
+        monkeypatch, "oob.example.com", "https://oob.example.com/x", token,
+    )
     assert "-server" in cmd and "oob.example.com" in cmd and "-config" in cmd
-    assert "-token" not in cmd and "T" not in cmd
+    assert "-token" not in cmd and token not in cmd
 
 
 def test_resume_session_argv_changed_server_keeps_server_drops_token(monkeypatch):
-    cmd = _resume_argv(monkeypatch, "oob.example.com", "oob.other.com", "T")
-    assert "-server" in cmd and "oob.example.com" in cmd and "-token" not in cmd and "T" not in cmd
+    token = "PRIVATE-TOKEN"
+    cmd = _resume_argv(monkeypatch, "oob.example.com", "oob.other.com", token)
+    assert ("-server" in cmd and "oob.example.com" in cmd
+            and "-token" not in cmd and token not in cmd)
+
+
+def test_managed_window_refuses_an_unregistered_token_before_launch(monkeypatch):
+    from pathlib import Path
+    from quarry_recon import oob
+
+    monkeypatch.setattr(oob.secrets, "values", lambda: [])
+    monkeypatch.setattr(
+        oob.runner, "run",
+        lambda *_args, **_kwargs: pytest.fail("unregistered token reached the runner"),
+    )
+    with pytest.raises(oob.ContractError, match="active private credential"):
+        oob._run_client_window(
+            object(), log=Path("/tmp/log"), session_file=Path("/tmp/session"),
+            server="oob.example.com", token="PRIVATE-TOKEN", wait=1,
+            seed_prior=False, managed_outputs=False,
+        )

@@ -786,6 +786,25 @@ def _classify(exit_code: int, has_out: bool, blocked: bool, transport: bool, ok_
     return Status.SUCCESS, ""
 
 
+def _deadline_sigint_completion(request, settlement) -> bool:
+    """Recognize only the private OOB deadline shutdown completion.
+
+    The worker's detail is authenticated control traffic.  The request posture
+    itself is stamped only by the repository facade for ``params.oob_control``.
+    Keeping this predicate shared prevents result classification and native
+    artifact finalization from disagreeing about the sole accepted exit-1 path.
+    """
+    from .runner_protocol import ExecutionTerminal
+
+    return bool(
+        request.deadline_sigint
+        and settlement is not None
+        and settlement.terminal is ExecutionTerminal.COMPLETE
+        and settlement.detail == "sigint_deadline_exit"
+        and settlement.exit_code == 1
+    )
+
+
 _TERM_GRACE = 3.0        # seconds between SIGTERM and the hard SIGKILL of a tool's process group
 _REAP_GRACE = 2.0        # shared post-SIGKILL reap window in cancel_all, never per-process
 _POSIX = (os.name == "posix")
@@ -1509,16 +1528,37 @@ def _repository_run_result(
             })
     )
 
+    deadline_sigint_exit = _deadline_sigint_completion(request, settlement)
     if settlement is not None and settlement.terminal is ExecutionTerminal.TIMED_OUT:
         status, note = Status.TIMED_OUT, f"timed out after {request.timeout}s"
     elif not started or exit_code is None:
         status, note = Status.FAILED, f"execution did not complete ({execution.reason.value})"
+    elif (request.deadline_sigint and settlement is not None
+          and settlement.terminal is ExecutionTerminal.COMPLETE
+          and settlement.detail == "sigint_deadline_exit"):
+        # Interactsh persists its resumable session from its SIGINT handler and
+        # documents exit 1 for that path.  A regular early exit 1 has no
+        # witnessed deadline marker and therefore remains an ordinary failure.
+        if exit_code != 1:
+            status, note = Status.FAILED, (
+                f"deadline SIGINT exited {exit_code}, expected 1"
+            )
+        else:
+            status, note = _classify(
+                0, observed > 0, blocked, transport,
+                request.ok_empty, request.ok_codes,
+            )
+            note = (note + "; " if note else "") + "deadline SIGINT exit 1"
     else:
         status, note = _classify(
             exit_code, observed > 0, blocked, transport,
             request.ok_empty, request.ok_codes,
         )
-        if status in (Status.SUCCESS, Status.EMPTY) and primary_incomplete:
+    if status in (Status.SUCCESS, Status.EMPTY) and primary_incomplete:
+        if deadline_sigint_exit:
+            status = Status.FAILED
+            note = (note + "; " if note else "") + "deadline SIGINT evidence incomplete"
+        else:
             status = Status.PARTIAL
             note = (note + "; " if note else "") + "primary evidence incomplete"
 
@@ -1531,6 +1571,8 @@ def _repository_run_result(
         "repository_ownership_settled": outcome.ownership_settled,
         "execution_reason": execution.reason.value,
     }
+    if request.deadline_sigint:
+        meta["deadline_sigint"] = deadline_sigint_exit
     if stdout_stream is not None:
         if stdout_stream.observed_sha256 is not None:
             meta["stdout_sha256"] = stdout_stream.observed_sha256
@@ -1746,7 +1788,8 @@ def _native_execution_clean(outcome, request) -> bool:
         outcome.clean
         and settlement is not None
         and settlement.terminal is ExecutionTerminal.COMPLETE
-        and settlement.exit_code in request.ok_codes
+        and (settlement.exit_code in request.ok_codes
+             or _deadline_sigint_completion(request, settlement))
     )
 
 
@@ -1990,9 +2033,17 @@ def _run_with_repository(
                 runtime_identity=prepared.record,
                 approved_peers=resolved_peers,
             )
+        sealed_oob_resume = bool(
+            type(repository) is store.Run
+            and source_id == "params.oob_control"
+            and repository.manifest_committed()
+        )
+        # A sealed OOB poll writes its identity into the unique unpublished
+        # revision candidate after this contained execution settles.  Reopening
+        # the canonical base identity directory here would violate the seal.
         identity_ref = (
             runtime_identity.publish_launch_identity(repository, request_id, prepared.record)
-            if type(repository) is store.Run else None
+            if type(repository) is store.Run and not sealed_oob_resume else None
         )
         worker_environment = dict(prepared.environment)
         if prepared.redactions:
@@ -2016,6 +2067,7 @@ def _run_with_repository(
             raw_path=raw_path,
             stderr_path=stderr_path,
             max_output_bytes=max_output_bytes,
+            _deadline_sigint=(source_id == "params.oob_control"),
         )
     except BaseException as exc:
         settlement_fault = settle_network_invocation("deny")

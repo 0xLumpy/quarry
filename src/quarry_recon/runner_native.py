@@ -19,7 +19,7 @@ import json
 import os
 import stat
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 
@@ -157,7 +157,7 @@ class RepositoryNativeOutput:
         if len(indices) != len(set(indices)) or len(suffixes) != len(set(suffixes)):
             raise ContractError("native output bindings overlap")
         if self.kind is NativeOutputKind.FILE:
-            if len(self.bindings) != 1 or suffixes != ((),) or self.seed_prior:
+            if len(self.bindings) != 1 or suffixes != ((),):
                 raise ContractError("file output requires one root binding")
         else:
             if () not in suffixes:
@@ -166,12 +166,14 @@ class RepositoryNativeOutput:
 
     @classmethod
     def file(
-        cls, argv_index: int, *components: str, required: bool = True,
+        cls, argv_index: int, *components: str, seed_prior: bool = False,
+        required: bool = True,
     ) -> "RepositoryNativeOutput":
         return cls(
             NativeOutputKind.FILE,
             tuple(components),
             (NativeArgvBinding(argv_index),),
+            seed_prior=seed_prior,
             required=required,
         )
 
@@ -3258,6 +3260,41 @@ def _seed_tree(
                 _copy_tree_snapshot(source.fd, destination_fd, snapshot)
 
 
+def _seed_file(
+    run: store.Run,
+    policy: RepositoryNativeOutput,
+    destination_fd: int,
+    destination_name: str,
+) -> None:
+    """Copy one authenticated committed file into its private attempt sink."""
+    with run._mutation(store.MutationScope.BASE_EVIDENCE):
+        with _owned_run_anchor(run) as anchor:
+            with _owned_descriptor("native seed source descriptor") as source:
+                try:
+                    store._open_strict_directory_into(
+                        source, anchor, policy.components[:-1],
+                    )
+                except privfs.PrivatePathMissing:
+                    return
+                snapshot = _snapshot_file_at(
+                    source.fd,
+                    policy.components[-1],
+                    policy_index=0,
+                    policy=replace(policy, required=False),
+                    normalize=False,
+                )
+                if not snapshot.evidence.present:
+                    return
+                _copy_file_exact(
+                    source.fd,
+                    policy.components[-1],
+                    destination_fd,
+                    destination_name,
+                    expected_size=snapshot.evidence.size,
+                    expected_digest=snapshot.evidence.sha256 or "",
+                )
+
+
 def _write_stage_claim(
     root_fd: int,
     run: store.Run,
@@ -3339,6 +3376,8 @@ def prepare_native_outputs(
                             _ensure_dirs_at(tree_fd, binding.relative_suffix[:-1])
                     finally:
                         os.close(tree_fd)
+                elif policy.seed_prior:
+                    _seed_file(run, policy, owner._root_fd, name)
                 for binding in policy.bindings:
                     rewritten[binding.argv_index] = os.path.abspath(str(
                         Path(base) / owner._root_name / name

@@ -2232,7 +2232,8 @@ class BrokerPolicy:
         return False
 
     def _decide(self, peer: str, port: int, kind: int, protocol: int, *,
-                mediated: bool) -> tuple[str, str]:
+                mediated: bool,
+                declared_control_endpoint: bool = False) -> tuple[str, str]:
         from . import netguard
 
         # A small, source-derived set of tracees owns DNS transport directly.
@@ -2272,7 +2273,9 @@ class BrokerPolicy:
         if self.authority_class == "public-provider" \
                 and (not address.is_global or netguard.is_private_ip(peer)):
             return "deny", "public provider peer is not global unicast"
-        if self.block_private_targets and netguard.is_private_ip(peer):
+        if (self.block_private_targets and netguard.is_private_ip(peer)
+                and not (mediated and declared_control_endpoint
+                         and self.authority_class == "operator-infrastructure")):
             return "deny", "private-target opt-out"
         if mediated:
             if self.authority_class == "target":
@@ -2280,7 +2283,8 @@ class BrokerPolicy:
             if self.authority_class == "public-provider":
                 return "allow", "global-unicast public-provider peer admitted"
             if (self.authority_class == "operator-infrastructure"
-                    and peer in self.approved_peers):
+                    and (peer in self.approved_peers
+                         or declared_control_endpoint)):
                 return "allow", "declared operator endpoint peer admitted"
             return "deny", "authority class has no mediated peer permission"
         if port == 53:
@@ -2322,12 +2326,19 @@ class BrokerPolicy:
         """Classify a proxy peer with its exact target/control authority."""
         from . import netguard
 
-        decision, reason = self.decide_resolved(peer, port, kind, protocol)
+        endpoint = self._endpoint(host, port)
+        declared_control = (
+            endpoint in self.public_control_endpoints
+            or endpoint in self.operator_control_endpoints
+        )
+        decision, reason = self._decide(
+            peer, port, kind, protocol, mediated=True,
+            declared_control_endpoint=declared_control,
+        )
         if port == 53 and host in self.resolver_ips:
             return "deny", "DNS resolver is direct-only, never proxy authority"
         if decision != "allow":
             return decision, reason
-        endpoint = self._endpoint(host, port)
         if endpoint in self.public_control_endpoints:
             address = ipaddress.ip_address(peer)
             if not address.is_global or netguard.is_private_ip(peer):

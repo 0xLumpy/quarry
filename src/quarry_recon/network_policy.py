@@ -288,7 +288,8 @@ _auxiliary_doors = {
                              connect_time_peer=False),
     "params.oob_control": _door(
         "params.oob_control", "external-control-plane", "operator-infrastructure",
-        "oob-control", argv0=("interactsh-client",), required_argv=("-duc",),
+        "oob-control-proxy", argv0=("interactsh-client",),
+        required_argv=("-duc",),
     ),
     **{
         source_id: _door(source_id, "native-control-http", "operator-infrastructure",
@@ -305,6 +306,7 @@ del _sid, _helper
 
 _PROXY_BOUND_PROFILES = frozenset({
     "browser-pipe-proxy", "target-http-proxy", "nuclei-authorized-http",
+    "oob-control-proxy",
 })
 _CIDR_PEER_PROFILES = frozenset({
     "target-connect-scan", "target-connect-service", "target-cidr-tls",
@@ -355,9 +357,13 @@ def broker_transport_semantics(source_id: str, tool: str) -> dict[str, str]:
     else:
         peer_mode = "deny-all"
 
+    # Proxy-bound lanes perform DNS in the runner-owned mediator.  The
+    # tracee's ordinary connect authority remains deny-all; resolver_ips are
+    # carried only so the proxy can make its authenticated, traced DNS hop.
     resolver_mode = (
         "mediated-public"
-        if door.authority_class in {"target", "public-provider"}
+        if (door.authority_class in {"target", "public-provider"}
+            or door.profile in _PROXY_BOUND_PROFILES)
         and door.authority_class != "offline"
         else "none"
     )
@@ -466,6 +472,31 @@ def _nuclei_public_control_endpoints() -> tuple[str, ...]:
 
 
 def _validate_control_endpoint_authority(profile: str, public, operator) -> None:
+    if profile == "oob-control-proxy":
+        # The stock Interactsh client is admitted to the public pool only as
+        # this finite six-host/two-port set.  A configured server replaces the
+        # set with one exact host authority (or its explicit HTTP/HTTPS port
+        # pair); suffixes and arbitrary public endpoints are never implicit.
+        if public and public != _nuclei_public_control_endpoints():
+            raise NetworkPolicyError("Interactsh public OOB endpoint set is invalid")
+        if public and operator:
+            raise NetworkPolicyError("Interactsh OOB endpoint mode is ambiguous")
+        if len(operator) > 2:
+            raise NetworkPolicyError("Interactsh OOB endpoint mode is ambiguous")
+        if len(operator) == 2:
+            hosts_ports = []
+            for endpoint in operator:
+                if endpoint.startswith("["):
+                    host, raw_port = endpoint[1:].split("]:", 1)
+                else:
+                    host, raw_port = endpoint.rsplit(":", 1)
+                hosts_ports.append((host, int(raw_port)))
+            if (hosts_ports[0][0] != hosts_ports[1][0]
+                    or {hosts_ports[0][1], hosts_ports[1][1]} != {80, 443}):
+                raise NetworkPolicyError("Interactsh OOB endpoint set is invalid")
+        if not public and not operator:
+            raise NetworkPolicyError("Interactsh OOB endpoint authority is empty")
+        return
     if profile != "nuclei-authorized-http":
         if public or operator:
             raise NetworkPolicyError("transport profile has no control endpoint authority")
@@ -513,6 +544,70 @@ def _nuclei_control_endpoints(argv) -> tuple[tuple[str, ...], tuple[str, ...]]:
     rendered = f"{parsed.scheme}://{rendered_host}{rendered_port}"
     if value.rstrip("/") != rendered:
         raise NetworkPolicyError("Nuclei OOB transport is not canonical")
+    return (), (endpoint,)
+
+
+def _oob_control_endpoints(argv) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Return the exact Interactsh endpoint set selected by its argv.
+
+    Interactsh's ``-server`` option is deliberately parsed here rather than
+    treated as a free-form proxy or DNS setting.  The normal stock invocation
+    has no ``-server`` and is bound to the six public OAST authorities.  A
+    configured server is one canonical authority; a bare host freezes the
+    client's HTTP/HTTPS fallback as that host on ports 80 and 443, while an
+    explicit URL/port is retained exactly.
+    """
+    if type(argv) not in {tuple, list}:
+        raise NetworkPolicyError("Interactsh OOB transport is invalid")
+    indexes = [index for index, value in enumerate(argv) if value == "-server"]
+    if (len(indexes) > 1 or any(value.startswith("-server=") for value in argv)):
+        raise NetworkPolicyError("Interactsh OOB transport is invalid")
+    if not indexes:
+        return _nuclei_public_control_endpoints(), ()
+    index = indexes[0]
+    if index + 1 >= len(argv) or type(argv[index + 1]) is not str:
+        raise NetworkPolicyError("Interactsh OOB transport is invalid")
+    value = argv[index + 1]
+    values = value.split(",")
+    if len(values) != 1 or not values[0]:
+        raise NetworkPolicyError("Interactsh OOB transport is invalid")
+    value = values[0]
+    parsed = urllib.parse.urlsplit(value)
+    if parsed.scheme:
+        try:
+            port = parsed.port
+        except ValueError as exc:
+            raise NetworkPolicyError("Interactsh OOB transport is invalid") from exc
+        if (parsed.scheme not in {"http", "https"} or parsed.hostname is None
+                or parsed.username is not None or parsed.password is not None
+                or parsed.path not in {"", "/"} or parsed.query
+                or parsed.fragment):
+            raise NetworkPolicyError("Interactsh OOB transport is invalid")
+        host = parsed.hostname.lower()
+        port = port or (443 if parsed.scheme == "https" else 80)
+        endpoint = _control_endpoint(host, port)
+        rendered_host = f"[{host}]" if ":" in host else host
+        rendered = f"{parsed.scheme}://{rendered_host}{'' if parsed.port is None else ':' + str(parsed.port)}"
+        if value.rstrip("/") != rendered:
+            raise NetworkPolicyError("Interactsh OOB transport is not canonical")
+    else:
+        # ``oob.py`` passes the Interactsh client's bare ``-server`` host.
+        # Interactsh may fall back between HTTP and HTTPS, so freeze both
+        # ports for this one host rather than granting an arbitrary port.
+        if "/" in value or "@" in value or value.count(":") > 1:
+            raise NetworkPolicyError("Interactsh OOB transport is invalid")
+        host, raw_port = (value.rsplit(":", 1) if ":" in value else (value, None))
+        if raw_port is None:
+            host = host.lower()
+            return (), tuple(sorted(
+                (_control_endpoint(host, 80), _control_endpoint(host, 443)),
+            ))
+        elif not raw_port.isascii() or not raw_port.isdecimal() \
+                or str(int(raw_port)) != raw_port:
+            raise NetworkPolicyError("Interactsh OOB transport is invalid")
+        else:
+            port = int(raw_port)
+        endpoint = _control_endpoint(host.lower(), port)
     return (), (endpoint,)
 
 
@@ -1111,6 +1206,11 @@ class NetworkPolicyScope:
         if tool in {"gowitness", "katana", "nuclei"} and runtime_identity is not None \
                 and len(control_helpers) != 1:
             raise NetworkPolicyError("browser transport requires one exact helper identity")
+        if (semantics["transport_profile"] == "oob-control-proxy"
+                and runtime_identity is not None and len(control_clients) != 1):
+            raise NetworkPolicyError(
+                "Interactsh proxy transport requires one exact adapter identity",
+            )
         if type(approved_peers) not in {tuple, list}:
             raise NetworkPolicyError("approved peer set must be finite")
         try:
@@ -1122,6 +1222,11 @@ class NetworkPolicyScope:
             raise NetworkPolicyError("approved peer set is not canonical")
         public_controls = _canonical_control_endpoints(public_control_endpoints)
         operator_controls = _canonical_control_endpoints(operator_control_endpoints)
+        if semantics["transport_profile"] == "oob-control-proxy" \
+                and not public_controls and not operator_controls:
+            # The stock adapter has no endpoint flag: freeze its public pool
+            # into the policy rather than granting the proxy ambient Internet.
+            public_controls = _nuclei_public_control_endpoints()
         if set(public_controls) & set(operator_controls):
             raise NetworkPolicyError("control endpoint authority overlaps")
         _validate_control_endpoint_authority(
@@ -1361,6 +1466,8 @@ class NetworkPolicyScope:
         if semantics["transport_profile"] == "nuclei-authorized-http":
             public_controls, operator_controls = _nuclei_control_endpoints(argv)
             nuclei_lane = _nuclei_protocol_lane(argv) or "none"
+        elif semantics["transport_profile"] == "oob-control-proxy":
+            public_controls, operator_controls = _oob_control_endpoints(argv)
         invocation = NetworkInvocation(
             self, request_id=request_id, source_id=source_id,
             tool=Path(tool).name, runtime_identity=runtime_identity,

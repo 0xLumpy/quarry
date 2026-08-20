@@ -1874,7 +1874,6 @@ def oob_poll(profile_path, run_id, wait, as_json):
 
 
 def _oob_poll(profile_path, run_id, wait, got):
-    import time as _time
     from . import oob as oobmod
     from . import exit_contract as _ec
 
@@ -1929,21 +1928,19 @@ def _oob_poll(profile_path, run_id, wait, got):
         _cfg = _nuclei_policy.authenticate_frozen_oob(_policy_document, _current_private)
     except _nuclei_policy.NucleiPolicyError as exc:
         raise _ec.Refused(str(exc)) from exc
-    resumed = oobmod.resume_session(run_obj, token=_cfg.get("auth_token"),
-                                    server=_modes["oob_server"]
-                                    if _modes["oob_backend"] == "self-hosted" else None,
-                                    expected_server=_modes["oob_server"]
-                                    if _modes["oob_backend"] == "self-hosted" else None)
+    resumed = oobmod.resume_session(
+        run_obj, token=_cfg.get("auth_token"),
+        server=_modes["oob_server"]
+        if _modes["oob_backend"] == "self-hosted" else None,
+        wait=wait,
+        expected_server=_modes["oob_server"]
+        if _modes["oob_backend"] == "self-hosted" else None,
+    )
     if resumed is None:
         raise click.ClickException("no resumable OOB session for this run "
                                    "(session.json missing, interactsh-client absent, or domain mismatch)")
-    session, proc = resumed
-    try:
-        if wait:
-            _time.sleep(wait)                       # let the resumed client fetch buffered callbacks
-        rows = oobmod.poll_session(run_obj, session)
-    finally:
-        oobmod.close_session(proc)
+    session = resumed
+    rows = oobmod.poll_session(run_obj, session)
     res = _oob_ingest(lambda: oobmod.import_polled(run_obj, session, rows, scope=profile.scope()))
     click.echo(f"oob poll: +{res['added']} new interaction(s) ({res['correlated']} correlated) "
                f"-> {_oob_sink(run_obj, res)}")

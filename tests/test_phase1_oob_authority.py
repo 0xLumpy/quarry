@@ -10,13 +10,13 @@ revision candidate, or a retryable refusal.
 from __future__ import annotations
 
 import copy
-import io
 import json
 import os
-import signal
 import threading
 import time
+from contextlib import nullcontext
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -79,44 +79,30 @@ def _safe_ref(run, value: str) -> Path:
     return resolved
 
 
-class _FakeProc:
-    def __init__(self):
-        self.stdout = io.StringIO("")
-
-
 def _fake_interactsh(monkeypatch, captured):
     monkeypatch.setattr(oob.shutil, "which", lambda _name: "/usr/bin/interactsh-client")
-    monkeypatch.setattr(
-        oob, "_prepare_client_launch",
-        lambda _run, command, **_kwargs: (list(command), {}),
-    )
-    monkeypatch.setattr(oob, "_await_register", lambda _proc, _server, _wait: ("csession01.oast.pro",
-                                                                               "csession01"))
-    monkeypatch.setattr(
-        oob.runner, "terminate_group", lambda _proc, **_kwargs: None,
-    )
+    monkeypatch.setattr(oob, "_network_scope_snapshot", lambda _run: {
+        "block_private_targets": False, "control_plane_cidrs": [],
+        "requested_cidrs": [], "apex_domains": ["acme.example"],
+        "oos_patterns": [],
+    })
+    monkeypatch.setattr(oob, "_candidate_network_scope", lambda *_a, **_k: nullcontext())
 
-    def launch(command, **kwargs):
-        proc = _FakeProc()
-        captured.update(command=list(command), kwargs=dict(kwargs), proc=proc)
-        return proc
+    def launch(_run, **kwargs):
+        log = Path(kwargs["log"])
+        state = Path(kwargs["session_file"])
+        privfs.private_dir(log.parent)
+        privfs.write_private(log, _callback() if "revisions" in log.parts else "")
+        privfs.write_private(state, "opaque-interactsh-state")
+        if kwargs.get("stdout_components"):
+            stdout = _run.dir.joinpath(*kwargs["stdout_components"])
+            privfs.write_private(
+                stdout, "Payload for OOB Testing: csession01.oast.pro\n",
+            )
+        captured.update(kwargs)
+        return SimpleNamespace(meta={"runtime_identity": {"schema": "fixture"}})
 
-    monkeypatch.setattr(oob.subprocess, "Popen", launch)
-
-
-def test_oob_close_uses_sigint_persistence_boundary(monkeypatch):
-    observed = {}
-    proc = _FakeProc()
-
-    def terminate(current, **kwargs):
-        observed["proc"] = current
-        observed.update(kwargs)
-
-    monkeypatch.setattr(oob.runner, "terminate_group", terminate)
-    oob.close_session(proc)
-
-    assert observed == {"proc": proc, "graceful_signal": signal.SIGINT}
-    assert proc.stdout.closed
+    monkeypatch.setattr(oob, "_run_client_window", launch)
 
 
 def test_saved_session_paths_are_run_relative_references(tmp_path):
@@ -140,6 +126,24 @@ def test_saved_session_paths_are_run_relative_references(tmp_path):
     loaded = oob.load_session(run)
     assert _safe_ref(run, loaded["log"]) == log
     assert _safe_ref(run, loaded["session_file"]) == state_file
+
+
+def test_candidate_policy_trace_rejects_name_replacement(tmp_path):
+    candidate = tmp_path / "candidate"
+    candidate.mkdir(mode=0o700)
+    repository = oob._CandidatePolicyRepository(candidate)
+    components = ("raw", "network", "policy.jsonl")
+    repository._append_base_artifact(components, b"first\n")
+    trace = candidate / "network-policy.jsonl"
+    displaced = candidate / "network-policy.displaced"
+    trace.rename(displaced)
+    privfs.write_private(trace, "replacement\n")
+
+    with pytest.raises(ContractError, match="trace authority changed"):
+        repository._append_base_artifact(components, b"second\n")
+
+    assert displaced.read_bytes() == b"first\n"
+    assert trace.read_bytes() == b"replacement\n"
 
 
 @pytest.mark.parametrize("field", ["log", "session_file"])
@@ -172,11 +176,9 @@ def test_session_consumers_refuse_escaping_repository_references(tmp_path, monke
             session.update({"domain": "csession01.oast.pro", "server": None})
             privfs.write_private(oob.session_path(run), json.dumps(session))
             monkeypatch.setattr(oob.shutil, "which", lambda _name: "/usr/bin/interactsh-client")
-            monkeypatch.setattr(
-                oob.subprocess,
-                "Popen",
-                lambda *_args, **_kwargs: pytest.fail("unsafe session reference reached process launch"),
-            )
+            monkeypatch.setattr(oob, "_run_client_window",
+                                lambda *_args, **_kwargs: pytest.fail(
+                                    "unsafe session reference reached process launch"))
             oob.resume_session(run, wait=0)
 
 
@@ -200,26 +202,21 @@ def test_token_issue_is_not_visible_in_memory_or_on_disk_when_the_base_is_sealed
     assert path.read_bytes() == before_bytes
 
 
-def test_live_interactsh_log_and_session_claims_hold_off_the_base_seal(tmp_path, monkeypatch):
+def test_bounded_interactsh_window_releases_before_the_base_seal(tmp_path, monkeypatch):
     run = _running_run(tmp_path, "live-session-claim")
     captured = {}
     _fake_interactsh(monkeypatch, captured)
 
     opened = oob.open_session(run, wait=0)
     assert opened is not None
-    session, proc = opened
-    try:
-        with pytest.raises(ContractError, match="live artifact claim"):
-            store.Run.open(tmp_path, "acme.example", run.run_id).begin_finalization()
-        assert run.state == "running"
-        assert _safe_ref(run, session["log"]).parts[-4:] == (
-            "raw", "oob", "session", "interactions.jsonl",
-        )
-        assert _safe_ref(run, session["session_file"]).parts[-4:] == (
-            "raw", "oob", "session", "interactsh.session",
-        )
-    finally:
-        oob.close_session(proc)
+    session = opened
+    assert run._live_artifact_claim_count() == 0
+    assert _safe_ref(run, session["log"]).parts[-4:] == (
+        "raw", "oob", "session", "interactions.jsonl",
+    )
+    assert _safe_ref(run, session["session_file"]).parts[-4:] == (
+        "raw", "oob", "session", "interactsh.session",
+    )
 
     store.Run.open(tmp_path, "acme.example", run.run_id).begin_finalization()
     assert run.state == "finalizing"
@@ -262,6 +259,11 @@ def test_sealed_resume_uses_one_revision_candidate_and_never_client_writes_base(
         "log": str(log),
         "session_file": str(state_file),
         "server": None,
+        "network_scope": {
+            "block_private_targets": False, "control_plane_cidrs": [],
+            "requested_cidrs": [], "apex_domains": ["acme.example"],
+            "oos_patterns": [],
+        },
     })
     _finish(run)
     base_before = _base_bytes(run)
@@ -270,30 +272,20 @@ def test_sealed_resume_uses_one_revision_candidate_and_never_client_writes_base(
 
     resumed = oob.resume_session(run, wait=0)
     assert resumed is not None
-    session, proc = resumed
-    try:
-        command = captured["command"]
-        client_log = Path(command[command.index("-o") + 1])
-        client_state = Path(command[command.index("-session-file") + 1])
-        for destination in (client_log, client_state):
-            assert destination.is_absolute()
-            assert run.dir in destination.parents
-            assert run.raw not in (destination, *destination.parents)
-            assert "revisions" in destination.relative_to(run.dir).parts
-        assert client_log.parent == client_state.parent, (
-            "one resume must stage one candidate containing both mutable client files"
-        )
-        assert client_state.read_bytes() == b"opaque-interactsh-state"
-        assert _safe_ref(run, session["log"]) == client_log
-        assert _safe_ref(run, session["session_file"]) == client_state
-
-        # Model the client's only mutation: it writes the staged log named on
-        # argv.  Polling must resolve the safe reference, never the sealed base.
-        client_log.write_text(_callback())
-        rows = oob.poll_session(run, session)
-        assert len(rows) == 1
-    finally:
-        oob.close_session(proc)
+    session = resumed
+    client_log = Path(captured["log"])
+    client_state = Path(captured["session_file"])
+    for destination in (client_log, client_state):
+        assert destination.is_absolute()
+        assert run.dir in destination.parents
+        assert run.raw not in (destination, *destination.parents)
+        assert "revisions" in destination.relative_to(run.dir).parts
+    assert client_log.parent == client_state.parent
+    assert client_state.read_bytes() == b"opaque-interactsh-state"
+    assert _safe_ref(run, session["log"]) == client_log
+    assert _safe_ref(run, session["session_file"]) == client_state
+    rows = oob.poll_session(run, session)
+    assert len(rows) == 1
 
     result = oob.import_polled(run, session, rows)
     assert result["revision"].status == "valid"

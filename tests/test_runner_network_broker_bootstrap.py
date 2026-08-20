@@ -250,6 +250,9 @@ def test_policy_handoff_verifies_parses_and_starts_before_ack(monkeypatch):
         ("params.nuclei_scan", "nuclei",
          ("nuclei", "-duc", "-l", "targets", "-pt", "tcp"),
          "nuclei-authorized-http", "tcp", "-p", "socks5", ("-pi",)),
+        ("params.oob_control", "interactsh-client",
+         ("interactsh-client", "-duc", "-json"),
+         "oob-control-proxy", "none", "", "http", ()),
     ),
 )
 def test_proxy_is_runner_injected_before_release_and_shares_authority(
@@ -330,9 +333,17 @@ def test_proxy_is_runner_injected_before_release_and_shares_authority(
         assert events == ["parse", "proxy_init", "proxy_start"]
         assert request.argv == cmd
         assert protocol.request_digest(request) == original_digest
-        assert child_request.argv == request.argv + (
-            proxy_flag, f"{scheme}://127.0.0.1:43123", *extra,
-        )
+        if proxy_flag:
+            assert child_request.argv == request.argv + (
+                proxy_flag, f"{scheme}://127.0.0.1:43123", *extra,
+            )
+            assert child_request.environment == request.environment
+        else:
+            assert child_request.argv == request.argv
+            environment = dict(child_request.environment)
+            assert environment["HTTP_PROXY"] == "http://127.0.0.1:43123"
+            assert environment["HTTPS_PROXY"] == "http://127.0.0.1:43123"
+            assert environment[PRIVATE_POLICY_ENV] == "policy-wire"
 
         launcher._release_callback(
             deadline=time.monotonic() + 1, clock=time.monotonic,
@@ -345,6 +356,45 @@ def test_proxy_is_runner_injected_before_release_and_shares_authority(
                     os.close(fd)
                 except OSError:
                     pass
+
+
+def test_oob_caller_proxy_environment_is_refused_before_proxy_start(monkeypatch):
+    request = _request(
+        environment=(
+            (PRIVATE_POLICY_ENV, "policy-wire"),
+            ("HTTPS_PROXY", "http://caller.invalid"),
+        ),
+        tool="interactsh-client",
+        cmd=("interactsh-client", "-duc", "-json"),
+    )
+    launcher = SimpleNamespace(
+        pid=12345,
+        _broker_report_read=-1,
+        _broker_ack_write=-1,
+        _release_callback=None,
+        _network_broker_session=None,
+        _network_proxy=None,
+    )
+
+    class FakePolicy:
+        request_id = request.request_id
+        tool = request.tool
+        source_id = "params.oob_control"
+        transport_profile = "oob-control-proxy"
+        nuclei_protocol_lane = "none"
+
+        @classmethod
+        def from_json(cls, raw):
+            assert raw == "policy-wire"
+            return cls()
+
+    monkeypatch.setattr(runner_worker, "BrokerPolicy", FakePolicy)
+    monkeypatch.setattr(
+        runner_worker, "PinnedBrowserProxy",
+        lambda *_args, **_kwargs: pytest.fail("caller proxy reached proxy startup"),
+    )
+    with pytest.raises(RuntimeError, match="network_proxy_caller_environment_forbidden"):
+        runner_worker._configure_network_broker(request, launcher)
 
 
 @pytest.mark.parametrize(

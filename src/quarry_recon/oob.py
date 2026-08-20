@@ -11,26 +11,28 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import queue
 import re
-import signal
 import shutil
-import subprocess
-import threading
+import stat
 import time
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import privfs, runner, runtime_identity, secrets
+from . import network_policy, privfs, runner, secrets
+from .runner_native import RepositoryNativeOutput
+from .runner_repository import RepositoryOutput
 from .state import ContractError
 
 
 _OOB_SESSION_COMPONENTS = ("raw", "oob", "session", "session.json")
 _OOB_LOG_COMPONENTS = ("raw", "oob", "session", "interactions.jsonl")
 _OOB_CLIENT_SESSION_COMPONENTS = ("raw", "oob", "session", "interactsh.session")
+_OOB_REGISTER_STDOUT_COMPONENTS = ("raw", "oob", "session", "register.stdout")
+_OOB_REGISTER_STDERR_COMPONENTS = ("raw", "oob", "session", "register.stderr")
+_OOB_POLL_STDOUT_COMPONENTS = ("raw", "oob", "session", "poll.stdout")
+_OOB_POLL_STDERR_COMPONENTS = ("raw", "oob", "session", "poll.stderr")
 _SESSION_REFERENCE_FIELDS = frozenset({"log", "session_file"})
-_POPEN_TYPE = subprocess.Popen
 
 
 @contextmanager
@@ -364,224 +366,233 @@ def load_session(run) -> dict | None:
     return obj
 
 
-def _drain(stream, q: "queue.Queue") -> None:
-    """Read a subprocess stream line-by-line into a queue, sentinel None on EOF. Belongs in a daemon
-    thread: the caller waits on the queue with a timeout, never on readline."""
-    try:
-        for line in iter(stream.readline, ""):
-            q.put(line)
-    except Exception:
-        pass
-    q.put(None)
-
-
-def _await_register(proc, server, wait):
-    """Read the client's stdout until it prints its registered host or `wait` elapses; returns
-    (host, unique_id) or None. Cannot block: the stdout drain runs in a daemon thread."""
-    q: "queue.Queue" = queue.Queue()
-    threading.Thread(target=_drain, args=(proc.stdout, q), daemon=True).start()
-    parsed = None
-    buf: list[str] = []
-    deadline = time.monotonic() + wait
-    while time.monotonic() < deadline and parsed is None:
-        try:
-            line = q.get(timeout=0.3)
-        except queue.Empty:
-            if proc.poll() is not None:
-                break
-            continue
-        if line is None:
-            break
-        buf.append(line)
-        parsed = _parse_registered("".join(buf), server)
-    return parsed
-
-
-def _prepare_client_launch(run, command: list[str], *, lifetime: ExitStack,
-                           record_directory: Path | None = None):
-    """Admit one Interactsh process and bind its exact runtime without serializing argv.
-
-    A live base can publish through its artifact authority.  A sealed-base resume instead places the
-    identity beside the already-isolated revision candidate, so it never re-opens a canonical base name.
-    Lightweight compatibility callers still receive the same fail-closed executable admission, but have no
-    repository in which an evidence record could honestly be published.
-    """
-    prepared = runtime_identity.prepare_launch(
-        "interactsh-client", command,
-        payload_scope=getattr(run, "_runtime_payload_scope", None),
-    )
-    request_id = os.urandom(16).hex()
-    try:
-        runtime_identity.revalidate_launch(prepared)
-        if record_directory is not None:
-            body = (json.dumps(prepared.record, sort_keys=True, separators=(",", ":"),
-                               ensure_ascii=False) + "\n")
-            privfs.write_private(Path(record_directory) / f"runtime-identity-{request_id}.json", body)
-        else:
-            from . import store as _store
-            if type(run) is _store.Run:
-                runtime_identity.publish_launch_identity(run, request_id, prepared.record)
-    except BaseException as primary:
-        cleanup_fault = None
-        try:
-            prepared.close()
-        except BaseException as exc:
-            cleanup_fault = exc
-        if not isinstance(primary, Exception):
-            if cleanup_fault is not None:
-                primary.add_note(
-                    f"runtime identity cleanup also failed: {type(cleanup_fault).__name__}: "
-                    f"{cleanup_fault}"
-                )
-            raise primary.with_traceback(primary.__traceback__)
-        if cleanup_fault is not None and not isinstance(cleanup_fault, Exception):
-            raise cleanup_fault.with_traceback(cleanup_fault.__traceback__)
-        if cleanup_fault is not None:
-            primary.add_note(
-                f"runtime identity cleanup also failed: {type(cleanup_fault).__name__}: "
-                f"{cleanup_fault}"
-            )
-        raise primary.with_traceback(primary.__traceback__)
-    lifetime.callback(prepared.close)
-    return list(prepared.argv), dict(prepared.environment)
-
-
-def _settle_partial_popen(proc) -> None:
-    """Kill, exactly reap, and close a Popen whose constructor raised after creating a child."""
-    faults: list[BaseException] = []
-    try:
-        pid = getattr(proc, "pid", None)
-    except BaseException as exc:
-        pid = None
-        faults.append(exc)
-    if type(pid) is int and pid > 0:
-        try:
-            os.killpg(pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        except BaseException as exc:
-            faults.append(exc)
-        try:
-            waited, status = os.waitpid(pid, 0)
-            if waited == pid:
-                proc.returncode = os.waitstatus_to_exitcode(status)
-        except ChildProcessError:
-            try:
-                proc.poll()
-            except BaseException as exc:
-                faults.append(exc)
-        except BaseException as exc:
-            faults.append(exc)
-    for name in ("stdin", "stdout", "stderr"):
-        try:
-            stream = getattr(proc, name, None)
-            if stream is not None:
-                stream.close()
-        except BaseException as exc:
-            faults.append(exc)
-    cancellation = next((fault for fault in faults if not isinstance(fault, Exception)), None)
-    if cancellation is not None:
-        raise cancellation.with_traceback(cancellation.__traceback__)
-    if faults:
-        raise faults[0].with_traceback(faults[0].__traceback__)
-
-
-def _spawn_client(owner: dict, claims: ExitStack, argv: list[str], environment: dict[str, str],
-                  *, cwd: Path):
-    """Publish child authority before fork so constructor cancellation cannot orphan a credential user."""
-    kwargs = {
-        "stdout": subprocess.PIPE, "stderr": subprocess.STDOUT, "text": True,
-        "start_new_session": True, "env": environment, "cwd": str(cwd),
+def _network_scope_snapshot(run) -> dict:
+    """Freeze only the engagement fields needed to resume this owned channel."""
+    scope = network_policy.scope_for(run)
+    if scope is None:
+        raise ContractError("OOB control requires a bound network policy scope")
+    return {
+        "block_private_targets": scope.block_private_targets,
+        "control_plane_cidrs": list(scope.control_plane_cidrs),
+        "requested_cidrs": list(scope.requested_cidrs),
+        "apex_domains": list(scope.apex_domains),
+        "oos_patterns": list(scope.oos_patterns),
     }
-    factory = subprocess.Popen
-    if factory is _POPEN_TYPE:
-        proc = _POPEN_TYPE.__new__(_POPEN_TYPE)
-        owner["proc"] = proc
-        setattr(proc, "_quarry_oob_claims", claims)
+
+
+def _scope_from_snapshot(document: dict) -> network_policy.NetworkPolicyScope:
+    expected = {
+        "block_private_targets", "control_plane_cidrs", "requested_cidrs",
+        "apex_domains", "oos_patterns",
+    }
+    if type(document) is not dict or set(document) != expected:
+        raise ContractError("OOB session lacks its frozen network scope")
+    try:
+        return network_policy.NetworkPolicyScope(
+            block_private_targets=document["block_private_targets"],
+            control_plane_cidrs=document["control_plane_cidrs"],
+            requested_cidrs=document["requested_cidrs"],
+            apex_domains=document["apex_domains"],
+            oos_patterns=document["oos_patterns"],
+        )
+    except (TypeError, ValueError, network_policy.NetworkPolicyError) as exc:
+        raise ContractError("OOB session network scope is invalid") from exc
+
+
+class _CandidatePolicyRepository:
+    """One unique sealed-run candidate's durable network-policy trace sink."""
+
+    def __init__(self, directory: Path):
+        self.directory = Path(directory)
+        observed = self.directory.stat(follow_symlinks=False)
+        if (not stat.S_ISDIR(observed.st_mode)
+                or observed.st_uid != os.geteuid()
+                or stat.S_IMODE(observed.st_mode) != privfs.DIR_MODE):
+            raise ContractError("OOB candidate trace directory is unsafe")
+        self.identity = (observed.st_dev, observed.st_ino)
+        self._trace_identity = None
+
+    def _append_base_artifact(self, components: tuple[str, ...], data: bytes) -> None:
+        if (components != ("raw", "network", "policy.jsonl")
+                or type(data) is not bytes):
+            raise PermissionError("OOB candidate owns only its network policy trace")
+        directory_fd = privfs._walk_dirfd(self.directory)
+        trace_fd = -1
         try:
-            _POPEN_TYPE.__init__(proc, argv, **kwargs)
-        except BaseException as primary:
-            try:
-                _settle_partial_popen(proc)
-                owner["constructor_settled"] = True
-            except BaseException as cleanup_fault:
-                if isinstance(primary, Exception) and not isinstance(cleanup_fault, Exception):
-                    raise cleanup_fault.with_traceback(cleanup_fault.__traceback__)
-                primary.add_note(
-                    f"OOB constructor cleanup also failed: {type(cleanup_fault).__name__}: "
-                    f"{cleanup_fault}"
-                )
-            raise primary.with_traceback(primary.__traceback__)
-    else:
-        # Test doubles retain Popen's documented postcondition that a raise creates no child authority.
-        proc = factory(argv, **kwargs)
-        owner["proc"] = proc
-        setattr(proc, "_quarry_oob_claims", claims)
-    return proc
+            observed = os.fstat(directory_fd)
+            if ((observed.st_dev, observed.st_ino) != self.identity
+                    or not stat.S_ISDIR(observed.st_mode)
+                    or observed.st_uid != os.geteuid()
+                    or stat.S_IMODE(observed.st_mode) != privfs.DIR_MODE):
+                raise ContractError("OOB candidate trace authority changed")
+            trace_fd = os.open(
+                "network-policy.jsonl",
+                os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW
+                | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0),
+                privfs.FILE_MODE, dir_fd=directory_fd,
+            )
+            observed = os.fstat(trace_fd)
+            if (not stat.S_ISREG(observed.st_mode)
+                    or observed.st_uid != os.geteuid()
+                    or observed.st_nlink != 1
+                    or stat.S_IMODE(observed.st_mode) != privfs.FILE_MODE):
+                raise ContractError("OOB candidate policy trace is unsafe")
+            identity = (observed.st_dev, observed.st_ino)
+            if self._trace_identity is None:
+                self._trace_identity = identity
+            elif identity != self._trace_identity:
+                raise ContractError("OOB candidate policy trace authority changed")
+            target = memoryview(data)
+            while target:
+                written = os.write(trace_fd, target)
+                if written <= 0:
+                    raise OSError("OOB policy trace append made no progress")
+                target = target[written:]
+            os.fsync(trace_fd)
+            named = os.stat(
+                "network-policy.jsonl", dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+            if ((named.st_dev, named.st_ino) != self._trace_identity
+                    or not stat.S_ISREG(named.st_mode)
+                    or named.st_uid != os.geteuid()
+                    or named.st_nlink != 1
+                    or stat.S_IMODE(named.st_mode) != privfs.FILE_MODE):
+                raise ContractError("OOB candidate policy trace authority changed")
+            os.fsync(directory_fd)
+        finally:
+            if trace_fd >= 0:
+                os.close(trace_fd)
+            os.close(directory_fd)
+
+
+@contextmanager
+def _candidate_network_scope(run, directory: Path, snapshot: dict):
+    prior = getattr(run, "_network_policy_scope", None)
+    if prior is not None:
+        raise ContractError("sealed OOB resume found an unexpected live network scope")
+    repository = _CandidatePolicyRepository(directory)
+    scope = _scope_from_snapshot(snapshot)
+    scope.bind(repository)
+    setattr(run, "_network_policy_scope", scope)
+    try:
+        yield
+    finally:
+        try:
+            delattr(run, "_network_policy_scope")
+        except AttributeError:
+            pass
+
+
+def _window_seconds(wait) -> int:
+    if isinstance(wait, bool) or not isinstance(wait, int) or wait < 0:
+        raise ValueError("OOB client window must be a non-negative integer")
+    return max(1, wait)
+
+
+def _run_client_window(
+    run, *, log: Path, session_file: Path, server, token, wait: int,
+    seed_prior: bool, managed_outputs: bool, stdout_components=(), stderr_components=(),
+):
+    """Run one contained register/poll window; no child authority escapes."""
+    hosts = _server_hosts(server)
+    if len(hosts) > 1:
+        raise ContractError("OOB control supports one frozen self-host authority")
+    if token is not None:
+        if (type(token) is not str or len(token) < 6
+                or token not in secrets.values()):
+            # Runtime admission snapshots ``-config`` as a private input and
+            # turns the active framework secret set into stream/native-output
+            # redactions.  Refuse an ad-hoc value that would fall outside that
+            # exact redaction authority.
+            raise ContractError("OOB auth token is not an active private credential")
+    command = [
+        "interactsh-client", "-duc", "-json", "-pi", "1",
+        "-o", str(log), "-session-file", str(session_file),
+    ]
+    if hosts:
+        command.extend(("-server", hosts[0]))
+    with ExitStack() as lifetime:
+        if token is not None:
+            config = lifetime.enter_context(
+                secrets.private_tool_config("interactsh", {"token": token}),
+            )
+            command.extend(("-config", str(config)))
+        native_outputs = ()
+        if managed_outputs:
+            native_outputs = (
+                RepositoryNativeOutput.file(
+                    6, *_OOB_LOG_COMPONENTS, seed_prior=seed_prior, required=False,
+                ),
+                RepositoryNativeOutput.file(
+                    8, *_OOB_CLIENT_SESSION_COMPONENTS,
+                    seed_prior=seed_prior, required=True,
+                ),
+            )
+        result = runner.run(
+            "interactsh-client", command,
+            repository=run, source_id="params.oob_control",
+            stdout=(RepositoryOutput.publish(*stdout_components)
+                    if stdout_components else RepositoryOutput.discard()),
+            stderr=(RepositoryOutput.publish(*stderr_components)
+                    if stderr_components else RepositoryOutput.discard()),
+            native_outputs=native_outputs,
+            timeout=_window_seconds(wait), ok_empty=True, ok_codes=(0,),
+            max_output_bytes=1024 * 1024,
+        )
+    if (result.status not in {runner.Status.SUCCESS, runner.Status.EMPTY}
+            or result.meta.get("deadline_sigint") is not True):
+        return None
+    if managed_outputs and (
+            not runner.native_output_current(result, log)
+            or not runner.native_output_current(result, session_file)):
+        return None
+    return result
+
+
+def _read_window_output(run, *component_sets: tuple[str, ...]) -> str:
+    chunks = []
+    for components in component_sets:
+        path = run.dir.joinpath(*components)
+        try:
+            with os.fdopen(privfs.open_ro_private(path), "r", encoding="utf-8",
+                           errors="replace") as handle:
+                chunks.append(handle.read(1024 * 1024 + 1))
+        except FileNotFoundError:
+            continue
+    text = "\n".join(chunks)
+    return text if len(text.encode("utf-8", "replace")) <= 2 * 1024 * 1024 else ""
 
 
 def open_session(run, server=None, token=None, wait: int = 12):
-    """Start a Quarry-owned interactsh-client session and return (session_dict, proc), persisting
-    raw/oob/session.json with an empty token_map.
-
-    `server`/`token` name a self-hosted interactsh and its auth token; unset uses the client's default
-    public servers. Returns None if interactsh-client is missing or does not register within `wait`
-    seconds, which is a hard deadline — this cannot hang. The live process is the caller's to poll
-    (poll_session) and close (close_session).
-    """
+    """Register one resumable Quarry session in a bounded managed window."""
     if not shutil.which("interactsh-client"):
         return None
-    claims = ExitStack()
-    proc = None
-    spawn_owner: dict = {}
-    try:
-        # These lifetime claims exist even though interactsh opens the files by
-        # name.  They keep the base seal from racing a process that can still
-        # append to either canonical artifact.
-        log_claim = claims.enter_context(run.artifact_claim(*_OOB_LOG_COMPONENTS))
-        session_claim = claims.enter_context(run.artifact_claim(*_OOB_CLIENT_SESSION_COMPONENTS))
-        log_writer = log_claim.open_writer()
-        session_writer = session_claim.open_writer()
-        os.close(log_writer)
-        os.close(session_writer)
-        log_claim.publish()
-        session_claim.publish()
-        log = run.dir.joinpath(*_OOB_LOG_COMPONENTS)
-        sf = run.dir.joinpath(*_OOB_CLIENT_SESSION_COMPONENTS)
-        # -session-file makes the session resumable: a later client on the same file re-opens the same
-        # correlation id, so closing after a poll does not lose delayed callbacks
-        cmd = ["interactsh-client", "-duc", "-json", "-o", str(log),
-               "-session-file", str(sf)]
-        # -server wants bare domains, not a URL (nuclei's -iserver takes the full URL)
-        srv = ",".join(_server_hosts(server)) if server else ""
-        if srv:
-            cmd += ["-server", srv]
-        if token:
-            # The config remains private for exactly the process lifetime.  Authentication material is
-            # never exposed through argv, process listings, telemetry, or runtime-identity evidence.
-            config = claims.enter_context(
-                secrets.private_tool_config("interactsh", {"token": str(token)}),
-            )
-            cmd += ["-config", str(config)]
-        admitted_cmd, admitted_env = _prepare_client_launch(run, cmd, lifetime=claims)
-        proc = _spawn_client(spawn_owner, claims, admitted_cmd, admitted_env, cwd=run.dir)
-        parsed = _await_register(proc, server, wait)
-        if parsed is None:
-            close_session(proc)
-            return None
-        domain, uid = parsed
-        session = {"domain": domain, "unique_id": uid, "token_map": {}, "started": _utc(),
-                   "log": _repository_ref(run, log, field="log"),
-                   "session_file": _repository_ref(run, sf, field="session_file"), "server": server}
-        save_session(run, session)
-        return session, proc
-    except BaseException:
-        proc = proc or spawn_owner.get("proc")
-        if proc is None or spawn_owner.get("constructor_settled"):
-            claims.close()
-        else:
-            close_session(proc)
-        raise
+    snapshot = _network_scope_snapshot(run)
+    log = run.dir.joinpath(*_OOB_LOG_COMPONENTS)
+    state_file = run.dir.joinpath(*_OOB_CLIENT_SESSION_COMPONENTS)
+    result = _run_client_window(
+        run, log=log, session_file=state_file, server=server, token=token,
+        wait=wait, seed_prior=False, managed_outputs=True,
+        stdout_components=_OOB_REGISTER_STDOUT_COMPONENTS,
+        stderr_components=_OOB_REGISTER_STDERR_COMPONENTS,
+    )
+    if result is None:
+        return None
+    parsed = _parse_registered(_read_window_output(
+        run, _OOB_REGISTER_STDOUT_COMPONENTS, _OOB_REGISTER_STDERR_COMPONENTS,
+    ), server)
+    if parsed is None:
+        return None
+    domain, uid = parsed
+    session = {
+        "domain": domain, "unique_id": uid, "token_map": {}, "started": _utc(),
+        "log": _repository_ref(run, log, field="log"),
+        "session_file": _repository_ref(run, state_file, field="session_file"),
+        "server": server, "network_scope": snapshot,
+    }
+    save_session(run, session)
+    return session
 
 
 def _resume_token(saved_server, current_server, token):
@@ -598,13 +609,15 @@ _EXPECTED_SERVER_UNSET = object()
 
 def resume_session(run, token=None, server=None, wait: int = 12, *,
                    expected_server=_EXPECTED_SERVER_UNSET):
-    """Re-open the run's owned session to poll delayed callbacks, returning (session, proc) with the
-    saved token_map intact — this path never rebuilds it (open_session mints a fresh session instead).
+    """Run one bounded resume/poll window and return the preserved session.
 
     `server`/`token` are the current oob config; the token is coupled to the saved server (see
     `_resume_token`). Returns None if there is no saved session, no interactsh-client, or the re-registered
     domain does not match the saved one.
     """
+    from . import store as _store
+    if type(run) is not _store.Run:
+        raise ContractError("OOB resume requires an exact repository run")
     prev = load_session(run)
     if not prev or not prev.get("session_file"):
         return None
@@ -615,33 +628,22 @@ def resume_session(run, token=None, server=None, wait: int = 12, *,
     if not shutil.which("interactsh-client"):
         return None
     from . import revision as _revision
-    repository_run = all(hasattr(run, name) for name in ("dir", "project_dir", "run_id", "artifact_claim"))
-    if repository_run:
-        disposition, why = _revision.base_disposition(run.dir)
-        old_session = resolve_session_ref(run, prev["session_file"], field="session_file")
-        old_log = resolve_session_ref(run, prev.get("log") or "", field="log")
-    else:
-        # Narrow compatibility for lightweight argv-only adapters/tests.  Real
-        # repository callers always take the strict branch above.
-        disposition, why = "live", ""
-        old_session = Path(prev["session_file"])
-        old_log = Path(prev.get("log") or "")
+    disposition, why = _revision.base_disposition(run.dir)
+    old_session = resolve_session_ref(run, prev["session_file"], field="session_file")
+    old_log = resolve_session_ref(run, prev.get("log") or "", field="log")
     if disposition in ("finalizing", "unknown"):
         from .revision import RevisionError
         raise RevisionError(
             f"{run.dir}: {why} — refusing to resume OOB acquisition against it",
             retryable=True,
         )
-    claims = ExitStack()
-    spawn_owner: dict = {}
     if disposition == "live":
-        # The original session remains the live candidate.  Claims cover the
-        # complete interval in which an external process owns its two names.
-        if repository_run:
-            claims.enter_context(run.artifact_claim())
-            claims.enter_context(run.artifact_claim())
         log, session_file = old_log, old_session
         session = dict(prev)
+        scope_context = nullcontext()
+        managed_outputs = True
+        stdout_components = _OOB_POLL_STDOUT_COMPONENTS
+        stderr_components = _OOB_POLL_STDERR_COMPONENTS
     else:
         # A sealed base is never handed back to a mutable client.  Both files
         # are copied into one unique revision candidate before launch.
@@ -651,69 +653,38 @@ def resume_session(run, token=None, server=None, wait: int = 12, *,
         session["log"] = _repository_ref(run, log, field="log")
         session["session_file"] = _repository_ref(run, session_file, field="session_file")
         session["revision_candidate"] = candidate.name
-    cmd = ["interactsh-client", "-duc", "-json", "-o", str(log),
-           "-session-file", str(session_file)]
-    srv = ",".join(_server_hosts(prev.get("server"))) if prev.get("server") else ""   # bare domains for -server
-    if srv:
-        cmd += ["-server", srv]
+        scope_context = _candidate_network_scope(
+            run, log.parent, prev.get("network_scope"),
+        )
+        managed_outputs = False
+        stdout_components = stderr_components = ()
     eff_token = _resume_token(prev.get("server"), server, token)
-    if eff_token:
-        config = claims.enter_context(
-            secrets.private_tool_config("interactsh", {"token": eff_token}),
+    with scope_context:
+        result = _run_client_window(
+            run, log=log, session_file=session_file,
+            server=prev.get("server"), token=eff_token, wait=wait,
+            seed_prior=True, managed_outputs=managed_outputs,
+            stdout_components=stdout_components,
+            stderr_components=stderr_components,
         )
-        cmd += ["-config", str(config)]
-    proc = None
-    try:
-        identity_directory = log.parent if disposition == "sealed" else None
-        admitted_cmd, admitted_env = _prepare_client_launch(
-            run, cmd, lifetime=claims, record_directory=identity_directory,
-        )
-        spawn_cwd = run.dir if repository_run else log.parent
-        proc = _spawn_client(spawn_owner, claims, admitted_cmd, admitted_env, cwd=spawn_cwd)
-        parsed = _await_register(proc, prev.get("server"), wait)
+    if result is None:
+        return None
+    if disposition == "live":
+        parsed = _parse_registered(_read_window_output(
+            run, _OOB_POLL_STDOUT_COMPONENTS, _OOB_POLL_STDERR_COMPONENTS,
+        ), prev.get("server"))
         if parsed is None or parsed[0] != prev.get("domain"):
-            close_session(proc)
             return None
-        return session, proc
-    except BaseException:
-        proc = proc or spawn_owner.get("proc")
-        if proc is None or spawn_owner.get("constructor_settled"):
-            claims.close()
-        elif proc is not None:
-            close_session(proc)
-        raise
-
-
-def close_session(proc) -> None:
-    """Settle process, streams, and private claims while preserving cleanup-time cancellation."""
-    faults: list[BaseException] = []
-    try:
-        # interactsh-client writes its resumable session from its SIGINT
-        # handler.  Keep the runner's normal bounded SIGKILL/reap fallback.
-        runner.terminate_group(proc, graceful_signal=signal.SIGINT)
-    except BaseException as exc:
-        faults.append(exc)
-    try:
-        if getattr(proc, "stdout", None):
-            proc.stdout.close()
-    except BaseException as exc:
-        faults.append(exc)
-    claims = getattr(proc, "_quarry_oob_claims", None)
-    if claims is not None:
-        try:
-            claims.close()
-        except BaseException as exc:
-            faults.append(exc)
-        finally:
-            try:
-                delattr(proc, "_quarry_oob_claims")
-            except (AttributeError, TypeError):
-                pass
-    cancellation = next((fault for fault in faults if not isinstance(fault, Exception)), None)
-    if cancellation is not None:
-        raise cancellation.with_traceback(cancellation.__traceback__)
-    if faults:
-        raise faults[0].with_traceback(faults[0].__traceback__)
+    else:
+        identity = result.meta.get("runtime_identity")
+        if type(identity) is not dict:
+            raise ContractError("sealed OOB resume lacks runtime identity evidence")
+        privfs.write_private(
+            log.parent / f"runtime-identity-{os.urandom(16).hex()}.json",
+            json.dumps(identity, sort_keys=True, separators=(",", ":"),
+                       ensure_ascii=False) + "\n",
+        )
+    return session
 
 
 def correlate(rows: list[dict], session: dict) -> list[dict]:

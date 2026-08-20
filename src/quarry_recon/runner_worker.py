@@ -665,6 +665,26 @@ class _ParkedLauncher:
             raise RuntimeError("launcher_wait_invalid")
         return self._finish_wait_result(*self._wait_result)
 
+    def send_deadline_sigint(self) -> None:
+        """Request the private graceful deadline disposition without reaping.
+
+        The stream owner remains the exclusive reaper and keeps draining until
+        its fixed outer settlement deadline.  That owner falls back to
+        ``abort_and_reap`` if this request does not settle the launcher.
+        """
+        if self._reaped:
+            return
+        try:
+            os.killpg(self.pgid, signal.SIGINT)
+        except ProcessLookupError:
+            # A concurrent leader exit is reconciled by the stream owner.  Do
+            # not retry a numeric identity after its process group is gone.
+            pass
+        except OSError:
+            # Delivery is ambiguous for every other failure.  Let the stream
+            # owner take its exception path, SIGKILL, and exactly reap.
+            raise
+
 
 class _PreparedAbortOwner:
     """Stable cleanup root spanning allocation, fork and transaction return."""
@@ -1033,6 +1053,7 @@ def _configure_network_broker(request: WorkerRequest, launcher) -> WorkerRequest
     launcher._network_effect_fence = effect_fence
     child_request = request
     proxy_flags = None
+    proxy_environment = False
     if (policy.source_id == "crawl.katana_standard"
             and policy.transport_profile == "target-http-proxy"):
         proxy_flags = ("-proxy",)
@@ -1047,10 +1068,18 @@ def _configure_network_broker(request: WorkerRequest, launcher) -> WorkerRequest
         # scheme it forces DNS-over-TCP. The pinned proxy owns both the
         # DNS and raw-TCP lanes, so the tracee has no direct resolver door.
         proxy_flags = ("-p", "-pi")
-    if proxy_flags is not None:
+    elif (policy.source_id == "params.oob_control"
+          and policy.transport_profile == "oob-control-proxy"):
+        proxy_environment = True
+    if proxy_flags is not None or proxy_environment:
         if any(value.split("=", 1)[0] in _RUNNER_PROXY_FLAGS
                for value in request.argv):
             raise RuntimeError("network_proxy_caller_argument_forbidden")
+        if (proxy_environment
+                and {"HTTP_PROXY", "HTTPS_PROXY"}.intersection(
+                    dict(request.environment),
+                )):
+            raise RuntimeError("network_proxy_caller_environment_forbidden")
         session_deadline = (
             time.monotonic() + float(request.timeout) + _BROKER_BOOTSTRAP_SECONDS
             if request.timeout else float((1 << 53) - 1)
@@ -1064,15 +1093,23 @@ def _configure_network_broker(request: WorkerRequest, launcher) -> WorkerRequest
         host, port = proxy.endpoint
         if host != "127.0.0.1":
             raise RuntimeError("network_proxy_endpoint_invalid")
-        child_request = dataclasses.replace(
-            request,
-            argv=request.argv + (
-                proxy_flags[0], f"socks5://127.0.0.1:{port}"
-                if policy.transport_profile == "nuclei-authorized-http"
-                else f"http://127.0.0.1:{port}",
-                *proxy_flags[1:],
-            ),
-        )
+        endpoint = f"http://127.0.0.1:{port}"
+        if proxy_environment:
+            environment = dict(request.environment)
+            environment.update({"HTTP_PROXY": endpoint, "HTTPS_PROXY": endpoint})
+            child_request = dataclasses.replace(
+                request, environment=tuple(sorted(environment.items())),
+            )
+        else:
+            child_request = dataclasses.replace(
+                request,
+                argv=request.argv + (
+                    proxy_flags[0], f"socks5://127.0.0.1:{port}"
+                    if policy.transport_profile == "nuclei-authorized-http"
+                    else endpoint,
+                    *proxy_flags[1:],
+                ),
+            )
 
     def bootstrap(*, deadline, clock) -> None:
         now = float(clock())
