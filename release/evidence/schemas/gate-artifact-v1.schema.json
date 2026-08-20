@@ -18,7 +18,8 @@
     {"$ref": "#/$defs/synthetic_corpus_disclosure_attestation"},
     {"$ref": "#/$defs/aggregator_conformance_report"},
     {"$ref": "#/$defs/h0_test_report"},
-    {"$ref": "#/$defs/h0_isolation_self_test"}
+    {"$ref": "#/$defs/h0_isolation_self_test"},
+    {"$ref": "#/$defs/schema_validation_report"}
   ],
   "properties": {
     "artifact_type": {"$ref": "#/$defs/token"},
@@ -39,11 +40,14 @@
     "derivation_tree_digests": {"items": {"$ref": "#/$defs/digest"}, "maxItems": 2, "minItems": 2, "type": "array"},
     "dependency_graph_digest": {"$ref": "#/$defs/digest"},
     "environment": {"$ref": "#/$defs/environment"},
+    "evidence_finished_at": {"$ref": "#/$defs/text"},
     "evidence_instance_id": {"$ref": "#/$defs/token"},
+    "evidence_started_at": {"$ref": "#/$defs/text"},
     "exit_code": {"type": "integer"},
     "files": {"items": {"$ref": "#/$defs/install_file"}, "type": "array"},
     "finished_at": {"$ref": "#/$defs/text"},
     "fixture_digest": {"$ref": "#/$defs/digest"},
+    "fixture_manifest_digest": {"$ref": "#/$defs/digest"},
     "fixture_schema_digest": {"$ref": "#/$defs/digest"},
     "gate_id": {"$ref": "#/$defs/gate"},
     "gate_evidence_counts": {"$ref": "#/$defs/conformance_counts"},
@@ -52,6 +56,7 @@
     "install_prefix": {"$ref": "#/$defs/absolute_path"},
     "invocation_cwd": {"$ref": "#/$defs/absolute_path"},
     "instances": {"items": {"type": "object"}, "type": "array"},
+    "legacy_migration": {"$ref": "#/$defs/schema_validation_legacy_migration"},
     "materials": {"items": {"$ref": "#/$defs/named_digest"}, "type": "array"},
     "measurements": {"items": {"$ref": "#/$defs/measurement"}, "type": "array"},
     "manifest_digest": {"$ref": "#/$defs/digest"},
@@ -60,10 +65,12 @@
     "package": {"$ref": "#/$defs/package"},
     "raw_trials_digest": {"$ref": "#/$defs/digest"},
     "records": {"items": {"$ref": "#/$defs/machine_record"}, "minItems": 1, "type": "array"},
+    "registry_digest": {"$ref": "#/$defs/digest"},
     "release": {"const": "0.3.10"},
     "resource_limits_observed": {"$ref": "#/$defs/resources"},
     "runs": {"items": {"$ref": "#/$defs/h0_run"}, "type": "array"},
     "schema_version": {"const": "quarry.gate-artifact.v1"},
+    "outcomes": {"items": {"$ref": "#/$defs/schema_validation_outcome"}, "type": "array"},
     "subjects": {"items": {"type": "object"}, "type": "array"},
     "source_wheel": {"$ref": "#/$defs/package_install_wheel"},
     "started_at": {"$ref": "#/$defs/text"},
@@ -350,6 +357,24 @@
       "additionalProperties": false,
       "properties": {"artifact_type": {"const": "sbom"}, "candidate_identity_digest": {"$ref": "#/$defs/digest"}, "components": {"items": {"$ref": "#/$defs/component"}, "minItems": 1, "type": "array", "uniqueItems": true}, "dependency_graph_digest": {"$ref": "#/$defs/digest"}, "gate_id": {"const": "C-SBOM"}, "package": {"$ref": "#/$defs/package"}, "release": {"const": "0.3.10"}, "schema_version": {"const": "quarry.gate-artifact.v1"}},
       "required": ["artifact_type", "candidate_identity_digest", "components", "dependency_graph_digest", "gate_id", "package", "release", "schema_version"],
+      "type": "object"
+    },
+    "schema_validation_outcome": {
+      "additionalProperties": false,
+      "properties": {"accept": {"const": "pass"}, "fixture_digest": {"$ref": "#/$defs/digest"}, "malformed": {"const": "reject"}, "name": {"$ref": "#/$defs/token"}, "record_version": {"$ref": "#/$defs/text"}, "round_trip": {"const": "pass"}, "schema_digest": {"$ref": "#/$defs/digest"}, "unknown_member": {"const": "reject"}, "unknown_version": {"const": "reject"}},
+      "required": ["accept", "fixture_digest", "malformed", "name", "record_version", "round_trip", "schema_digest", "unknown_member", "unknown_version"],
+      "type": "object"
+    },
+    "schema_validation_legacy_migration": {
+      "additionalProperties": false,
+      "properties": {"disposition": {"const": "no-supported-legacy-fixtures"}, "supported_legacy_migrations": {"maxItems": 0, "type": "array"}},
+      "required": ["disposition", "supported_legacy_migrations"],
+      "type": "object"
+    },
+    "schema_validation_report": {
+      "additionalProperties": false,
+      "properties": {"artifact_type": {"const": "schema-validation-report"}, "candidate_identity_digest": {"$ref": "#/$defs/digest"}, "environment": {"$ref": "#/$defs/environment"}, "evidence_finished_at": {"$ref": "#/$defs/text"}, "evidence_instance_id": {"$ref": "#/$defs/token"}, "evidence_started_at": {"$ref": "#/$defs/text"}, "fixture_manifest_digest": {"$ref": "#/$defs/digest"}, "gate_id": {"const": "B-SCHEMA"}, "legacy_migration": {"$ref": "#/$defs/schema_validation_legacy_migration"}, "outcomes": {"items": {"$ref": "#/$defs/schema_validation_outcome"}, "minItems": 1, "type": "array"}, "registry_digest": {"$ref": "#/$defs/digest"}, "release": {"const": "0.3.10"}, "schema_version": {"const": "quarry.gate-artifact.v1"}},
+      "required": ["artifact_type", "candidate_identity_digest", "environment", "evidence_finished_at", "evidence_instance_id", "evidence_started_at", "fixture_manifest_digest", "gate_id", "legacy_migration", "outcomes", "registry_digest", "release", "schema_version"],
       "type": "object"
     },
     "synthetic_corpus_disclosure_attestation": {

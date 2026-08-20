@@ -432,6 +432,44 @@ def _supporting_bodies(
         bodies["threshold-reconciliation"] = contracts.canonical_json_line(thresholds)
     elif gate_id == "A-SUPPORT":
         bodies["support-reconciliation"] = contracts.canonical_json_line(support)
+    elif gate_id == "B-SCHEMA":
+        registry_body = (ROOT / evidence.REGISTRY_PATH).read_bytes()
+        fixture_manifest_body = (ROOT / contracts.SCHEMA_VALIDATION_FIXTURE_MANIFEST_PATH).read_bytes()
+        outcomes = []
+        registry = evidence._validate_schema_registry(evidence.load_json_bytes(registry_body))
+        for registered in registry["schemas"]:
+            name = registered["name"]
+            fixture_path = contracts.SCHEMA_VALIDATION_FIXTURE_PATHS[name]
+            outcomes.append({
+                "accept": "pass",
+                "fixture_digest": contracts.raw_sha256((ROOT / fixture_path).read_bytes()),
+                "malformed": "reject",
+                "name": name,
+                "record_version": registered["record_version"],
+                "round_trip": "pass",
+                "schema_digest": contracts.raw_sha256((ROOT / evidence.SCHEMA_PATHS[name]).read_bytes()),
+                "unknown_member": "reject",
+                "unknown_version": "reject",
+            })
+        instance = evidence_instances[0]
+        bodies["schema-validation-report"] = contracts.canonical_json_line({
+            "artifact_type": "schema-validation-report",
+            "candidate_identity_digest": evidence.canonical_digest(identity),
+            "environment": instance["environment"],
+            "evidence_finished_at": instance["finished_at"],
+            "evidence_instance_id": instance["id"],
+            "evidence_started_at": instance["started_at"],
+            "fixture_manifest_digest": contracts.raw_sha256(fixture_manifest_body),
+            "gate_id": gate_id,
+            "legacy_migration": {
+                "disposition": "no-supported-legacy-fixtures",
+                "supported_legacy_migrations": [],
+            },
+            "outcomes": outcomes,
+            "registry_digest": contracts.raw_sha256(registry_body),
+            "release": "0.3.10",
+            "schema_version": contracts.GATE_ARTIFACT_SCHEMA,
+        })
     elif gate_id == "B-HERMETIC-ALL":
         h0_environments = [
             copy.deepcopy(instance["environment"])
@@ -1001,9 +1039,16 @@ def _ready_contracts(
 
 
 def _identity(scope: dict, policy: dict) -> dict:
+    scope_digest_by_path = {
+        row["path"]: row["digest"] for row in scope["input_bindings"]
+    }
     inputs = []
     for index, (name, path) in enumerate(sorted(evidence.DEFAULT_IDENTITY_INPUTS.items())):
-        inputs.append({"digest": _digest(format(index % 16, "x")), "name": name, "path": path})
+        inputs.append({
+            "digest": scope_digest_by_path.get(path, _digest(format(index % 16, "x"))),
+            "name": name,
+            "path": path,
+        })
     inputs.extend(copy.deepcopy(scope["input_bindings"]))
     inputs.extend([
         {
@@ -1598,7 +1643,7 @@ class TestCommittedContracts:
             "benchmark_baseline", "benchmark_trials", "benchmark_invalidations",
             "benchmark_report", "sbom", "provenance", "publication_subjects",
             "synthetic_corpus_disclosure_attestation", "aggregator_conformance_report",
-            "h0_test_report", "h0_isolation_self_test",
+            "h0_test_report", "h0_isolation_self_test", "schema_validation_report",
         ]
         discriminators = []
         for name in variant_names:
@@ -1825,7 +1870,7 @@ class TestIncompleteSemanticRegistry:
             set(contracts.RESOURCE_SEMANTIC_GATES)
             | {
                 "A-IDENTITY", "A-EVIDENCE-SCHEMA", "A-TAXONOMY", "A-CORPUS", "A-THRESHOLDS", "A-SUPPORT",
-                "B-HERMETIC-ALL",
+                "B-HERMETIC-ALL", "B-SCHEMA",
                 "C-PACKAGE-BUILD", "C-PACKAGE-INSTALL", "C-NETWORK-BOUNDARY", "C-NET-DENY",
                 *contracts.V310_05_SEMANTIC_GATES,
             }
@@ -1834,9 +1879,85 @@ class TestIncompleteSemanticRegistry:
         arguments = _scenario(tmp_path)
         with pytest.raises(
             evidence.EvidenceError,
-            match="B-SCHEMA has no registered obligation-specific semantic verifier",
+            match="B-MANIFEST has no registered obligation-specific semantic verifier",
         ):
             contracts.aggregate_records(**arguments)
+
+
+class TestSchemaValidationSemanticEvidence:
+    def test_gate_artifact_schema_and_manual_schema_report_contract_match(self):
+        schema = json.loads((ROOT / "release/evidence/schemas/gate-artifact-v1.schema.json").read_text())
+        report = schema["$defs"]["schema_validation_report"]
+        outcome = schema["$defs"]["schema_validation_outcome"]
+        assert set(report["required"]) == {
+            "artifact_type", "candidate_identity_digest", "environment", "evidence_finished_at",
+            "evidence_instance_id", "evidence_started_at", "fixture_manifest_digest", "gate_id",
+            "legacy_migration", "outcomes", "registry_digest", "release", "schema_version",
+        }
+        assert set(outcome["required"]) == {
+            "accept", "fixture_digest", "malformed", "name", "record_version", "round_trip",
+            "schema_digest", "unknown_member", "unknown_version",
+        }
+        assert report["properties"]["gate_id"] == {"const": "B-SCHEMA"}
+        assert schema["$defs"]["schema_validation_legacy_migration"] == {
+            "additionalProperties": False,
+            "properties": {
+                "disposition": {"const": "no-supported-legacy-fixtures"},
+                "supported_legacy_migrations": {"maxItems": 0, "type": "array"},
+            },
+            "required": ["disposition", "supported_legacy_migrations"],
+            "type": "object",
+        }
+
+    @staticmethod
+    def _case(tmp_path):
+        arguments = _scenario(tmp_path)
+        gate = _gate(arguments, "B-SCHEMA")
+        bodies = {}
+        for row in arguments["artifact_index"]["artifacts"]:
+            if row["gate_id"] == "B-SCHEMA":
+                bodies[row["name"]] = (arguments["artifact_root"] / row["path"]).read_bytes()
+        report = contracts.read_evidence_report(
+            bodies.pop("gate-evidence"), identity=arguments["identity"], gate_id="B-SCHEMA",
+        )
+        return gate, bodies, {
+            "identity": arguments["identity"], "input_bodies": arguments["input_bodies"],
+            "report": report, "scope": arguments["scope"],
+        }
+
+    def test_registered_schema_fixture_report_recomputes_exactly(self, tmp_path):
+        gate, bodies, context = self._case(tmp_path)
+        contracts._semantic_schema_validation(gate, bodies, **context)
+
+    @pytest.mark.parametrize(
+        ("mutate", "match"),
+        [
+            (lambda doc: doc.update(candidate_identity_digest=_digest("0")), "wrong candidate"),
+            (lambda doc: doc.update(evidence_instance_id="other-instance"), "exact signed H0"),
+            (lambda doc: doc["outcomes"][0].update(schema_digest=_digest("0")), "frozen schema/fixture facts"),
+            (lambda doc: doc["outcomes"].reverse(), "exact registered schema roster"),
+            (lambda doc: doc.update(fixture_manifest_digest=_digest("0")), "wrong frozen registry"),
+        ],
+    )
+    def test_candidate_h0_and_frozen_source_substitution_fail_closed(self, tmp_path, mutate, match):
+        gate, bodies, context = self._case(tmp_path)
+        document = json.loads(bodies["schema-validation-report"])
+        mutate(document)
+        bodies["schema-validation-report"] = contracts.canonical_json_line(document)
+        next(artifact for artifact in gate["artifacts"]
+             if artifact["name"] == "schema-validation-report")["digest"] = contracts.raw_sha256(
+                 bodies["schema-validation-report"]
+             )
+        with pytest.raises(evidence.EvidenceError, match=match):
+            contracts._semantic_schema_validation(gate, bodies, **context)
+
+    def test_unsigned_supporting_artifact_substitution_fails_closed(self, tmp_path):
+        gate, bodies, context = self._case(tmp_path)
+        bodies["schema-validation-report"] = contracts.canonical_json_line({
+            **json.loads(bodies["schema-validation-report"]), "registry_digest": _digest("0"),
+        })
+        with pytest.raises(evidence.EvidenceError, match="exact signed gate artifact"):
+            contracts._semantic_schema_validation(gate, bodies, **context)
 
 
 class TestH0HermeticSemanticEvidence:

@@ -426,6 +426,12 @@ MANIFEST_PATHS = {
     "support-matrix": "release/evidence/support-matrix-v1.json",
     "threshold-benchmark": "release/evidence/threshold-benchmark-v1.json",
 }
+SCHEMA_VALIDATION_FIXTURE_MANIFEST_PATH = "release/evidence/schema-validation-fixtures-v1.json"
+SCHEMA_VALIDATION_FIXTURE_PATHS = {
+    "candidate_identity": "release/evidence/schema-fixtures/candidate-identity-v1.json",
+    "gate_record": "release/evidence/schema-fixtures/gate-record-v1.json",
+    "schema_registry": "release/evidence/schema-fixtures/schema-registry-v1.json",
+}
 RUNNER_INPUT_PATHS = dict(evidence.FUTURE_RUNNER_INPUTS)
 RUN_MANIFEST_INPUT_PATHS = {
     "run-manifest-schema": "release/evidence/schemas/run-manifest-v1.schema.json",
@@ -439,6 +445,15 @@ SCOPE_INPUT_PATHS = {
     "release-contracts-tests": "tests/test_release_contracts.py",
     "release-contracts-validator": "src/quarry_recon/release_contracts.py",
     "resource-gate-report-validator": "src/quarry_recon/resource_contract.py",
+    "schema-validation-registry": evidence.REGISTRY_PATH,
+    "schema-validation-registry-schema": evidence.SCHEMA_PATHS["schema_registry"],
+    "schema-validation-candidate-identity-schema": evidence.SCHEMA_PATHS["candidate_identity"],
+    "schema-validation-gate-record-schema": evidence.SCHEMA_PATHS["gate_record"],
+    "schema-validation-fixture-manifest": SCHEMA_VALIDATION_FIXTURE_MANIFEST_PATH,
+    **{
+        f"schema-validation-fixture-{name.replace('_', '-')}": path
+        for name, path in SCHEMA_VALIDATION_FIXTURE_PATHS.items()
+    },
 }
 PRODUCTION_TRUST_POLICY_PATH = "release/evidence/trust-policy-v1.json"
 
@@ -4336,6 +4351,173 @@ def _semantic_evidence_schema(
         raise evidence.EvidenceError("aggregator conformance report gate evidence count does not reconcile")
 
 
+def _read_schema_validation_fixture_manifest(data: bytes) -> dict:
+    doc = _object(_canonical_reader(data, "schema validation fixture manifest"),
+                  "schema validation fixture manifest", {"fixtures", "release", "schema_version"})
+    if doc["schema_version"] != "quarry.schema-validation-fixtures.v1" or doc["release"] != RELEASE:
+        raise evidence.EvidenceError("schema validation fixture manifest has unsupported identity")
+    fixtures = _array(doc["fixtures"], "schema validation fixture manifest.fixtures")
+    normalized = []
+    for index, record in enumerate(fixtures):
+        item = _object(record, f"schema validation fixture manifest.fixtures[{index}]",
+                       {"name", "path"})
+        normalized.append({
+            "name": _token(item["name"], f"schema validation fixture manifest.fixtures[{index}].name"),
+            "path": _path(item["path"], f"schema validation fixture manifest.fixtures[{index}].path"),
+        })
+    _unique(normalized, "name", "schema validation fixture manifest.fixtures")
+    expected = [
+        {"name": name, "path": SCHEMA_VALIDATION_FIXTURE_PATHS[name]}
+        for name in sorted(SCHEMA_VALIDATION_FIXTURE_PATHS)
+    ]
+    if normalized != expected:
+        raise evidence.EvidenceError("schema validation fixture manifest has the wrong fixture inventory")
+    return doc
+
+
+def _schema_fixture_reader(name: str, document: object, *, identity: dict) -> dict:
+    if name == "candidate_identity":
+        return evidence.validate_candidate_identity(document)
+    if name == "gate_record":
+        return evidence.validate_gate_record(document, identity=identity)
+    if name == "schema_registry":
+        return evidence._validate_schema_registry(document)
+    raise evidence.EvidenceError("schema validation fixture names an unregistered reader")
+
+
+def _semantic_schema_validation(
+    gate: dict, bodies: Mapping[str, bytes], **context: object,
+) -> None:
+    """Recompute every registered schema fixture outcome from frozen source bytes."""
+    if gate["gate_id"] != "B-SCHEMA":  # pragma: no cover - registry invariant
+        raise evidence.EvidenceError("schema validation verifier received the wrong gate")
+    identity = context["identity"]
+    report = context["report"]
+    scope = context["scope"]
+    inputs = context["input_bodies"]
+    if not isinstance(identity, dict) or not isinstance(report, dict) or not isinstance(scope, dict) or not isinstance(inputs, Mapping):
+        raise evidence.EvidenceError("schema validation verifier requires accepted release context")
+    doc = _object(_artifact_document(bodies["schema-validation-report"], "B-SCHEMA", "schema-validation-report"),
+                  "schema validation report", {
+                      "artifact_type", "candidate_identity_digest", "evidence_finished_at",
+                      "evidence_instance_id", "evidence_started_at", "environment",
+                      "fixture_manifest_digest", "gate_id", "legacy_migration", "outcomes", "registry_digest",
+                      "release", "schema_version",
+                  })
+    if (doc["artifact_type"] != "schema-validation-report" or
+            doc["schema_version"] != GATE_ARTIFACT_SCHEMA or doc["release"] != RELEASE or
+            doc["gate_id"] != "B-SCHEMA"):
+        raise evidence.EvidenceError("schema validation report has unsupported identity")
+    if doc["candidate_identity_digest"] != evidence.canonical_digest(identity):
+        raise evidence.EvidenceError("schema validation report is bound to the wrong candidate")
+    if doc["legacy_migration"] != {
+        "disposition": "no-supported-legacy-fixtures", "supported_legacy_migrations": [],
+    }:
+        raise evidence.EvidenceError("schema validation report has an unsupported legacy-fixture disposition")
+    signed_artifact = next(
+        (artifact for artifact in gate["artifacts"] if artifact["name"] == "schema-validation-report"),
+        None,
+    )
+    if signed_artifact is None or signed_artifact["digest"] != raw_sha256(bodies["schema-validation-report"]):
+        raise evidence.EvidenceError("schema validation report is not the exact signed gate artifact")
+    evidence_started = _timestamp(doc["evidence_started_at"], "schema validation report.evidence_started_at")
+    evidence_finished = _timestamp(doc["evidence_finished_at"], "schema validation report.evidence_finished_at")
+    if not _timestamp(gate["started_at"], "B-SCHEMA gate.started_at") <= evidence_started <= evidence_finished <= _timestamp(gate["finished_at"], "B-SCHEMA gate.finished_at"):
+        raise evidence.EvidenceError("schema validation report lies outside its signed gate interval")
+    instances = report["instances"]
+    if len(instances) != 1:
+        raise evidence.EvidenceError("B-SCHEMA must bind exactly one signed H0 gate-evidence instance")
+    instance = instances[0]
+    if (doc["evidence_instance_id"] != instance["id"] or doc["environment"] != instance["environment"] or
+            doc["evidence_started_at"] != instance["started_at"] or
+            doc["evidence_finished_at"] != instance["finished_at"]):
+        raise evidence.EvidenceError("schema validation report does not bind its exact signed H0 gate-evidence instance/environment/time")
+
+    bindings = {row["name"]: row for row in scope["input_bindings"]}
+    required_inputs = {
+        "schema-validation-registry", "schema-validation-fixture-manifest",
+        "schema-validation-candidate-identity-schema", "schema-validation-gate-record-schema",
+        "schema-validation-registry-schema",
+        *{f"schema-validation-fixture-{name.replace('_', '-')}" for name in SCHEMA_VALIDATION_FIXTURE_PATHS},
+    }
+    if not required_inputs.issubset(bindings) or not required_inputs.issubset(inputs):
+        raise evidence.EvidenceError("schema validation verifier is missing a frozen registry or fixture input")
+    for name in required_inputs:
+        if raw_sha256(inputs[name]) != bindings[name]["digest"]:
+            raise evidence.EvidenceError("schema validation source bytes drift from their frozen scope binding")
+    registry_body = inputs["schema-validation-registry"]
+    fixture_manifest_body = inputs["schema-validation-fixture-manifest"]
+    if (doc["registry_digest"] != raw_sha256(registry_body) or
+            doc["fixture_manifest_digest"] != raw_sha256(fixture_manifest_body)):
+        raise evidence.EvidenceError("schema validation report names the wrong frozen registry or fixture manifest")
+    registry = evidence._validate_schema_registry(evidence.load_json_bytes(registry_body))
+    fixtures = _read_schema_validation_fixture_manifest(fixture_manifest_body)["fixtures"]
+    fixture_by_name = {row["name"]: row for row in fixtures}
+    outcomes = _array(doc["outcomes"], "schema validation report.outcomes")
+    if len(outcomes) != len(registry["schemas"]):
+        raise evidence.EvidenceError("schema validation report does not contain the exact registered schema roster")
+    if [
+        (row.get("name"), row.get("record_version")) if type(row) is dict else (None, None)
+        for row in outcomes
+    ] != [(row["name"], row["record_version"]) for row in registry["schemas"]]:
+        raise evidence.EvidenceError("schema validation report does not contain the exact registered schema roster")
+    fixture_identity: dict | None = None
+    for index, (registered, observed) in enumerate(zip(registry["schemas"], outcomes, strict=True)):
+        item = _object(observed, f"schema validation report.outcomes[{index}]", {
+            "accept", "fixture_digest", "malformed", "name", "record_version", "round_trip",
+            "schema_digest", "unknown_member", "unknown_version",
+        })
+        fixture = fixture_by_name.get(registered["name"])
+        if fixture is None:
+            raise evidence.EvidenceError("schema validation fixture manifest omits a registered schema")
+        schema_input = {
+            "candidate_identity": "schema-validation-candidate-identity-schema",
+            "gate_record": "schema-validation-gate-record-schema",
+            "schema_registry": "schema-validation-registry-schema",
+        }.get(registered["name"])
+        if schema_input is None:  # pragma: no cover - registry reader invariant
+            raise evidence.EvidenceError("schema validation report names an unsupported registered schema")
+        fixture_input = f"schema-validation-fixture-{registered['name'].replace('_', '-')}"
+        schema_body = inputs[schema_input]
+        fixture_body = inputs[fixture_input]
+        expected = {
+            "name": registered["name"], "record_version": registered["record_version"],
+            "schema_digest": raw_sha256(schema_body), "fixture_digest": raw_sha256(fixture_body),
+            "accept": "pass", "round_trip": "pass", "unknown_version": "reject",
+            "unknown_member": "reject", "malformed": "reject",
+        }
+        if item != expected:
+            raise evidence.EvidenceError("schema validation report outcome does not match frozen schema/fixture facts")
+        evidence._validate_registered_schema(
+            evidence.load_json_bytes(schema_body), name=registered["name"],
+            record_version=registered["record_version"],
+        )
+        fixture_document = _canonical_reader(fixture_body, f"schema validation fixture {registered['name']}")
+        reader_identity = fixture_identity if registered["name"] == "gate_record" else identity
+        if reader_identity is None:
+            raise evidence.EvidenceError("schema validation gate fixture precedes its candidate fixture")
+        accepted = _schema_fixture_reader(registered["name"], fixture_document, identity=reader_identity)
+        if registered["name"] == "candidate_identity":
+            fixture_identity = accepted
+        if evidence.canonical_json_bytes(accepted) != fixture_body[:-1]:
+            raise evidence.EvidenceError("schema validation fixture does not round-trip exactly")
+        unknown = dict(fixture_document)
+        unknown["schema_version"] = "quarry.unknown.v1"
+        malformed = dict(fixture_document)
+        malformed.pop("schema_version", None)
+        unknown_member = dict(fixture_document)
+        unknown_member["unexpected_member"] = None
+        for variant, label in (
+            (unknown, "unknown-version"), (unknown_member, "unknown-member"),
+            (malformed, "malformed"),
+        ):
+            try:
+                _schema_fixture_reader(registered["name"], variant, identity=reader_identity)
+            except evidence.EvidenceError:
+                continue
+            raise evidence.EvidenceError(f"schema validation {label} fixture was accepted")
+
+
 # Only obligation-owned parsers whose complete supporting graph is recomputed
 # are promoted.  In particular C-PERF-PHASE-FAIRNESS stays fail-closed until a
 # typed per-obligation roster can be reconciled with C-POLICY-TRACE.
@@ -4347,6 +4529,7 @@ SEMANTIC_VERIFIERS = MappingProxyType({
     "A-THRESHOLDS": _semantic_thresholds,
     "A-SUPPORT": _semantic_support,
     "B-HERMETIC-ALL": _semantic_h0_hermetic_all,
+    "B-SCHEMA": _semantic_schema_validation,
     "C-PACKAGE-BUILD": _semantic_package_build,
     "C-NETWORK-BOUNDARY": _semantic_network_boundary,
     "C-NET-DENY": _semantic_network_denial,

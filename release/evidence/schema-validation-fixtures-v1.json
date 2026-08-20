@@ -1,0 +1,1 @@
+{"fixtures":[{"name":"candidate_identity","path":"release/evidence/schema-fixtures/candidate-identity-v1.json"},{"name":"gate_record","path":"release/evidence/schema-fixtures/gate-record-v1.json"},{"name":"schema_registry","path":"release/evidence/schema-fixtures/schema-registry-v1.json"}],"release":"0.3.10","schema_version":"quarry.schema-validation-fixtures.v1"}
