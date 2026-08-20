@@ -1099,7 +1099,7 @@ def _attest_inherited_fds(expected_fds, *, control_fds=(),
             )
 
 
-def attest_exec_fds(*, pipe_controls=()) -> None:
+def attest_exec_fds(*, pipe_controls=(), status_fd: int | None = None) -> None:
     """Final fixed-launcher proof immediately before execve."""
     try:
         controls = tuple(pipe_controls)
@@ -1107,8 +1107,15 @@ def attest_exec_fds(*, pipe_controls=()) -> None:
         raise NetworkBrokerRefused(
             "network_broker_exec_pipe_identity_invalid",
         ) from exc
+    if status_fd is not None and (type(status_fd) is not int or status_fd < 5):
+        raise NetworkBrokerRefused(
+            "network_broker_exec_status_fd_invalid",
+        )
+    status = () if status_fd is None else (status_fd,)
     if not controls:
-        _attest_inherited_fds((0, 1, 2))
+        _attest_inherited_fds(
+            (0, 1, 2, *status), control_fds=status,
+        )
         return
     expected_records = ((3, "read"), (4, "write"))
     if (len(controls) != 2
@@ -1129,7 +1136,8 @@ def attest_exec_fds(*, pipe_controls=()) -> None:
         (4, (os.O_WRONLY, controls[1][2], controls[1][3])),
     )
     _attest_inherited_fds(
-        (0, 1, 2, 3, 4), exec_pipe_fds=inherited,
+        (0, 1, 2, 3, 4, *status), control_fds=status,
+        exec_pipe_fds=inherited,
     )
 
 

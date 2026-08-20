@@ -12,11 +12,13 @@ from __future__ import annotations
 import ctypes
 import dataclasses
 import hashlib
+import json
 import os
 import select
 import signal
 import shutil
 import stat
+import struct
 import sys
 import tempfile
 import time
@@ -62,11 +64,14 @@ from .network_broker import (
     NetworkEffectFence,
     acquire_worker_subreaper,
     acknowledge_listener,
+    attest_exec_fds,
     child_install_and_report,
     duplicate_reported_listener,
     seal_worker_identity,
     verify_listener_bootstrap,
+    reap_adopted_descendants,
 )
+from .network_cdp import PinnedCDPBridge
 from .network_proxy import PinnedBrowserProxy
 from .network_dns import TargetDNSMediator
 from .network_policy import PRIVATE_POLICY_ENV
@@ -79,6 +84,7 @@ STDOUT_FD_ENV = "QUARRY_RUNNER_STDOUT_FD"
 STDERR_FD_ENV = "QUARRY_RUNNER_STDERR_FD"
 STDIN_FD_ENV = "QUARRY_RUNNER_STDIN_FD"
 PRIVATE_REDACTIONS_ENV = "QUARRY_RUNNER_PRIVATE_REDACTIONS"
+_PRIVATE_BROWSER_LAUNCH_ENV = "QUARRY_RUNNER_BROWSER_LAUNCH"
 _PR_SET_PDEATHSIG = 1
 _EXIT_BOOTSTRAP_INVALID = 64
 _EXIT_CONTROL_FAILED = 65
@@ -93,6 +99,57 @@ _DNS_RESOLVER_FLAGS = frozenset({
     "-r", "--resolver", "-resolver", "--resolvers", "-resolvers",
     "--resolvers-trusted", "-system-resolvers", "--system-resolvers",
 })
+_GOWITNESS_WSS_FLAGS = frozenset({"--chrome-wss-url"})
+
+
+def _gowitness_browser_path(argv: tuple[str, ...]) -> tuple[tuple[str, ...], str]:
+    """Consume the one runner-admitted Chromium path from Gowitness' argv."""
+    result = [argv[0]]
+    browser_path = None
+    cursor = 1
+    while cursor < len(argv):
+        value = argv[cursor]
+        name = value.split("=", 1)[0]
+        if name in _GOWITNESS_WSS_FLAGS:
+            raise RuntimeError("network_cdp_caller_argument_forbidden")
+        if name == "--chrome-path":
+            if browser_path is not None:
+                raise RuntimeError("network_browser_path_invalid")
+            if value == "--chrome-path":
+                if cursor + 1 >= len(argv) or not argv[cursor + 1]:
+                    raise RuntimeError("network_browser_path_invalid")
+                browser_path = argv[cursor + 1]
+                cursor += 2
+            else:
+                browser_path = value.partition("=")[2]
+                cursor += 1
+            continue
+        result.append(value)
+        cursor += 1
+    if (type(browser_path) is not str or not browser_path.startswith("/")
+            or "\x00" in browser_path):
+        raise RuntimeError("network_browser_path_invalid")
+    return tuple(result), browser_path
+
+
+def _browser_argv(browser_path: str, profile: str,
+                  proxy_endpoint: tuple[str, int]) -> tuple[str, ...]:
+    host, port = proxy_endpoint
+    if host != "127.0.0.1" or type(port) is not int or not 1 <= port <= 65535:
+        raise RuntimeError("network_proxy_endpoint_invalid")
+    return (
+        browser_path, "--headless=new", "--disable-gpu", "--no-first-run",
+        "--no-default-browser-check", "--disable-background-networking",
+        "--disable-component-update", "--disable-default-apps",
+        "--disable-domain-reliability", "--disable-extensions", "--disable-sync",
+        "--metrics-recording-only", "--disable-quic", "--disable-http2",
+        "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+        "--disable-features=AsyncDns,DnsOverHttps,UseDnsHttpsSvcbAlpn,WebRtcHideLocalIpsWithMdns",
+        f"--proxy-server=http://127.0.0.1:{port}",
+        "--proxy-bypass-list=<-loopback>",
+        "--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1",
+        f"--user-data-dir={profile}", "--remote-debugging-pipe", "about:blank",
+    )
 
 
 def _strip_dns_resolver_overrides(argv: tuple[str, ...]) -> tuple[str, ...]:
@@ -462,6 +519,19 @@ def _close_child_fds_except(keep: set[int]) -> None:
             _close_quietly(fd)
 
 
+def _isolate_browser_stdio() -> None:
+    """Keep the sidecar from retaining the controller stream pipes."""
+    null_fd = os.open(
+        "/dev/null", os.O_RDWR | getattr(os, "O_CLOEXEC", 0),
+    )
+    try:
+        for fd in (0, 1, 2):
+            os.dup2(null_fd, fd, inheritable=True)
+    finally:
+        if null_fd not in {0, 1, 2}:
+            _close_quietly(null_fd)
+
+
 def _launcher_child(
     *,
     worker_pid: int,
@@ -527,6 +597,18 @@ def _execution_launcher_child(
     broker_report_write: int,
     broker_ack_read: int,
     broker_ack_write: int,
+    chrome_input_read: int,
+    bridge_input_write: int,
+    bridge_output_read: int,
+    chrome_output_write: int,
+    browser_exec_status_read: int,
+    browser_exec_status_write: int,
+    browser_report_read: int,
+    browser_report_write: int,
+    browser_ack_read: int,
+    browser_ack_write: int,
+    browser_pid_read: int,
+    browser_pid_write: int,
     inherited_fds: tuple[int, ...],
 ) -> None:
     """Park without target material, then exec one exact private request.
@@ -539,7 +621,10 @@ def _execution_launcher_child(
     """
     try:
         for fd in (release_write, stdin_write, stdout_read, stderr_read,
-                   exec_status_read, broker_report_read, broker_ack_write):
+                   exec_status_read, broker_report_read, broker_ack_write,
+                   bridge_input_write, bridge_output_read,
+                   browser_exec_status_read, browser_report_read,
+                   browser_ack_write, browser_pid_read):
             _close_quietly(fd)
         _arm_parent_death(worker_pid)
         os.setsid()
@@ -549,6 +634,9 @@ def _execution_launcher_child(
         keep = {
             release_read, stdin_read, stdout_write, stderr_write,
             exec_status_write, broker_report_write, broker_ack_read,
+            chrome_input_read, chrome_output_write,
+            browser_exec_status_write, browser_report_write,
+            browser_ack_read, browser_pid_write,
         }
         _close_child_fds_except(keep)
         os.kill(os.getpid(), signal.SIGSTOP)
@@ -571,6 +659,91 @@ def _execution_launcher_child(
                 _close_quietly(fd)
         environment = {key: value for key, value in request.environment}
         policy_raw = environment.pop(PRIVATE_POLICY_ENV, None)
+        browser_raw = environment.pop(_PRIVATE_BROWSER_LAUNCH_ENV, None)
+        environment.pop(PRIVATE_REDACTIONS_ENV, None)
+        if browser_raw is None:
+            for fd in (
+                chrome_input_read, chrome_output_write,
+                browser_exec_status_write, browser_report_write,
+                browser_ack_read, browser_pid_write,
+            ):
+                _close_quietly(fd)
+        else:
+            if policy_raw is None or request.tool != "gowitness":
+                raise RuntimeError("network_browser_launch_invalid")
+            try:
+                browser_document = json.loads(browser_raw)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError("network_browser_launch_invalid") from exc
+            if (type(browser_document) is not dict
+                    or set(browser_document) != {"argv", "environment"}
+                    or type(browser_document["argv"]) is not list
+                    or not browser_document["argv"]
+                    or any(type(value) is not str or "\x00" in value
+                           for value in browser_document["argv"])
+                    or type(browser_document["environment"]) is not dict
+                    or any(type(key) is not str or type(value) is not str
+                           or not key or "=" in key or "\x00" in key or "\x00" in value
+                           for key, value in browser_document["environment"].items())):
+                raise RuntimeError("network_browser_launch_invalid")
+            browser_argv = tuple(browser_document["argv"])
+            browser_environment = dict(browser_document["environment"])
+            parent_pid = os.getpid()
+            browser_pid = os.fork()
+            if browser_pid == 0:
+                try:
+                    for fd in (
+                        exec_status_write, broker_report_write, broker_ack_read,
+                    ):
+                        _close_quietly(fd)
+                    os.setpgid(0, 0)
+                    if os.getpgrp() != os.getpid() or os.getsid(0) != parent_pid:
+                        raise RuntimeError("network_browser_identity_invalid")
+                    runner_ipc.write_all(
+                        browser_pid_write, struct.pack("!I", os.getpid()),
+                    )
+                    _close_quietly(browser_pid_write)
+                    keep = {
+                        0, 1, 2, chrome_input_read, chrome_output_write,
+                        browser_exec_status_write, browser_report_write,
+                        browser_ack_read,
+                    }
+                    _close_child_fds_except(keep)
+                    _isolate_browser_stdio()
+                    child_install_and_report(
+                        browser_report_write, browser_ack_read, profile="browser",
+                        control_fds=(browser_exec_status_write,
+                                     chrome_input_read, chrome_output_write),
+                        deadline_monotonic=(
+                            time.monotonic() + _BROKER_BOOTSTRAP_SECONDS
+                        ),
+                    )
+                    read_identity = os.fstat(chrome_input_read)
+                    write_identity = os.fstat(chrome_output_write)
+                    os.dup2(chrome_input_read, 3, inheritable=True)
+                    os.dup2(chrome_output_write, 4, inheritable=True)
+                    for fd in (chrome_input_read, chrome_output_write):
+                        if fd not in {3, 4}:
+                            _close_quietly(fd)
+                    attest_exec_fds(pipe_controls=(
+                        (3, "read", read_identity.st_dev, read_identity.st_ino),
+                        (4, "write", write_identity.st_dev, write_identity.st_ino),
+                    ), status_fd=browser_exec_status_write)
+                    os.execve(
+                        browser_argv[0], list(browser_argv), browser_environment,
+                    )
+                except BaseException:
+                    try:
+                        os.write(browser_exec_status_write, b"\x01")
+                    except BaseException:
+                        pass
+                os._exit(127)
+            for fd in (
+                chrome_input_read, chrome_output_write,
+                browser_exec_status_write, browser_report_write,
+                browser_ack_read, browser_pid_write,
+            ):
+                _close_quietly(fd)
         if policy_raw is None:
             _close_quietly(broker_report_write)
             _close_quietly(broker_ack_read)
@@ -585,7 +758,6 @@ def _execution_launcher_child(
             )
         if request.cwd is not None:
             os.chdir(request.cwd)
-        environment.pop(PRIVATE_REDACTIONS_ENV, None)
         os.execvpe(request.argv[0], list(request.argv), environment)
     except BaseException:
         try:
@@ -624,9 +796,14 @@ class _ParkedLauncher:
         self._broker_ack_write = broker_ack_write
         self._release_callback = None
         self._network_broker_session = None
+        self._network_browser_broker_session = None
         self._network_proxy = None
+        self._network_cdp_bridge = None
         self._network_control_registry = None
         self._network_effect_fence = None
+        self._browser_pid = None
+        self._browser_pidfd = -1
+        self._browser_preexec_identity_verified = False
         self._released = False
         self._reaped = False
         self._stop_wait_state = "not_started"
@@ -772,7 +949,12 @@ class _ParkedLauncher:
         return True
 
     def _close_broker_bootstrap_fds(self) -> None:
-        for attribute in ("_broker_report_read", "_broker_ack_write"):
+        for attribute in (
+            "_broker_report_read", "_broker_ack_write",
+            "_browser_bridge_input_write", "_browser_bridge_output_read",
+            "_browser_exec_status_read", "_browser_report_read",
+            "_browser_ack_write", "_browser_pid_read",
+        ):
             fd = getattr(self, attribute, -1)
             if fd >= 0:
                 _close_quietly(fd)
@@ -807,6 +989,9 @@ class _ParkedLauncher:
             "stdin_write_fd", "stdout_read_fd", "stderr_read_fd",
             "_exec_status_read",
             "_broker_report_read", "_broker_ack_write",
+            "_browser_bridge_input_write", "_browser_bridge_output_read",
+            "_browser_exec_status_read", "_browser_report_read",
+            "_browser_ack_write", "_browser_pid_read",
         ):
             fd = getattr(self, attribute, -1)
             if fd >= 0:
@@ -902,6 +1087,18 @@ class _ExecutionLauncherOwner:
         self.broker_report_write = -1
         self.broker_ack_read = -1
         self.broker_ack_write = -1
+        self.chrome_input_read = -1
+        self.bridge_input_write = -1
+        self.bridge_output_read = -1
+        self.chrome_output_write = -1
+        self.browser_exec_status_read = -1
+        self.browser_exec_status_write = -1
+        self.browser_report_read = -1
+        self.browser_report_write = -1
+        self.browser_ack_read = -1
+        self.browser_ack_write = -1
+        self.browser_pid_read = -1
+        self.browser_pid_write = -1
         self.pid = -1
         self.launcher = None
 
@@ -910,6 +1107,9 @@ def _close_execution_child_ends(owner: _ExecutionLauncherOwner) -> None:
     for attribute in (
         "release_read", "stdin_read", "stdout_write", "stderr_write",
         "exec_status_write", "broker_report_write", "broker_ack_read",
+        "chrome_input_read", "chrome_output_write",
+        "browser_exec_status_write", "browser_report_write",
+        "browser_ack_read", "browser_pid_write",
     ):
         fd = getattr(owner, attribute)
         if fd >= 0:
@@ -929,6 +1129,12 @@ def _adopt_execution_launcher(owner: _ExecutionLauncherOwner) -> _ParkedLauncher
             broker_report_read=owner.broker_report_read,
             broker_ack_write=owner.broker_ack_write,
         )
+        owner.launcher._browser_bridge_input_write = owner.bridge_input_write
+        owner.launcher._browser_bridge_output_read = owner.bridge_output_read
+        owner.launcher._browser_exec_status_read = owner.browser_exec_status_read
+        owner.launcher._browser_report_read = owner.browser_report_read
+        owner.launcher._browser_ack_write = owner.browser_ack_write
+        owner.launcher._browser_pid_read = owner.browser_pid_read
     launcher = owner.launcher
     if launcher is not None:
         owner.release_write = -1
@@ -938,6 +1144,12 @@ def _adopt_execution_launcher(owner: _ExecutionLauncherOwner) -> _ParkedLauncher
         owner.exec_status_read = -1
         owner.broker_report_read = -1
         owner.broker_ack_write = -1
+        owner.bridge_input_write = -1
+        owner.bridge_output_read = -1
+        owner.browser_exec_status_read = -1
+        owner.browser_report_read = -1
+        owner.browser_ack_write = -1
+        owner.browser_pid_read = -1
     _close_execution_child_ends(owner)
     return launcher
 
@@ -949,6 +1161,11 @@ def _close_execution_owner_fds(owner: _ExecutionLauncherOwner) -> None:
         "exec_status_read", "exec_status_write",
         "broker_report_read", "broker_report_write",
         "broker_ack_read", "broker_ack_write",
+        "chrome_input_read", "bridge_input_write", "bridge_output_read",
+        "chrome_output_write", "browser_exec_status_read",
+        "browser_exec_status_write", "browser_report_read",
+        "browser_report_write", "browser_ack_read", "browser_ack_write",
+        "browser_pid_read", "browser_pid_write",
     ):
         fd = getattr(owner, attribute)
         if fd >= 0:
@@ -1098,7 +1315,14 @@ def _spawn_execution_launcher(
             owner.exec_status_read, owner.exec_status_write = os.pipe()
             owner.broker_report_read, owner.broker_report_write = os.pipe()
             owner.broker_ack_read, owner.broker_ack_write = os.pipe()
+            owner.chrome_input_read, owner.bridge_input_write = os.pipe()
+            owner.bridge_output_read, owner.chrome_output_write = os.pipe()
+            owner.browser_exec_status_read, owner.browser_exec_status_write = os.pipe()
+            owner.browser_report_read, owner.browser_report_write = os.pipe()
+            owner.browser_ack_read, owner.browser_ack_write = os.pipe()
+            owner.browser_pid_read, owner.browser_pid_write = os.pipe()
             os.set_inheritable(owner.exec_status_write, False)
+            os.set_inheritable(owner.browser_exec_status_write, False)
             worker_pid = os.getpid()
             owner.pid = os.fork()
             if owner.pid == 0:  # pragma: no cover - Linux integration exercises this
@@ -1118,6 +1342,18 @@ def _spawn_execution_launcher(
                     broker_report_write=owner.broker_report_write,
                     broker_ack_read=owner.broker_ack_read,
                     broker_ack_write=owner.broker_ack_write,
+                    chrome_input_read=owner.chrome_input_read,
+                    bridge_input_write=owner.bridge_input_write,
+                    bridge_output_read=owner.bridge_output_read,
+                    chrome_output_write=owner.chrome_output_write,
+                    browser_exec_status_read=owner.browser_exec_status_read,
+                    browser_exec_status_write=owner.browser_exec_status_write,
+                    browser_report_read=owner.browser_report_read,
+                    browser_report_write=owner.browser_report_write,
+                    browser_ack_read=owner.browser_ack_read,
+                    browser_ack_write=owner.browser_ack_write,
+                    browser_pid_read=owner.browser_pid_read,
+                    browser_pid_write=owner.browser_pid_write,
                     inherited_fds=inherited_fds,
                 )
             launcher = _adopt_execution_launcher(owner)
@@ -1218,7 +1454,62 @@ def _close_listener_handoff(handoff: ListenerHandoff | None) -> None:
         _close_quietly(fd)
 
 
-def _configure_network_broker(request: WorkerRequest, launcher) -> WorkerRequest:
+def _read_exact_until(fd: int, size: int, deadline: float) -> bytes:
+    body = bytearray()
+    while len(body) < size:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError("network_browser_bootstrap_timeout")
+        readable, _, _ = select.select((fd,), (), (), remaining)
+        if not readable:
+            raise RuntimeError("network_browser_bootstrap_timeout")
+        try:
+            block = os.read(fd, size - len(body))
+        except InterruptedError:
+            continue
+        if not block:
+            raise RuntimeError("network_browser_bootstrap_truncated")
+        body.extend(block)
+    return bytes(body)
+
+
+def _require_exec_eof_until(fd: int, deadline: float) -> None:
+    readable, _, _ = select.select((fd,), (), (), max(0.0, deadline - time.monotonic()))
+    if not readable:
+        raise RuntimeError("network_browser_exec_timeout")
+    if os.read(fd, 1):
+        raise RuntimeError("network_browser_exec_failed")
+
+
+def _require_eof_until(fd: int, deadline: float) -> None:
+    readable, _, _ = select.select((fd,), (), (), max(0.0, deadline - time.monotonic()))
+    if not readable or os.read(fd, 1):
+        raise RuntimeError("network_browser_bootstrap_trailing_data")
+
+
+def _verify_browser_descendant(browser_pid: int, launcher_pid: int) -> None:
+    try:
+        with open(f"/proc/{browser_pid}/stat", "rb", buffering=0) as handle:
+            stat_body = handle.read(4096)
+        close = stat_body.rfind(b")")
+        fields = stat_body[close + 2:].split()
+        parent_pid, process_group, session = map(int, fields[1:4])
+        with open(f"/proc/{browser_pid}/cgroup", "rb", buffering=0) as handle:
+            browser_cgroup = handle.read(65537)
+        with open(f"/proc/{launcher_pid}/cgroup", "rb", buffering=0) as handle:
+            launcher_cgroup = handle.read(65537)
+    except (OSError, ValueError, IndexError) as exc:
+        raise RuntimeError("network_browser_identity_invalid") from exc
+    if (close < 1 or len(fields) < 4 or parent_pid != launcher_pid
+            or process_group != browser_pid or session != launcher_pid
+            or not browser_cgroup or len(browser_cgroup) > 65536
+            or browser_cgroup != launcher_cgroup):
+        raise RuntimeError("network_browser_identity_invalid")
+
+
+def _configure_network_broker(
+    request: WorkerRequest, launcher, *, settlement_deadline: float | None,
+) -> WorkerRequest:
     """Prepare optional policy-owned transport before the launcher release.
 
     Policy parsing and any worker-owned proxy happen only after the authenticated
@@ -1226,14 +1517,32 @@ def _configure_network_broker(request: WorkerRequest, launcher) -> WorkerRequest
     callback then starts the kernel broker while the child is blocked in its
     private listener-report/ACK handshake.
     """
-    policy_raw = dict(request.environment).get(PRIVATE_POLICY_ENV)
+    request_environment = dict(request.environment)
+    if _PRIVATE_BROWSER_LAUNCH_ENV in request_environment:
+        raise RuntimeError("network_browser_launch_environment_forbidden")
+    policy_raw = request_environment.get(PRIVATE_POLICY_ENV)
     if policy_raw is None:
         return request
+
+    if type(settlement_deadline) not in {int, float, type(None)}:
+        raise RuntimeError("network_broker_settlement_deadline_invalid")
+    network_deadline = (
+        float((1 << 53) - 1)
+        if settlement_deadline is None else float(settlement_deadline)
+    )
+    if network_deadline <= time.monotonic():
+        raise RuntimeError("network_broker_settlement_deadline_invalid")
 
     policy = BrokerPolicy.from_json(policy_raw)
     if (policy.request_id != request.request_id
             or policy.tool != request.tool):
         raise RuntimeError("network_broker_policy_request_mismatch")
+
+    # GO is already authenticated, but the parked launcher has not received its
+    # release frame.  Fix orphan ownership and seal the broker before that child
+    # can fork the browser sidecar.
+    acquire_worker_subreaper()
+    seal_worker_identity()
 
     registry = ControlEndpointRegistry()
     effect_fence = NetworkEffectFence()
@@ -1244,14 +1553,10 @@ def _configure_network_broker(request: WorkerRequest, launcher) -> WorkerRequest
     # is never added to the policy JSON or derived child environment.
     dns_mediator_authentication = None
     if policy.transport_profile == "target-dns":
-        session_deadline = (
-            time.monotonic() + float(request.timeout) + _BROKER_BOOTSTRAP_SECONDS
-            if request.timeout else float((1 << 53) - 1)
-        )
         dns_mediator_authentication = os.urandom(32)
         mediator = TargetDNSMediator(
             policy, authentication=dns_mediator_authentication,
-            deadline_monotonic=session_deadline, effect_fence=effect_fence,
+            deadline_monotonic=network_deadline, effect_fence=effect_fence,
         )
         try:
             mediator.start()
@@ -1271,15 +1576,13 @@ def _configure_network_broker(request: WorkerRequest, launcher) -> WorkerRequest
             raise
     proxy_flags = None
     proxy_environment = False
+    gowitness_browser = False
     if (policy.source_id == "crawl.katana_standard"
             and policy.transport_profile == "target-http-proxy"):
         proxy_flags = ("-proxy",)
     elif (policy.source_id in {"probe.gowitness", "enrich.gowitness"}
           and policy.transport_profile == "browser-pipe-proxy"):
-        # Gowitness passes this only to its Chromium helper.  The helper's
-        # exact executable identity is authorized by the browser-pipe profile,
-        # while this runner-owned endpoint remains the only target egress door.
-        proxy_flags = ("--chrome-proxy",)
+        gowitness_browser = True
     elif policy.transport_profile == "nuclei-authorized-http":
         # Nuclei's AliveSocksProxy is also retryabledns' transport: with this
         # scheme it forces DNS-over-TCP. The pinned proxy owns both the
@@ -1288,21 +1591,46 @@ def _configure_network_broker(request: WorkerRequest, launcher) -> WorkerRequest
     elif (policy.source_id == "params.oob_control"
           and policy.transport_profile == "oob-control-proxy"):
         proxy_environment = True
-    if proxy_flags is not None or proxy_environment:
+    if proxy_flags is not None or proxy_environment or gowitness_browser:
         if any(value.split("=", 1)[0] in _RUNNER_PROXY_FLAGS
                for value in request.argv):
             raise RuntimeError("network_proxy_caller_argument_forbidden")
+        if (gowitness_browser
+                and any(value.split("=", 1)[0] in _GOWITNESS_WSS_FLAGS
+                        for value in request.argv)):
+            raise RuntimeError("network_cdp_caller_argument_forbidden")
         if (proxy_environment
                 and {"HTTP_PROXY", "HTTPS_PROXY"}.intersection(
                     dict(request.environment),
                 )):
             raise RuntimeError("network_proxy_caller_environment_forbidden")
-        session_deadline = (
-            time.monotonic() + float(request.timeout) + _BROKER_BOOTSTRAP_SECONDS
-            if request.timeout else float((1 << 53) - 1)
-        )
+        browser_directories = None
+        if gowitness_browser:
+            if len(policy.control_helpers) != 1 or len(policy.control_clients) != 1:
+                raise RuntimeError("network_browser_control_identity_invalid")
+            prepared_home = dict(request.environment).get("HOME")
+            if (type(prepared_home) is not str or not os.path.isabs(prepared_home)
+                    or not os.path.isdir(prepared_home)):
+                raise RuntimeError("network_browser_home_invalid")
+            root = tempfile.mkdtemp(prefix=".quarry-chromium-", dir=prepared_home)
+            os.chmod(root, 0o700)
+            browser_directories = {
+                "root": root,
+                "home": os.path.join(root, "home"),
+                "profile": os.path.join(root, "profile"),
+                "tmp": os.path.join(root, "tmp"),
+            }
+            for path in browser_directories.values():
+                if path != root:
+                    os.mkdir(path, 0o700)
+            policy = dataclasses.replace(
+                policy,
+                private_unix_roots=tuple(sorted({
+                    *policy.private_unix_roots, browser_directories["tmp"],
+                })),
+            )
         proxy = PinnedBrowserProxy(
-            policy, registry, deadline_monotonic=session_deadline,
+            policy, registry, deadline_monotonic=network_deadline,
             effect_fence=effect_fence,
         )
         launcher._network_proxy = proxy
@@ -1311,7 +1639,50 @@ def _configure_network_broker(request: WorkerRequest, launcher) -> WorkerRequest
         if host != "127.0.0.1":
             raise RuntimeError("network_proxy_endpoint_invalid")
         endpoint = f"http://127.0.0.1:{port}"
-        if proxy_environment:
+        if gowitness_browser:
+            controller_argv, browser_path = _gowitness_browser_path(request.argv)
+            if browser_directories is None:
+                raise RuntimeError("network_browser_launch_invalid")
+            bridge = PinnedCDPBridge(
+                policy, registry,
+                chrome_output_fd=launcher._browser_bridge_output_read,
+                chrome_input_fd=launcher._browser_bridge_input_write,
+                adapter="gowitness", controller_identity=policy.control_clients[0],
+                expected_controller_tgid=launcher.pid,
+                deadline_monotonic=network_deadline, effect_fence=effect_fence,
+            )
+            launcher._network_cdp_bridge = bridge
+            for attribute in (
+                "_browser_bridge_output_read", "_browser_bridge_input_write",
+            ):
+                fd = getattr(launcher, attribute)
+                _close_quietly(fd)
+                setattr(launcher, attribute, -1)
+            bridge.start()
+            browser_document = json.dumps(
+                {
+                    "argv": list(_browser_argv(
+                        browser_path, browser_directories["profile"], proxy.endpoint,
+                    )),
+                    "environment": {
+                        "HOME": browser_directories["home"],
+                        "TMPDIR": browser_directories["tmp"],
+                        "XDG_CACHE_HOME": os.path.join(browser_directories["home"], ".cache"),
+                        "XDG_CONFIG_HOME": os.path.join(browser_directories["home"], ".config"),
+                        "PATH": "/usr/bin:/bin",
+                        "LANG": "C.UTF-8",
+                    },
+                },
+                ensure_ascii=True, sort_keys=True, separators=(",", ":"),
+            )
+            environment = dict(request.environment)
+            environment[_PRIVATE_BROWSER_LAUNCH_ENV] = browser_document
+            child_request = dataclasses.replace(
+                request,
+                argv=controller_argv + ("--chrome-wss-url", bridge.websocket_url),
+                environment=tuple(sorted(environment.items())),
+            )
+        elif proxy_environment:
             environment = dict(request.environment)
             environment.update({"HTTP_PROXY": endpoint, "HTTPS_PROXY": endpoint})
             child_request = dataclasses.replace(
@@ -1331,7 +1702,9 @@ def _configure_network_broker(request: WorkerRequest, launcher) -> WorkerRequest
     def bootstrap(*, deadline, clock) -> None:
         now = float(clock())
         handoff = None
+        browser_handoff = None
         session = None
+        browser_session = None
         try:
             if (type(deadline) not in {int, float}
                     or float(deadline) <= now):
@@ -1339,8 +1712,33 @@ def _configure_network_broker(request: WorkerRequest, launcher) -> WorkerRequest
             # These process-wide facts must be fixed before any untrusted
             # descendant can exec.  The launcher is already parked and cannot
             # fork a grandchild before this callback ACKs its listener.
-            acquire_worker_subreaper()
-            seal_worker_identity()
+            if gowitness_browser:
+                browser_pid = struct.unpack(
+                    "!I", _read_exact_until(
+                        launcher._browser_pid_read, 4, float(deadline),
+                    ),
+                )[0]
+                if not 1 <= browser_pid < MAX_PID:
+                    raise RuntimeError("network_browser_pid_invalid")
+                _require_eof_until(launcher._browser_pid_read, float(deadline))
+                launcher._browser_pid = browser_pid
+                _verify_browser_descendant(browser_pid, launcher.pid)
+                launcher._browser_preexec_identity_verified = True
+                launcher._browser_pidfd = os.pidfd_open(browser_pid, 0)
+                browser_handoff = duplicate_reported_listener(
+                    browser_pid, launcher._browser_report_read,
+                    expected_profile="browser", deadline_monotonic=float(deadline),
+                    abort_child_on_failure=False,
+                )
+                try:
+                    verify_listener_bootstrap(
+                        browser_handoff, launcher._browser_report_read,
+                        deadline_monotonic=float(deadline),
+                        abort_child_on_failure=False,
+                    )
+                except BaseException:
+                    browser_handoff = None
+                    raise
             handoff = duplicate_reported_listener(
                 launcher.pid, launcher._broker_report_read,
                 expected_profile="standard", deadline_monotonic=float(deadline),
@@ -1357,18 +1755,37 @@ def _configure_network_broker(request: WorkerRequest, launcher) -> WorkerRequest
                 # on failure; do not retry their numeric values in finally.
                 handoff = None
                 raise
-            session_deadline = (
-                now + float(request.timeout) + _BROKER_BOOTSTRAP_SECONDS
-                if request.timeout else float((1 << 53) - 1)
-            )
             session = NetworkBrokerSession(
                 handoff, policy, expected_profile="standard",
-                deadline_monotonic=session_deadline,
+                deadline_monotonic=network_deadline,
                 control_registry=registry,
                 effect_fence=effect_fence,
                 dns_mediator_authentication=dns_mediator_authentication,
             )
+            if gowitness_browser:
+                browser_session = NetworkBrokerSession(
+                    browser_handoff, policy, expected_profile="browser",
+                    deadline_monotonic=network_deadline,
+                    control_registry=registry, effect_fence=effect_fence,
+                )
+                browser_session.start()
             session.start()
+            if browser_session is not None:
+                browser_pidfd = browser_handoff.child_pidfd
+                launcher._network_browser_broker_session = browser_session
+                browser_handoff = None
+                acknowledge_listener(
+                    launcher._browser_ack_write,
+                    child_pidfd=browser_pidfd,
+                    deadline_monotonic=float(deadline),
+                )
+                launcher._browser_ack_write = -1
+                _require_exec_eof_until(
+                    launcher._browser_exec_status_read, float(deadline),
+                )
+                _close_quietly(launcher._browser_exec_status_read)
+                launcher._browser_exec_status_read = -1
+                browser_session = None
             child_pidfd = handoff.child_pidfd
             launcher._network_broker_session = session
             handoff = None
@@ -1388,19 +1805,38 @@ def _configure_network_broker(request: WorkerRequest, launcher) -> WorkerRequest
             if launcher._broker_report_read >= 0:
                 _close_quietly(launcher._broker_report_read)
                 launcher._broker_report_read = -1
+            if getattr(launcher, "_browser_report_read", -1) >= 0:
+                _close_quietly(launcher._browser_report_read)
+                launcher._browser_report_read = -1
+            if getattr(launcher, "_browser_pid_read", -1) >= 0:
+                _close_quietly(launcher._browser_pid_read)
+                launcher._browser_pid_read = -1
             if session is not None:
                 session.stop()
                 if launcher._network_broker_session is session:
                     launcher._network_broker_session = None
+            if browser_session is not None:
+                browser_session.stop()
+                if launcher._network_browser_broker_session is browser_session:
+                    launcher._network_browser_broker_session = None
             if handoff is not None:
                 _close_listener_handoff(handoff)
+            if browser_handoff is not None:
+                _close_listener_handoff(browser_handoff)
 
     launcher._release_callback = bootstrap
     return child_request
 
 
-def _settle_network_broker(launcher) -> dict | None:
+def _settle_network_broker(launcher, *, deadline_monotonic: float | None = None) -> dict | None:
     """Settle proxy and listener only after the direct launcher is terminal."""
+    browser_session = getattr(launcher, "_network_browser_broker_session", None)
+    bridge = getattr(launcher, "_network_cdp_bridge", None)
+    gowitness_state = getattr(launcher, "_network_gowitness_state", None)
+    if browser_session is not None or bridge is not None or gowitness_state is not None:
+        return _settle_gowitness_network(
+            launcher, deadline_monotonic=deadline_monotonic,
+        )
     proxy = getattr(launcher, "_network_proxy", None)
     session = getattr(launcher, "_network_broker_session", None)
     launcher._network_proxy = None
@@ -1450,7 +1886,10 @@ def _settle_network_broker(launcher) -> dict | None:
         return None if mediator_summary is None else {"dns_mediator": mediator_summary}
     try:
         session.settle_after_tasks(
-            deadline_monotonic=time.monotonic() + _BROKER_BOOTSTRAP_SECONDS,
+            deadline_monotonic=(
+                float((1 << 53) - 1)
+                if deadline_monotonic is None else float(deadline_monotonic)
+            ),
         )
         summary = session.summary()
         if type(summary) is not dict or summary.get("complete") is not True:
@@ -1477,6 +1916,252 @@ def _settle_network_broker(launcher) -> dict | None:
                 and not isinstance(cancel_fault, Exception)):
             raise cancel_fault
         raise
+
+
+def _settle_gowitness_network(launcher, *, deadline_monotonic: float | None) -> dict:
+    """Settle controller, CDP, and the separately grouped browser in order."""
+    deadline = (
+        float((1 << 53) - 1)
+        if deadline_monotonic is None else float(deadline_monotonic)
+    )
+    state = getattr(launcher, "_network_gowitness_state", None)
+    if state is None:
+        state = {
+            "controller_summary": None, "controller_eof": False,
+            "browser_killed": False,
+            "adopted_killed": False, "browser_summary": None,
+            "bridge_summary": None, "proxy_summary": None,
+            "reaped": None, "fence_cancelled": False,
+            "stopped": set(), "cleanup_required": False,
+            "cleanup_complete": False, "complete_summary": None,
+        }
+        launcher._network_gowitness_state = state
+    if state["complete_summary"] is not None:
+        return state["complete_summary"]
+    if state["cleanup_complete"]:
+        return {"complete": False, "cleanup_complete": True}
+    controller = launcher._network_broker_session
+    browser = launcher._network_browser_broker_session
+    bridge = launcher._network_cdp_bridge
+    proxy = launcher._network_proxy
+    fence = launcher._network_effect_fence
+    try:
+        if state["cleanup_required"]:
+            _cleanup_gowitness_network(launcher, state, deadline)
+            return {"complete": False, "cleanup_complete": True}
+        if any(value is None for value in (controller, browser, bridge, proxy, fence)):
+            raise NetworkBrokerRefused("network_browser_settlement_authority_invalid")
+        if state["controller_summary"] is None:
+            controller.settle_after_tasks(deadline_monotonic=deadline)
+            observed = controller.summary()
+            if observed.get("complete") is not True:
+                raise NetworkBrokerRefused("network_broker_settlement_incomplete")
+            state["controller_summary"] = observed
+        if not state["controller_eof"]:
+            while time.monotonic() < deadline:
+                cdp_live = bridge.summary()
+                if (cdp_live.get("settled_connections") == 1
+                        and cdp_live.get("active_client") is False):
+                    state["controller_eof"] = True
+                    break
+                time.sleep(0.01)
+            if not state["controller_eof"]:
+                raise NetworkBrokerRefused("network_cdp_controller_eof_unproved")
+        _kill_browser_authority(launcher, state)
+        if not state["adopted_killed"]:
+            _kill_adopted_browser_descendants(browser, deadline)
+            state["adopted_killed"] = True
+        if state["browser_summary"] is None:
+            browser.settle_after_tasks(deadline_monotonic=deadline)
+            observed = browser.summary()
+            if observed.get("complete") is not True:
+                raise NetworkBrokerRefused("network_browser_settlement_incomplete")
+            state["browser_summary"] = observed
+        if state["bridge_summary"] is None:
+            bridge.stop()
+            observed = bridge.summary()
+            if observed.get("complete") is not True:
+                raise NetworkBrokerRefused("network_cdp_settlement_incomplete")
+            state["bridge_summary"] = observed
+        if state["proxy_summary"] is None:
+            proxy.stop()
+            observed = proxy.summary()
+            if observed.get("complete") is not True:
+                raise NetworkBrokerRefused("network_proxy_settlement_incomplete")
+            state["proxy_summary"] = observed
+        if state["reaped"] is None:
+            state["reaped"] = reap_adopted_descendants(
+                launcher_reaped=True, deadline_monotonic=deadline,
+            )
+        summary = dict(state["controller_summary"])
+        summary.update({
+            "browser_broker": state["browser_summary"],
+            "cdp_bridge": state["bridge_summary"],
+            "browser_proxy": state["proxy_summary"],
+            "adopted_descendants": len(state["reaped"]),
+        })
+        launcher._network_broker_session = None
+        launcher._network_browser_broker_session = None
+        launcher._network_cdp_bridge = None
+        launcher._network_proxy = None
+        state["complete_summary"] = summary
+        return summary
+    except BaseException as exc:
+        primary = exc
+        state["cleanup_required"] = True
+        try:
+            _cleanup_gowitness_network(launcher, state, deadline)
+        except BaseException as cleanup_fault:
+            if not isinstance(primary, Exception):
+                raise primary
+            if not isinstance(cleanup_fault, Exception):
+                raise cleanup_fault
+            raise cleanup_fault
+        raise primary
+
+
+def _kill_browser_authority(launcher, state: dict) -> None:
+    """Kill the exact browser group, then retire its pidfd without stale reuse."""
+    if state["browser_killed"]:
+        return
+    browser_pid = getattr(launcher, "_browser_pid", None)
+    browser_pidfd = getattr(launcher, "_browser_pidfd", -1)
+    if browser_pid is None and browser_pidfd < 0:
+        state["browser_killed"] = True
+        return
+    if type(browser_pid) is not int or not 1 <= browser_pid < MAX_PID:
+        raise NetworkBrokerRefused("network_browser_identity_invalid")
+    if type(browser_pidfd) is not int or browser_pidfd < 0:
+        # The browser reports its PID and creates its own PGID before waiting
+        # for the listener ACK.  Its exact PPid/session/PGID/cgroup identity is
+        # durably recorded before pidfd_open, so failure of that open can still
+        # retire the verified pre-exec PGID after bootstrap FDs are closed.
+        if getattr(launcher, "_browser_preexec_identity_verified", False) is not True:
+            raise NetworkBrokerRefused("network_browser_identity_invalid")
+        try:
+            os.killpg(browser_pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        state["browser_killed"] = True
+        return
+    try:
+        signal.pidfd_send_signal(browser_pidfd, 0)
+    except ProcessLookupError:
+        pass
+    else:
+        try:
+            os.killpg(browser_pid, signal.SIGKILL)
+        except ProcessLookupError:
+            signal.pidfd_send_signal(browser_pidfd, signal.SIGKILL)
+    state["browser_killed"] = True
+    # Commit retirement before close: cancellation may make close ambiguous,
+    # but no retry may ever target a subsequently reused numeric descriptor.
+    launcher._browser_pidfd = -1
+    os.close(browser_pidfd)
+
+
+def _cleanup_gowitness_network(launcher, state: dict, deadline: float) -> None:
+    """Monotonically finish a failed or cancelled sidecar transaction."""
+    fence = getattr(launcher, "_network_effect_fence", None)
+    if fence is not None and not state["fence_cancelled"]:
+        fence.cancel()
+        state["fence_cancelled"] = True
+    _kill_browser_authority(launcher, state)
+    browser = getattr(launcher, "_network_browser_broker_session", None)
+    if state["reaped"] is None:
+        state["reaped"] = _kill_and_reap_adopted_children(deadline)
+        state["adopted_killed"] = True
+    for name, component in (
+        ("controller", getattr(launcher, "_network_broker_session", None)),
+        ("browser", browser),
+        ("bridge", getattr(launcher, "_network_cdp_bridge", None)),
+        ("proxy", getattr(launcher, "_network_proxy", None)),
+    ):
+        if component is not None and name not in state["stopped"]:
+            component.stop()
+            state["stopped"].add(name)
+    launcher._network_broker_session = None
+    launcher._network_browser_broker_session = None
+    launcher._network_cdp_bridge = None
+    launcher._network_proxy = None
+    state["cleanup_complete"] = True
+
+
+def _kill_and_reap_adopted_children(deadline: float) -> tuple[tuple[int, int], ...]:
+    """Pidfd-kill every current direct child, then prove subreaper emptiness."""
+    reaped: list[tuple[int, int]] = []
+    first_sweep = True
+    while first_sweep or time.monotonic() < deadline:
+        first_sweep = False
+        try:
+            with open(
+                    f"/proc/{os.getpid()}/task/{os.getpid()}/children",
+                    "r", encoding="ascii") as handle:
+                body = handle.read(65537)
+        except (OSError, UnicodeError) as exc:
+            raise NetworkBrokerRefused(
+                "network_browser_descendant_snapshot_failed",
+            ) from exc
+        if len(body) > 65536:
+            raise NetworkBrokerRefused("network_browser_descendant_snapshot_failed")
+        values = body.split()
+        if len(values) > 512 or any(not value.isdecimal() for value in values):
+            raise NetworkBrokerRefused("network_browser_descendant_snapshot_failed")
+        for value in values:
+            pidfd = -1
+            try:
+                pidfd = os.pidfd_open(int(value), 0)
+                signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            finally:
+                if pidfd >= 0:
+                    os.close(pidfd)
+        while len(reaped) <= 512:
+            try:
+                waited_pid, status = os.waitpid(-1, os.WNOHANG)
+            except ChildProcessError:
+                return tuple(reaped)
+            if waited_pid == 0:
+                break
+            reaped.append((waited_pid, status))
+        if len(reaped) > 512:
+            raise NetworkBrokerRefused("network_browser_descendant_settlement_incomplete")
+        time.sleep(0.01)
+    raise NetworkBrokerRefused("network_browser_descendant_settlement_incomplete")
+
+
+def _kill_adopted_browser_descendants(browser_session, deadline: float) -> None:
+    """Kill exact subreaper-owned Chrome descendants until listener HUP."""
+    while time.monotonic() < deadline:
+        if browser_session.summary().get("listener_hup") is True:
+            return
+        try:
+            with open(
+                    f"/proc/{os.getpid()}/task/{os.getpid()}/children",
+                    "r", encoding="ascii") as handle:
+                body = handle.read(65537)
+        except (OSError, UnicodeError) as exc:
+            raise NetworkBrokerRefused(
+                "network_browser_descendant_snapshot_failed",
+            ) from exc
+        if len(body) > 65536:
+            raise NetworkBrokerRefused("network_browser_descendant_snapshot_failed")
+        values = body.split()
+        if len(values) > 512 or any(not value.isdecimal() for value in values):
+            raise NetworkBrokerRefused("network_browser_descendant_snapshot_failed")
+        for value in values:
+            pidfd = -1
+            try:
+                pidfd = os.pidfd_open(int(value), 0)
+                signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            finally:
+                if pidfd >= 0:
+                    os.close(pidfd)
+        time.sleep(0.01)
+    raise NetworkBrokerRefused("network_browser_descendant_settlement_incomplete")
 
 
 def _command_matches_prepared(command, request, prepared: PreparedFrame) -> bool:
@@ -1852,8 +2537,11 @@ def _run_execution_transaction(
     settlement_deadline = (
         None if execution_deadline is None else execution_deadline + 5.0
     )
+    network_settlement_complete = False
     try:
-        child_request = _configure_network_broker(request, launcher)
+        child_request = _configure_network_broker(
+            request, launcher, settlement_deadline=settlement_deadline,
+        )
         settlement = _run_stream_engine(
             child_request,
             launcher,
@@ -1866,12 +2554,23 @@ def _run_execution_transaction(
             clock=time.monotonic,
             on_started=_write_started,
         )
-        _settle_network_broker(launcher)
+        _settle_network_broker(
+            launcher, deadline_monotonic=settlement_deadline,
+        )
+        network_settlement_complete = True
         _write_settlement(control_fd, settlement)
     except BaseException as primary:
         if not _launcher_terminal(launcher):
             _settle_after_boundary(launcher, primary)
-        _settle_network_broker(launcher)
+        if not network_settlement_complete:
+            try:
+                _settle_network_broker(
+                    launcher, deadline_monotonic=settlement_deadline,
+                )
+            except BaseException as cleanup_fault:
+                if not isinstance(primary, Exception):
+                    raise primary
+                raise cleanup_fault
         if not isinstance(primary, Exception):
             raise
         return _EXIT_CONTROL_FAILED

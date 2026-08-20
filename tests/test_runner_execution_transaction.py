@@ -197,6 +197,9 @@ def _install_execution_fakes(
             stream_calls.append((request, observed_launcher, kwargs))
         if stream_behavior == "invalid_input":
             raise RuntimeError("stream_input_invalid")
+        if stream_behavior == "keyboard_interrupt_after_terminal":
+            launcher.returncode = 0
+            raise KeyboardInterrupt("stream cancellation")
         released = launcher.release_for_exec(
             request,
             deadline=kwargs["execution_deadline"],
@@ -517,6 +520,18 @@ def test_timeout_zero_defers_settlement_deadline_until_natural_exit(monkeypatch)
     kwargs = stream_calls[0][2]
     assert kwargs["execution_deadline"] is None
     assert kwargs["settlement_deadline"] is None
+
+
+def test_network_cleanup_fault_does_not_replace_stream_cancellation(monkeypatch):
+    def cleanup_fault(*_args, **_kwargs):
+        raise RuntimeError("network cleanup failed")
+
+    monkeypatch.setattr(runner_worker, "_settle_network_broker", cleanup_fault)
+    with pytest.raises(KeyboardInterrupt, match="stream cancellation"):
+        _exchange(
+            monkeypatch,
+            stream_behavior="keyboard_interrupt_after_terminal",
+        )
 
 
 @pytest.mark.parametrize(

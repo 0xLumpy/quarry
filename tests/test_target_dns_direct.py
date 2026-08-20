@@ -121,7 +121,9 @@ def test_target_dns_authentication_is_runtime_only_and_never_reaches_child_env(
     ).worker
     launcher = SimpleNamespace(_release_callback=None)
     monkeypatch.setattr(runner_worker.os, "urandom", lambda _size: secret)
-    child_request = runner_worker._configure_network_broker(request, launcher)
+    child_request = runner_worker._configure_network_broker(
+        request, launcher, settlement_deadline=time.monotonic() + 5,
+    )
     try:
         child_environment = dict(child_request.environment)
         assert child_environment[network_policy.PRIVATE_POLICY_ENV] == policy_wire
