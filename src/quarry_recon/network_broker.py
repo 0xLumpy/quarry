@@ -2610,7 +2610,7 @@ class ControlEndpointRegistry:
                         continue
                     try:
                         identity = _socket_identity(grant.client_fd)
-                    except OSError as exc:
+                    except (OSError, NetworkBrokerError) as exc:
                         try:
                             closed = self._grant_fd_closed(grant)
                         except NetworkBrokerRefused as probe_exc:

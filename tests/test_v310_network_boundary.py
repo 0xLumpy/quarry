@@ -2504,6 +2504,17 @@ def test_consume_reaps_a_grant_closed_by_an_uncertain_prior_close(monkeypatch):
             )
         assert registry._grants == [grant]
 
+        real_socket_identity = network_broker._socket_identity
+
+        def identity_refuses_closed_grant(fd):
+            if fd == held:
+                raise NetworkBrokerRefused("injected identity refusal")
+            return real_socket_identity(fd)
+
+        monkeypatch.setattr(
+            network_broker, "_socket_identity", identity_refuses_closed_grant,
+        )
+
         assert registry.consume_connection(
             control, accepted_fd=accepted.fileno(),
             deadline_monotonic=time.monotonic() + 0.02,
