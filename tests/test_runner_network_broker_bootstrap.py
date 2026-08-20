@@ -515,6 +515,17 @@ def test_gowitness_runner_injects_only_pinned_cdp_and_private_browser_launch(
         assert PRIVATE_POLICY_ENV not in document["environment"]
         assert runner_worker.PRIVATE_REDACTIONS_ENV not in document["environment"]
         assert "CONTROLLER_ONLY" not in document["environment"]
+        profile = next(
+            value.partition("=")[2] for value in document["argv"]
+            if value.startswith("--user-data-dir=")
+        )
+        browser_root = os.path.dirname(profile)
+        assert os.path.dirname(browser_root) == str(tmp_path)
+        assert os.path.basename(browser_root).startswith("c-")
+        assert len(os.path.basename(browser_root).encode()) == 10
+        assert document["environment"]["TMPDIR"] == os.path.join(
+            browser_root, "tmp",
+        )
     finally:
         for fd in (browser_output, chrome_output, chrome_input, browser_input):
             try:
@@ -824,6 +835,64 @@ def test_gowitness_incomplete_controller_cancels_every_shared_component(monkeypa
     assert events == [
         "controller_settle", "cancel", "controller_stop", "browser_stop",
         "bridge_stop", "proxy_stop",
+    ]
+
+
+def test_gowitness_fatal_cdp_fails_without_spending_settlement_deadline(monkeypatch):
+    events = []
+
+    class Controller:
+        def settle_after_tasks(self, **_kwargs):
+            events.append("controller_settle")
+
+        def summary(self):
+            return {"complete": True}
+
+        def stop(self):
+            events.append("controller_stop")
+
+    class Component:
+        def __init__(self, name):
+            self.name = name
+
+        def stop(self):
+            events.append(self.name + "_stop")
+
+    class Bridge(Component):
+        def summary(self):
+            return {
+                "fatal": "network_cdp_chrome_pipe_closed",
+                "thread_alive": False,
+                "settled_connections": 0,
+                "active_client": False,
+            }
+
+    class Fence:
+        def cancel(self):
+            events.append("cancel")
+
+    launcher = SimpleNamespace(
+        _network_broker_session=Controller(),
+        _network_browser_broker_session=Component("browser"),
+        _network_cdp_bridge=Bridge("bridge"),
+        _network_proxy=Component("proxy"), _network_effect_fence=Fence(),
+        _browser_pid=None, _browser_pidfd=-1,
+    )
+    monkeypatch.setattr(
+        runner_worker, "_kill_and_reap_adopted_children",
+        lambda _deadline: events.append("adopted_sweep") or (),
+    )
+    monkeypatch.setattr(
+        runner_worker.time, "sleep",
+        lambda _seconds: pytest.fail("fatal bridge settlement slept"),
+    )
+    with pytest.raises(NetworkBrokerRefused, match="cdp_settlement_incomplete"):
+        runner_worker._settle_network_broker(
+            launcher, deadline_monotonic=time.monotonic() + 30,
+        )
+    assert events == [
+        "controller_settle", "cancel", "adopted_sweep", "controller_stop",
+        "browser_stop", "bridge_stop", "proxy_stop",
     ]
 
 

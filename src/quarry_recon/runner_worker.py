@@ -1612,7 +1612,10 @@ def _configure_network_broker(
             if (type(prepared_home) is not str or not os.path.isabs(prepared_home)
                     or not os.path.isdir(prepared_home)):
                 raise RuntimeError("network_browser_home_invalid")
-            root = tempfile.mkdtemp(prefix=".quarry-chromium-", dir=prepared_home)
+            # Chromium derives internal AF_UNIX names below this directory.
+            # Keep the private name short while retaining PreparedLaunch's
+            # existing ownership and cleanup of the enclosing HOME.
+            root = tempfile.mkdtemp(prefix="c-", dir=prepared_home)
             os.chmod(root, 0o700)
             browser_directories = {
                 "root": root,
@@ -1960,10 +1963,18 @@ def _settle_gowitness_network(launcher, *, deadline_monotonic: float | None) -> 
         if not state["controller_eof"]:
             while time.monotonic() < deadline:
                 cdp_live = bridge.summary()
+                if cdp_live.get("fatal") is not None:
+                    raise NetworkBrokerRefused(
+                        "network_cdp_settlement_incomplete",
+                    )
                 if (cdp_live.get("settled_connections") == 1
                         and cdp_live.get("active_client") is False):
                     state["controller_eof"] = True
                     break
+                if cdp_live.get("thread_alive") is False:
+                    raise NetworkBrokerRefused(
+                        "network_cdp_settlement_incomplete",
+                    )
                 time.sleep(0.01)
             if not state["controller_eof"]:
                 raise NetworkBrokerRefused("network_cdp_controller_eof_unproved")
