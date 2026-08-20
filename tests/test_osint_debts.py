@@ -506,15 +506,14 @@ class TestASRankDiscoversASNs:
     def test_the_POST_helper_RAISES_on_a_graphql_error(self, monkeypatch):
         """A query the server rejected is a lane failure; reading it as "no matches" reports a clean zero
         over something nobody asked."""
-        import urllib.request
-
-        class _R:
-            def read(self): return json.dumps({"errors": [{"message": "boom"}], "data": None}).encode()
-            def __enter__(self): return self
-            def __exit__(self, *a): return False
-        monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: _R())
+        from quarry_recon import fetch
+        monkeypatch.setattr(fetch, "scoped_public_provider_get", lambda *_a, **_k: (
+            json.dumps({"errors": [{"message": "boom"}], "data": None}).encode(), "https://x", 200,
+        ))
+        session = type("S", (), {"_http_context": object()})()
         with pytest.raises(ValueError, match="boom"):
-            osint._http_post_json("https://x", {"query": "{}"})
+            osint._provider_post_json(session, "https://x", {"query": "{}"},
+                                      source_id="osint.asrank", timeout=25)
 
     def test_NO_org_anchor_is_a_recorded_skip_not_silence(self, tmp_path, monkeypatch):
         s = _Sess(tmp_path)
@@ -680,10 +679,10 @@ class TestASRankDiscoversASNs:
         whatever goes wrong on one row, the lane keeps the others and still reports what it did."""
         real = osint._asrank_asns
 
-        def hostile(node, timeout, save):
+        def hostile(session, node, timeout, save):
             if node.get("orgId") == "boom":
                 raise TypeError("hostile row")
-            return real(node, timeout, save)
+            return real(session, node, timeout, save)
 
         monkeypatch.setattr(osint, "_asrank_asns", hostile)
         s, _ = self._run(tmp_path, monkeypatch, [{"organizations": {"totalCount": 2, "edges": [

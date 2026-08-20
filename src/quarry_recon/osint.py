@@ -7,6 +7,7 @@ docs/design/PROVIDER-QUOTA-DESIGN.md.
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import re
@@ -17,12 +18,11 @@ import threading
 import time
 import urllib.error
 import urllib.parse
-import urllib.request
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import budget, events, osint_report, privfs, secrets, settings, whoxy_page
+from . import budget, events, fetch, osint_report, privfs, secrets, settings, whoxy_page
 from .contract import (PROVIDER_PARSE, PROVIDER_TRANSPORT, ProviderBodyError, capture_error_body,
                        provider_error_class, whoxy_envelope)
 from .runner import RunResult, Status, fresh_artifact_dir, have, run as exec_tool, skipped
@@ -86,18 +86,58 @@ def _utc() -> str:
 
 
 def _http(url: str, timeout: int = 25) -> str:
-    req = urllib.request.Request(url, headers={"User-Agent": "quarry-osint"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return r.read().decode("utf-8", "replace")
+    """Legacy seam for narrow unit doubles; it is never an HTTP transport."""
+    raise PermissionError("OSINT public-provider HTTP requires a bound NetworkPolicyScope")
 
 
 def _http_post_json(url: str, payload: dict, timeout: int = 25) -> dict:
-    body = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=body, method="POST",
-                                 headers={"User-Agent": "quarry-osint",
-                                          "Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        doc = json.loads(r.read().decode("utf-8", "replace"))
+    """Legacy seam for narrow unit doubles; it is never an HTTP transport."""
+    raise PermissionError("OSINT public-provider HTTP requires a bound NetworkPolicyScope")
+
+
+def _query_free_url(url: str) -> str:
+    parts = urllib.parse.urlsplit(url)
+    return parts._replace(query="", fragment="").geturl()
+
+
+def _provider_get(s, url: str, *, source_id: str, timeout: int) -> bytes:
+    """Use the OSINT run's pinned public-provider door, never ambient urllib."""
+    ctx = getattr(s, "_http_context", None)
+    if ctx is None:
+        # Keeps the small historical unit seams usable while refusing any real,
+        # unbound OSINT session before it can select a process-global transport.
+        return _http(url, timeout).encode("utf-8")
+    body, _final, status = fetch.scoped_public_provider_get(
+        ctx, url, timeout=timeout, max_redirects=0, source_id=source_id,
+    )
+    if body is None or status == 0:
+        raise RuntimeError("public-provider request was refused by the run network scope")
+    if status >= 400:
+        raise urllib.error.HTTPError(
+            _query_free_url(url), status, "provider response", {}, io.BytesIO(body),
+        )
+    return body
+
+
+def _provider_post_json(s, url: str, payload: dict, *, source_id: str, timeout: int) -> dict:
+    ctx = getattr(s, "_http_context", None)
+    if ctx is None:
+        return _http_post_json(url, payload, timeout)
+    body, _final, status = fetch.scoped_public_provider_get(
+        ctx, url, data=json.dumps(payload).encode("utf-8"), method="POST",
+        headers={"Content-Type": "application/json"}, timeout=timeout,
+        max_redirects=0, source_id=source_id,
+    )
+    if body is None or status == 0:
+        raise RuntimeError("public-provider request was refused by the run network scope")
+    if status >= 400:
+        raise urllib.error.HTTPError(
+            _query_free_url(url), status, "provider response", {}, io.BytesIO(body),
+        )
+    try:
+        doc = json.loads(body.decode("utf-8", "replace"))
+    except json.JSONDecodeError as exc:
+        raise ValueError("response was not JSON") from exc
     if isinstance(doc, dict) and doc.get("errors"):
         raise ValueError("; ".join(str(e.get("message", e)) for e in doc["errors"])[:300])
     if not isinstance(doc, dict) or not isinstance(doc.get("data"), dict):
@@ -571,6 +611,60 @@ class OsintSession:
             privfs.private_dir(p)                            # 0700 raw evidence dir
             return p / name
 
+    def _append_network_policy_trace(self, data: bytes) -> None:
+        """Append only the OSINT HTTP policy trace through this session's lock."""
+        if type(data) is not bytes:
+            raise TypeError("OSINT network policy trace must be exact bytes")
+        session_fd = raw_fd = network_fd = trace_fd = -1
+        with self._execution_mutation():
+            try:
+                session_fd = self._open_exact_directory(
+                    self.dir, self._execution_identity, "OSINT session",
+                )
+                raw_fd = os.open(
+                    "raw", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=session_fd,
+                )
+                self._validate_private_directory_fd(
+                    raw_fd, self._execution_raw_identity, "OSINT raw directory",
+                )
+                try:
+                    network_fd = os.open(
+                        "network", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                        dir_fd=raw_fd,
+                    )
+                except FileNotFoundError:
+                    os.mkdir("network", privfs.DIR_MODE, dir_fd=raw_fd)
+                    os.fsync(raw_fd)
+                    network_fd = os.open(
+                        "network", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                        dir_fd=raw_fd,
+                    )
+                observed = os.fstat(network_fd)
+                if (not stat.S_ISDIR(observed.st_mode)
+                        or observed.st_uid != os.geteuid()
+                        or stat.S_IMODE(observed.st_mode) != privfs.DIR_MODE):
+                    raise RuntimeError("OSINT network trace directory is unsafe")
+                trace_fd = os.open(
+                    "policy.jsonl",
+                    os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW
+                    | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0),
+                    privfs.FILE_MODE, dir_fd=network_fd,
+                )
+                observed = os.fstat(trace_fd)
+                if (not stat.S_ISREG(observed.st_mode)
+                        or observed.st_uid != os.geteuid()
+                        or observed.st_nlink != 1
+                        or stat.S_IMODE(observed.st_mode) != privfs.FILE_MODE):
+                    raise RuntimeError("OSINT network trace identity is unsafe")
+                self._write_all(trace_fd, data)
+                os.fsync(trace_fd)
+                os.fsync(network_fd)
+            finally:
+                for fd in (trace_fd, network_fd, raw_fd, session_fd):
+                    if fd >= 0:
+                        os.close(fd)
+
     def output(self, path: Path | None = None):
         """Declare publish or discard under this exact unsealed session."""
         from .runner_repository import RepositoryOutput
@@ -722,10 +816,39 @@ class OsintSession:
 
 # ── sources ──────────────────────────────────────────────────────────────────
 
+class _OsintHttpRepository:
+    """The deliberately tiny repository face needed by OSINT's native HTTP policy."""
+
+    __slots__ = ("_session", "profile", "scope", "run", "_network_policy_scope")
+
+    def __init__(self, session: OsintSession, profile, scope):
+        self._session = session
+        self.profile = profile
+        self.scope = scope
+        self.run = self
+        self._network_policy_scope = None
+
+    def _append_base_artifact(self, components: tuple[str, ...], data: bytes) -> None:
+        if components != ("raw", "network", "policy.jsonl"):
+            raise PermissionError("OSINT HTTP repository only owns its network policy trace")
+        self._session._append_network_policy_trace(data)
+
+    def add(self, kind: str, item: dict) -> bool:
+        """Accept the native HTTP guard's one internal-resolution review finding."""
+        if (kind != "review" or type(item) is not dict
+                or item.get("klass") != "internal-resolution"):
+            raise PermissionError("OSINT HTTP repository only accepts network review findings")
+        self._session.intel("internal-resolution", str(item.get("value", "")), "netguard",
+                            host=item.get("host"), ips=item.get("ips"), note=item.get("note"))
+        return True
+
+
 def _azmap(s: OsintSession, apex: str, echo, timeout: int) -> None:
     try:
-        data = _http(f"https://azmap.dev/api/tenant?domain={apex}&extract=true",
-                     timeout=min(timeout, 30))
+        data = _provider_get(
+            s, f"https://azmap.dev/api/tenant?domain={apex}&extract=true",
+            source_id="osint.azmap", timeout=min(timeout, 30),
+        ).decode("utf-8", "replace")
         raw = s.raw_path("azmap", f"{apex}.json")
         privfs.write_private(raw, data)
         obj = json.loads(data)
@@ -810,12 +933,20 @@ def _dmarc(s: OsintSession, apex: str, echo, timeout: int) -> None:
         s.note_failure("dmarc", f"{apex}: {e}")
 
 
-def _whoxy_get(url: str, timeout: int):
+def _whoxy_get(url: str, timeout: int, *, ctx=None):
     raw = b""
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "quarry-osint"})
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            raw = r.read()
+        if ctx is None:
+            raise PermissionError("OSINT public-provider HTTP requires a bound NetworkPolicyScope")
+        raw, _final, status = fetch.scoped_public_provider_get(
+            ctx, url, timeout=timeout, max_redirects=0, source_id="osint.whoxy",
+        )
+        if raw is None or status == 0:
+            raise RuntimeError("public-provider request was refused by the run network scope")
+        if status >= 400:
+            raise urllib.error.HTTPError(
+                _query_free_url(url), status, "provider response", {}, io.BytesIO(raw),
+            )
     except Exception as e:
         # capture the failure bytes: Whoxy usually answers failure inside a 200, but when it does
         # not, these are the evidence
@@ -830,6 +961,13 @@ def _whoxy_get(url: str, timeout: int):
             pass
         return raw, e
     return raw, None
+
+
+def _session_whoxy_get(s, url: str, timeout: int):
+    ctx = getattr(s, "_http_context", None)
+    if ctx is None:
+        return _whoxy_get(url, timeout)
+    return _whoxy_get(url, timeout, ctx=ctx)
 
 
 def _balance_from_error(err) -> "whoxy_page.BalanceRead":
@@ -880,8 +1018,10 @@ def _whoxy(s: OsintSession, emails: set[str], org_names: list[str], echo, timeou
         status envelope classifies here.
         """
         q = urllib.parse.quote(anchor.value)
-        raw, err = _whoxy_get(f"https://api.whoxy.com/?key={key}&reverse=whois&{anchor.param}={q}"
-                              f"&page={page}", min(timeout, 60))
+        raw, err = _session_whoxy_get(
+            s, f"https://api.whoxy.com/?key={key}&reverse=whois&{anchor.param}={q}&page={page}",
+            min(timeout, 60),
+        )
         if err is not None:
             return raw, err
         try:
@@ -905,7 +1045,9 @@ def _whoxy(s: OsintSession, emails: set[str], org_names: list[str], echo, timeou
         entered only when pending work remains.
         """
         with whoxy_page.spend_lock():
-            raw, err = _whoxy_get(f"https://api.whoxy.com/?key={key}&account=balance", min(timeout, 30))
+            raw, err = _session_whoxy_get(
+                s, f"https://api.whoxy.com/?key={key}&account=balance", min(timeout, 30),
+            )
             if err is None:
                 bal = whoxy_page.read_balance(raw.decode("utf-8", "replace"))
             else:
@@ -1102,7 +1244,7 @@ def _readable(value, want) -> bool:
     return value is None or isinstance(value, want)
 
 
-def _asrank_orgs(name: str, limit: int, timeout: int, save) -> tuple[list, int | None, int | None]:
+def _asrank_orgs(s, name: str, limit: int, timeout: int, save) -> tuple[list, int | None, int | None]:
     """`(organizations, total_matches, provider_short)` for one org-name search; `total` and `short` are None
     when the provider count could not be read. Pages until it has what the bound allows, saving each
     response as its own artifact.
@@ -1111,9 +1253,9 @@ def _asrank_orgs(name: str, limit: int, timeout: int, save) -> tuple[list, int |
     nodes: list = []
     total, offset, guard = None, 0, 0
     while True:
-        data = _http_post_json(_ASRANK_URL, {"query": _ASRANK_ORG_Q % {
+        data = _provider_post_json(s, _ASRANK_URL, {"query": _ASRANK_ORG_Q % {
             "name": json.dumps(name), "first": page, "offset": offset,
-            "asns": _ASRANK_ASN_PAGE}}, timeout=timeout)
+            "asns": _ASRANK_ASN_PAGE}}, source_id="osint.asrank", timeout=timeout)
         orgs = (data.get("organizations") or {})
         ref = save(f"orgs-{offset:05d}", data)
         if total is None:
@@ -1134,7 +1276,7 @@ def _asrank_orgs(name: str, limit: int, timeout: int, save) -> tuple[list, int |
     return nodes[:allowed], total, max(0, allowed - len(nodes))
 
 
-def _asrank_asns(node: dict, timeout: int, save) -> tuple[list, str, str]:
+def _asrank_asns(s: OsintSession, node: dict, timeout: int, save) -> tuple[list, str, str]:
     """`(member ASNs, shortfall reason, artifact)` for one organisation. A page returning fewer than
     `numberAsns` is re-requested for exactly that count.
     """
@@ -1147,8 +1289,9 @@ def _asrank_asns(node: dict, timeout: int, save) -> tuple[list, str, str]:
         return asns, f"{_text(node.get('orgName')) or '?'}: unreadable member count", ref
     if declared > len(asns) and node.get("orgId"):
         try:
-            data = _http_post_json(_ASRANK_URL, {"query": _ASRANK_MEMBERS_Q % {
-                "org": json.dumps(node["orgId"]), "asns": declared}}, timeout=timeout)
+            data = _provider_post_json(s, _ASRANK_URL, {"query": _ASRANK_MEMBERS_Q % {
+                "org": json.dumps(node["orgId"]), "asns": declared}},
+                                       source_id="osint.asrank", timeout=timeout)
             ref = save(f"members-{re.sub(r'[^A-Za-z0-9]', '_', str(node['orgId']))[:40]}", data)
             more = _obj(_obj(_obj(data.get("organization")).get("members")).get("asns"))
             asns = [e["node"] for e in (more.get("edges") or [])
@@ -1184,9 +1327,8 @@ def _asrank(s: OsintSession, profile, echo, timeout: int) -> None:
             raw = s.raw_path("asrank", f"{_slug}.{seq['n']:03d}-{kind}.json")
             privfs.write_private(raw, json.dumps(doc, indent=2, ensure_ascii=False))
             return str(raw)
-
         try:
-            orgs, total, missing = _asrank_orgs(name, cap, timeout=min(timeout, 30), save=save)
+            orgs, total, missing = _asrank_orgs(s, name, cap, timeout=min(timeout, 30), save=save)
         except Exception as e:                                   # noqa: BLE001
             failed += 1
             echo(f"    asrank[{name}]: {e}")
@@ -1222,7 +1364,9 @@ def _asrank(s: OsintSession, profile, echo, timeout: int) -> None:
                                                  f"({type(value).__name__})")
                 org_name = _text(raw_name)
                 iso = _text(raw_iso)
-                asns, shortfall, asn_ref = _asrank_asns(node, timeout=min(timeout, 30), save=save)
+                asns, shortfall, asn_ref = _asrank_asns(
+                    s, node, timeout=min(timeout, 30), save=save,
+                )
             except Exception as e:                               # noqa: BLE001
                 # one unreadable row may not cost the lane its terminal
                 bad_orgs += 1
@@ -1412,7 +1556,10 @@ def _rdap(s: OsintSession, profile, echo, timeout: int) -> None:
     withheld = len(eligible) - len(chosen)
     for ip in chosen:
         try:
-            data = _http(f"https://rdap.org/ip/{ip}", timeout=min(timeout, 30))
+            data = _provider_get(
+                s, f"https://rdap.org/ip/{ip}", source_id="osint.rdap",
+                timeout=min(timeout, 30),
+            ).decode("utf-8", "replace")
             raw = s.raw_path("rdap", f"{ip}.json")
             privfs.write_private(raw, data)
             obj = json.loads(data)
@@ -1463,6 +1610,10 @@ def run(profile, scope, project_dir: Path, echo=print, timeout: int = 1800) -> P
     ceiling; fast lookups use shorter caps.
     """
     sess = OsintSession(project_dir, profile.target)
+    from . import network_policy
+    http_repository = _OsintHttpRepository(sess, profile, scope)
+    network_policy.NetworkPolicyScope.from_profile(profile).bind(http_repository)
+    sess._http_context = http_repository
     from .runner import set_tool_cwd
     set_tool_cwd(sess.dir)   # contain any stray tool output inside the osint session dir
     emails: set[str] = set()

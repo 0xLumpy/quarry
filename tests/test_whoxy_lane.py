@@ -123,11 +123,11 @@ class TestFailureEvidenceIsExact:
         body = b'{"status": 0, "status_reason": "\xff\xfe bad bytes"}'
         assert body.decode("utf-8", "replace").encode() != body, "fixture is not actually non-UTF-8"
 
-        def raising(req, timeout=None):
-            raise urllib.error.HTTPError("http://x", 500, "err", {}, io.BytesIO(body))
-
-        monkeypatch.setattr(osint.urllib.request, "urlopen", raising)
-        raw, err = osint._whoxy_get("https://api.whoxy.com/?key=K&account=balance", 5)
+        from quarry_recon import fetch
+        monkeypatch.setattr(fetch, "scoped_public_provider_get",
+                            lambda *_a, **_k: (body, "https://api.whoxy.com/", 500))
+        raw, err = osint._whoxy_get("https://api.whoxy.com/?key=K&account=balance", 5,
+                                    ctx=object())
         assert raw == body, raw
         assert err is not None and getattr(err, "error_class", None)
 
