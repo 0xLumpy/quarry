@@ -1381,8 +1381,8 @@ def main() -> int:
            pathlib.Path("/proc/net/route").read_text("ascii").splitlines()[1:]
            if len(line.split()) > 1):
         acceptance_errors.append("tool_default_route")
-    if network_broker.complete_backend() is not False:
-        acceptance_errors.append("backend_enabled_before_freeze")
+    if network_broker.complete_backend() is not True:
+        acceptance_errors.append("backend_incomplete_after_freeze")
     if crashpad_adversary:
         result = crashpad_result or {}
         handler_processes = [

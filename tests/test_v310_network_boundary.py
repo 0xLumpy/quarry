@@ -128,6 +128,61 @@ def _interface_snapshot(unicast=("192.0.2.10",), broadcasts=("255.255.255.255",)
     return netguard.InterfaceSnapshot(tuple(unicast), tuple(broadcasts))
 
 
+def _filter_action(profile: str, syscall: int, args=()) -> int:
+    """Evaluate the small cBPF subset used by the fixed broker filter."""
+    architecture = network_broker._ARCHITECTURES["x86_64"]
+    array, _program = network_broker._filter_program(architecture, profile=profile)
+    words = {0: syscall, 4: architecture.audit}
+    for index, value in enumerate(args):
+        words[16 + index * 8] = value & 0xFFFFFFFF
+        words[20 + index * 8] = value >> 32
+    accumulator = 0
+    instruction = 0
+    while True:
+        current = array[instruction]
+        if current.code == network_broker._BPF_LD_W_ABS:
+            accumulator = words.get(current.k, 0)
+        elif current.code == network_broker._BPF_ALU_AND_K:
+            accumulator &= current.k
+        elif current.code == network_broker._BPF_JMP_JEQ_K:
+            instruction += 1 + (current.jt if accumulator == current.k else current.jf)
+            continue
+        elif current.code == network_broker._BPF_JMP_JSET_K:
+            instruction += 1 + (current.jt if accumulator & current.k else current.jf)
+            continue
+        elif current.code == network_broker._BPF_RET_K:
+            return current.k
+        else:  # pragma: no cover - the fixed filter uses only the opcodes above.
+            raise AssertionError(f"unexpected cBPF opcode: {current.code:#x}")
+        instruction += 1
+
+
+@pytest.mark.parametrize("profile", ("standard", "browser"))
+@pytest.mark.parametrize("syscall,args,handler", (
+    ("sendto", (0, 0, 0, 0, 1, 16), "_handle_sendto"),
+    ("sendmsg", (0, 1, 0), "_handle_sendmsg"),
+))
+def test_addressed_send_filters_route_to_the_implemented_broker_handler(
+        profile, syscall, args, handler):
+    architecture = network_broker._ARCHITECTURES["x86_64"]
+    assert network_broker.complete_backend() is True
+    assert _filter_action(profile, getattr(architecture, syscall), args) == (
+        network_broker._SECCOMP_RET_USER_NOTIF
+    )
+    session = object.__new__(network_broker.NetworkBrokerSession)
+    session._architecture = architecture
+    routed = []
+    session._handle_sendto = lambda _notification: routed.append("_handle_sendto")
+    session._handle_sendmsg = lambda _notification: routed.append("_handle_sendmsg")
+    notification = network_broker._SeccompNotif()
+    notification.data.nr = getattr(architecture, syscall)
+    session._handle(notification)
+    assert routed == [handler]
+    assert _filter_action(profile, architecture.sendmmsg) == (
+        network_broker._SECCOMP_RET_ERRNO | errno.EPERM
+    )
+
+
 def test_transport_registry_is_exactly_source_keyed_and_complete():
     registered = network_policy.REGISTERED_TRANSPORT_DOORS
     assert set(registered) == set(policy.SOURCE_OWNERSHIP) == set(sources.all_sources())

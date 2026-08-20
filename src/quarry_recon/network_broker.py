@@ -699,7 +699,10 @@ def _filter_program(architecture: _Architecture, *, profile: str = "standard"):
         jump(_BPF_JMP_JEQ_K, architecture.sendmsg, "sendmsg_flags", "sendto_gate")
         label("sendmsg_flags")
         statement(_BPF_LD_W_ABS, 32)
-        jump(_BPF_JMP_JSET_K, _MSG_FASTOPEN, "deny", "allow")
+        # A sendmsg() destination is behind the tracee-owned msghdr pointer,
+        # so cBPF cannot distinguish connected from addressed sends.  Preserve
+        # the scalar fast-open refusal and mediate every remaining shape.
+        jump(_BPF_JMP_JSET_K, _MSG_FASTOPEN, "deny", "notify")
 
         # Chromium's sandbox and Mojo IPC use destination-less sendto() at high
         # volume.  The only IP stream peers a browser-profile process can
@@ -4547,7 +4550,7 @@ def _ioctl(fd: int, command: int, structure) -> int:
 
 def complete_backend() -> bool:
     """True only after every trapped addressed-send syscall has an emulator."""
-    return False
+    return True
 
 
 __all__ = (
