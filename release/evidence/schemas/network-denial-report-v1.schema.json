@@ -1,0 +1,85 @@
+{
+  "$id": "urn:quarry:schema:network-denial-report:v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "candidate_identity_digest": {"pattern": "^sha256:[0-9a-f]{64}$", "type": "string"},
+    "gate_id": {"const": "C-NET-DENY"},
+    "instances": {
+      "items": {"$ref": "#/$defs/instance"},
+      "maxItems": 256,
+      "minItems": 3,
+      "type": "array"
+    },
+    "release": {"const": "0.3.10"},
+    "schema_version": {"const": "quarry.network-denial-report.v1"}
+  },
+  "required": ["candidate_identity_digest", "gate_id", "instances", "release", "schema_version"],
+  "title": "Quarry C-NET-DENY network denial report v1",
+  "type": "object",
+  "$defs": {
+    "attempt": {
+      "additionalProperties": false,
+      "properties": {
+        "denial": {
+          "additionalProperties": false,
+          "properties": {
+            "code": {"pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$", "type": "string"},
+            "detail": {"maxLength": 512, "minLength": 1, "type": "string"}
+          },
+          "required": ["code", "detail"],
+          "type": "object"
+        },
+        "elapsed_milliseconds": {"maximum": 60000, "minimum": 0, "type": "integer"},
+        "kind": {"enum": ["native-tool", "proxy", "resolver", "socket", "subprocess"]},
+        "outcome": {"const": "denied"}
+      },
+      "required": ["denial", "elapsed_milliseconds", "kind", "outcome"],
+      "type": "object"
+    },
+    "environment": {
+      "additionalProperties": false,
+      "properties": {
+        "architecture": {"minLength": 1, "type": "string"},
+        "isolation_profile": {"pattern": "^sha256:[0-9a-f]{64}$", "type": "string"},
+        "os": {"minLength": 1, "type": "string"},
+        "python": {"minLength": 1, "type": "string"},
+        "runner_image": {"pattern": "^sha256:[0-9a-f]{64}$", "type": "string"}
+      },
+      "required": ["architecture", "isolation_profile", "os", "python", "runner_image"],
+      "type": "object"
+    },
+    "identity": {
+      "additionalProperties": false,
+      "properties": {
+        "lane": {"enum": ["H0-hermetic", "C0-private-corpus", "P0-package-supply"]},
+        "python": {"minLength": 1, "type": "string"},
+        "runner_image": {"pattern": "^sha256:[0-9a-f]{64}$", "type": "string"}
+      },
+      "required": ["lane", "python", "runner_image"],
+      "type": "object"
+    },
+    "instance": {
+      "additionalProperties": false,
+      "properties": {
+        "attempts": {
+          "items": false,
+          "maxItems": 5,
+          "minItems": 5,
+          "prefixItems": [
+            {"allOf": [{"$ref": "#/$defs/attempt"}, {"properties": {"kind": {"const": "native-tool"}}}]},
+            {"allOf": [{"$ref": "#/$defs/attempt"}, {"properties": {"kind": {"const": "proxy"}}}]},
+            {"allOf": [{"$ref": "#/$defs/attempt"}, {"properties": {"kind": {"const": "resolver"}}}]},
+            {"allOf": [{"$ref": "#/$defs/attempt"}, {"properties": {"kind": {"const": "socket"}}}]},
+            {"allOf": [{"$ref": "#/$defs/attempt"}, {"properties": {"kind": {"const": "subprocess"}}}]}
+          ],
+          "type": "array"
+        },
+        "environment": {"$ref": "#/$defs/environment"},
+        "identity": {"$ref": "#/$defs/identity"}
+      },
+      "required": ["attempts", "environment", "identity"],
+      "type": "object"
+    }
+  }
+}

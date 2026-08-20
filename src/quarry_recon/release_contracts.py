@@ -45,6 +45,7 @@ BENCHMARK_INVALIDATIONS_SCHEMA = GATE_ARTIFACT_SCHEMA
 BENCHMARK_BASELINE_SCHEMA = GATE_ARTIFACT_SCHEMA
 BENCHMARK_REPORT_SCHEMA = GATE_ARTIFACT_SCHEMA
 RESOURCE_GATE_REPORT_SCHEMA = resource_contract.SCHEMA_VERSION
+NETWORK_DENIAL_REPORT_SCHEMA = "quarry.network-denial-report.v1"
 PUBLICATION_SUBJECTS_SCHEMA = GATE_ARTIFACT_SCHEMA
 AGGREGATE_SCHEMA = "quarry.release-aggregate.v1"
 APPROVAL_SCHEMA = "quarry.detached-release-approval.v1"
@@ -377,6 +378,7 @@ SCHEMA_PATHS = {
     "gate-artifact-schema": "release/evidence/schemas/gate-artifact-v1.schema.json",
     "gate-evidence-report-schema": "release/evidence/schemas/gate-evidence-report-v1.schema.json",
     "no-live-rule-schema": "release/evidence/schemas/no-live-rule-v1.schema.json",
+    "network-denial-report-schema": "release/evidence/schemas/network-denial-report-v1.schema.json",
     "release-scope-schema": "release/evidence/schemas/release-scope-v1.schema.json",
     "resource-gate-report-schema": "release/evidence/schemas/resource-gate-report-v1.schema.json",
     "signature-envelope-schema": "release/evidence/schemas/signature-envelope-v1.schema.json",
@@ -392,6 +394,7 @@ SCHEMA_VERSIONS = {
     "gate-artifact-schema": GATE_ARTIFACT_SCHEMA,
     "gate-evidence-report-schema": EVIDENCE_REPORT_SCHEMA,
     "no-live-rule-schema": NO_LIVE_RULE_SCHEMA,
+    "network-denial-report-schema": NETWORK_DENIAL_REPORT_SCHEMA,
     "release-scope-schema": RELEASE_SCOPE_SCHEMA,
     "resource-gate-report-schema": RESOURCE_GATE_REPORT_SCHEMA,
     "signature-envelope-schema": SIGNATURE_ENVELOPE_SCHEMA,
@@ -1944,6 +1947,127 @@ def _validate_generic_supporting_artifact(
     return doc
 
 
+_NETWORK_DENIAL_LANES = (
+    "H0-hermetic", "C0-private-corpus", "P0-package-supply",
+)
+_NETWORK_DENIAL_ATTEMPTS = (
+    "native-tool", "proxy", "resolver", "socket", "subprocess",
+)
+
+
+def _validate_network_denial_report(body: bytes, *, identity: dict, support: dict) -> dict:
+    """Validate the one complete, image-bound C-NET-DENY denial matrix."""
+    doc = _object(
+        _artifact_document(body, "C-NET-DENY", "network-denial-report"),
+        "network denial report",
+        {"candidate_identity_digest", "gate_id", "instances", "release", "schema_version"},
+    )
+    if doc["schema_version"] != NETWORK_DENIAL_REPORT_SCHEMA or doc["release"] != RELEASE:
+        raise evidence.EvidenceError("network denial report schema or release is unsupported")
+    if doc["gate_id"] != "C-NET-DENY":
+        raise evidence.EvidenceError("network denial report is bound to the wrong gate")
+    if doc["candidate_identity_digest"] != evidence.canonical_digest(identity):
+        raise evidence.EvidenceError("network denial report is bound to the wrong candidate")
+    instances = _array(doc["instances"], "network denial report.instances")
+    if not 3 <= len(instances) <= 256:
+        raise evidence.EvidenceError("network denial report instance count is outside its bound")
+
+    supported_instances = [
+        row for row in support["environments"] if row["lane"] in _NETWORK_DENIAL_LANES
+    ]
+    if {row["lane"] for row in supported_instances} != set(_NETWORK_DENIAL_LANES):
+        raise evidence.EvidenceError("support matrix omits a required network denial lane")
+    for index, row in enumerate(supported_instances):
+        for field in ("architecture", "os", "python"):
+            _token(row[field], f"support matrix network denial environment {index}.{field}")
+        for field in ("isolation_profile", "runner_image"):
+            _digest(row[field], f"support matrix network denial environment {index}.{field}")
+    expected = sorted(
+        supported_instances,
+        key=lambda row: (LANE_ORDER.index(row["lane"]), row["runner_image"], row["python"]),
+    )
+    expected_identities = [
+        (row["lane"], row["runner_image"], row["python"]) for row in expected
+    ]
+    expected_environments = [{
+        "architecture": row["architecture"],
+        "isolation_profile": row["isolation_profile"],
+        "os": row["os"],
+        "python": row["python"],
+        "runner_image": row["runner_image"],
+    } for row in expected]
+    if len(expected_identities) != len(set(expected_identities)):
+        raise evidence.EvidenceError("support matrix has ambiguous network denial identities")
+
+    observed_identities = []
+    observed_environments = []
+    for index, record in enumerate(instances):
+        item = _object(record, f"network denial report.instances[{index}]", {
+            "attempts", "environment", "identity",
+        })
+        identity_record = _object(item["identity"], f"network denial identity {index}", {
+            "lane", "python", "runner_image",
+        })
+        if identity_record["lane"] not in _NETWORK_DENIAL_LANES:
+            raise evidence.EvidenceError("network denial report has an unsupported lane")
+        _token(identity_record["python"], f"network denial identity {index}.python")
+        _digest(identity_record["runner_image"], f"network denial identity {index}.runner_image")
+        identity_key = (
+            identity_record["lane"], identity_record["runner_image"], identity_record["python"],
+        )
+        observed_identities.append(identity_key)
+
+        environment = _object(item["environment"], f"network denial environment {index}", {
+            "architecture", "isolation_profile", "os", "python", "runner_image",
+        })
+        for field in ("architecture", "os", "python"):
+            _token(environment[field], f"network denial environment {index}.{field}")
+        for field in ("isolation_profile", "runner_image"):
+            _digest(environment[field], f"network denial environment {index}.{field}")
+        if (environment["python"] != identity_record["python"]
+                or environment["runner_image"] != identity_record["runner_image"]):
+            raise evidence.EvidenceError("network denial identity disagrees with its environment")
+        observed_environments.append(environment)
+
+        attempts = _array(item["attempts"], f"network denial attempts {index}")
+        if len(attempts) != len(_NETWORK_DENIAL_ATTEMPTS):
+            raise evidence.EvidenceError("network denial instance must contain exactly five attempts")
+        for attempt_index, (attempt, expected_kind) in enumerate(
+                zip(attempts, _NETWORK_DENIAL_ATTEMPTS, strict=True)):
+            attempt_record = _object(
+                attempt, f"network denial attempt {index}/{attempt_index}",
+                {"denial", "elapsed_milliseconds", "kind", "outcome"},
+            )
+            if attempt_record["kind"] != expected_kind:
+                raise evidence.EvidenceError("network denial attempts are not in canonical complete order")
+            if attempt_record["outcome"] != "denied":
+                raise evidence.EvidenceError("network denial attempt was not denied")
+            _integer(attempt_record["elapsed_milliseconds"],
+                     f"network denial attempt {index}/{attempt_index}.elapsed_milliseconds")
+            if attempt_record["elapsed_milliseconds"] > 60_000:
+                raise evidence.EvidenceError("network denial attempt duration exceeds its bound")
+            denial = _object(attempt_record["denial"],
+                             f"network denial attempt {index}/{attempt_index}.denial",
+                             {"code", "detail"})
+            _token(denial["code"], f"network denial attempt {index}/{attempt_index}.denial.code")
+            detail = _string(denial["detail"],
+                             f"network denial attempt {index}/{attempt_index}.denial.detail")
+            if len(detail) > 512:
+                raise evidence.EvidenceError("network denial attempt detail exceeds its bound")
+
+    ordering = [
+        (LANE_ORDER.index(lane), runner_image, python)
+        for lane, runner_image, python in observed_identities
+    ]
+    if ordering != sorted(ordering) or len(observed_identities) != len(set(observed_identities)):
+        raise evidence.EvidenceError("network denial instances must have sorted unique identities")
+    if observed_identities != [
+            (row["lane"], row["runner_image"], row["python"]) for row in expected
+    ] or observed_environments != expected_environments:
+        raise evidence.EvidenceError("network denial report does not cover the exact supported runner images")
+    return doc
+
+
 def _archive_member_name(value: str, name: str) -> PurePosixPath:
     try:
         value.encode("utf-8")
@@ -2800,6 +2924,15 @@ def _semantic_resource_benchmark(
     )
 
 
+def _semantic_network_denial(
+    _gate: dict, bodies: Mapping[str, bytes], **context: object,
+) -> None:
+    _validate_network_denial_report(
+        bodies["network-denial-report"],
+        identity=context["identity"], support=context["support"],
+    )
+
+
 def _semantic_sbom(
     _gate: dict, bodies: Mapping[str, bytes], **context: object,
 ) -> None:
@@ -2850,6 +2983,7 @@ PROVISIONAL_SEMANTIC_VERIFIERS = MappingProxyType({
 # are promoted.  In particular C-PERF-PHASE-FAIRNESS stays fail-closed until a
 # typed per-obligation roster can be reconciled with C-POLICY-TRACE.
 SEMANTIC_VERIFIERS = MappingProxyType({
+    "C-NET-DENY": _semantic_network_denial,
     "C-FAULT-DISK": _semantic_resource_fault,
     "C-FAULT-RESOLVER": _semantic_resource_fault,
     "C-PERF-INGEST": _semantic_resource_benchmark,

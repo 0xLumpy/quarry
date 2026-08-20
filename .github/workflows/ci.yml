@@ -71,10 +71,10 @@ jobs:
           python-version: "3.12"
           cache: pip
           cache-dependency-path: pyproject.toml
-      - name: Install H1 system capability
+      - name: Install H1 system capabilities
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends --yes bubblewrap
+          sudo apt-get install --no-install-recommends --yes bubblewrap iproute2
       - name: Install test dependencies
         run: python -m pip install ".[dev]"
       - name: H1 synthetic tool integration

@@ -208,6 +208,37 @@ def _supporting_bodies(
                 "size": len(bodies[name]),
             } for name, media_type in (("sdist", "application/gzip"), ("wheel", "application/zip"))],
         })
+    elif gate_id == "C-NET-DENY":
+        environments = sorted(
+            (row for row in support["environments"]
+             if row["lane"] in ("H0-hermetic", "C0-private-corpus", "P0-package-supply")),
+            key=lambda row: (
+                contracts.LANE_ORDER.index(row["lane"]), row["runner_image"], row["python"],
+            ),
+        )
+        bodies["network-denial-report"] = contracts.canonical_json_line({
+            "candidate_identity_digest": evidence.canonical_digest(identity),
+            "gate_id": gate_id,
+            "instances": [{
+                "attempts": [{
+                    "denial": {"code": "ENETUNREACH", "detail": "synthetic denial"},
+                    "elapsed_milliseconds": 1,
+                    "kind": kind,
+                    "outcome": "denied",
+                } for kind in ("native-tool", "proxy", "resolver", "socket", "subprocess")],
+                "environment": {
+                    key: row[key] for key in (
+                        "architecture", "isolation_profile", "os", "python", "runner_image",
+                    )
+                },
+                "identity": {
+                    "lane": row["lane"], "python": row["python"],
+                    "runner_image": row["runner_image"],
+                },
+            } for row in environments],
+            "release": "0.3.10",
+            "schema_version": contracts.NETWORK_DENIAL_REPORT_SCHEMA,
+        })
     elif gate_id in contracts.PERFORMANCE_OPERATIONS:
         assert benchmark is not None
         bodies["benchmark-baseline"] = _benchmark_baseline_body(thresholds, gate_id)
@@ -1292,7 +1323,9 @@ class TestSignatures:
 
 class TestIncompleteSemanticRegistry:
     def test_production_aggregation_refuses_unimplemented_obligation_semantics(self, tmp_path):
-        assert set(contracts.SEMANTIC_VERIFIERS) == set(contracts.RESOURCE_SEMANTIC_GATES)
+        assert set(contracts.SEMANTIC_VERIFIERS) == (
+            set(contracts.RESOURCE_SEMANTIC_GATES) | {"C-NET-DENY"}
+        )
         assert "C-PERF-PHASE-FAIRNESS" not in contracts.SEMANTIC_VERIFIERS
         arguments = _scenario(tmp_path)
         with pytest.raises(
