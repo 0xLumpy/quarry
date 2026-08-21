@@ -51,10 +51,10 @@ _UTC_ZERO_OFFSET = re.compile(
 )
 _VERSION = re.compile(r"(?:^|\s)(?:gitleaks\s+)?v?(\d+\.\d+\.\d+)(?:\s|$)", re.I)
 _EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
-FROZEN_FIXTURE_MANIFEST_DIGEST = "sha256:0014b9160e510242e4f54e10b2f0aef761afe9f85ccc9f3c2e9d1ad50f86a02f"
+FROZEN_FIXTURE_MANIFEST_DIGEST = "sha256:1dfbde1f56242382547b9749784b01e2d74f2cc6fae531198148260ccbb388c6"
 FROZEN_FIXTURE_MANIFEST_INPUT = "c-output-fixture-manifest"
 FROZEN_FIXTURE_MANIFEST_PATH = "release/evidence/c-output-fixture-manifest-v2.json"
-FROZEN_FIXTURE_MANIFEST_RAW_SHA256 = "bed6cf4f1ee4405225eda6616320e01bb212d3aa998e2187814dfa6c4d11ab3a"
+FROZEN_FIXTURE_MANIFEST_RAW_SHA256 = "3a7ad3ae9f743396d528d19556e13063c76369eda5c95b0956303eb9b89abb7e"
 
 _EXPECTED = {
     "empty": {

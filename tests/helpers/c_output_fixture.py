@@ -1,4 +1,4 @@
-#!/usr/bin/python3
+#!/usr/bin/env python3
 """Candidate-bound local producer for C-OUTPUT runner cases.
 
 The helper deliberately owns behavior only. Every byte it writes is supplied
