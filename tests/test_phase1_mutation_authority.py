@@ -863,6 +863,7 @@ def test_normalized_journal_run_swap_never_touches_replacement(tmp_path, monkeyp
 @pytest.mark.parametrize(
     "suffix",
     [b'{"ip":', b'{"ip":"192.0.2.94"}', b'{"ip":"192.0.2.94","x":"\xf0\x9f'],
+    ids=["partial-object", "missing-newline", "partial-utf8"],
 )
 def test_torn_normalized_suffix_is_degraded_and_gaps_verdict(tmp_path, suffix):
     run = _running_run(tmp_path, "torn-normalized")

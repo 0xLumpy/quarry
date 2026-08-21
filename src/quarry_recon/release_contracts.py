@@ -25,6 +25,7 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from types import MappingProxyType
 
+from . import fault_store_evidence
 from . import path_identity_evidence
 from . import release_evidence as evidence
 from . import report_truth
@@ -75,6 +76,8 @@ SOURCE_REGISTRY_RECONCILIATION_SCHEMA = source_registry_evidence.SCHEMA_VERSION
 PATH_IDENTITY_PROPERTY_CORPUS_SCHEMA = path_identity_evidence.PROPERTY_CORPUS_SCHEMA_VERSION
 PATH_IDENTITY_CONTAINMENT_DECISIONS_SCHEMA = \
     path_identity_evidence.CONTAINMENT_DECISIONS_SCHEMA_VERSION
+FAULT_STORE_CASE_MANIFEST_SCHEMA = fault_store_evidence.CASE_MANIFEST_SCHEMA_VERSION
+FAULT_STORE_SOURCE_PLAN_SCHEMA = fault_store_evidence.SOURCE_PLAN_SCHEMA_VERSION
 
 RELEASE = evidence.RELEASE_SCOPE
 LANE_ORDER = (
@@ -463,6 +466,10 @@ SCHEMA_PATHS = {
         "release/evidence/schemas/path-identity-property-corpus-v1.schema.json",
     "path-identity-decisions-schema":
         "release/evidence/schemas/path-identity-containment-decisions-v1.schema.json",
+    "fault-store-case-manifest-schema":
+        "release/evidence/schemas/fault-store-case-manifest-v1.schema.json",
+    "fault-store-source-plan-schema":
+        "release/evidence/schemas/fault-store-source-plan-v1.schema.json",
 }
 SCHEMA_VERSIONS = {
     "aggregate-schema": AGGREGATE_SCHEMA,
@@ -497,6 +504,8 @@ SCHEMA_VERSIONS = {
     "source-registry-reconciliation-schema": SOURCE_REGISTRY_RECONCILIATION_SCHEMA,
     "path-identity-corpus-schema": PATH_IDENTITY_PROPERTY_CORPUS_SCHEMA,
     "path-identity-decisions-schema": PATH_IDENTITY_CONTAINMENT_DECISIONS_SCHEMA,
+    "fault-store-case-manifest-schema": FAULT_STORE_CASE_MANIFEST_SCHEMA,
+    "fault-store-source-plan-schema": FAULT_STORE_SOURCE_PLAN_SCHEMA,
 }
 MANIFEST_PATHS = {
     "aggregator-conformance-manifest": "release/evidence/aggregator-conformance-v1.json",
@@ -509,6 +518,7 @@ MANIFEST_PATHS = {
     "coverage-policy": "release/evidence/coverage-policy-v1.json",
     "static-security-policy": "release/evidence/static-security-policy-v1.json",
     "determinism-fixture": "release/evidence/determinism-fixture-v1.json",
+    "fault-store-case-manifest": "release/evidence/fault-store-cases-v1.json",
 }
 SCHEMA_VALIDATION_FIXTURE_MANIFEST_PATH = "release/evidence/schema-validation-fixtures-v1.json"
 SCHEMA_VALIDATION_FIXTURE_PATHS = {
@@ -582,6 +592,7 @@ SCOPE_INPUT_PATHS = {
     "source-registry-reconciliation-runtime": "src/quarry_recon/source_registry_evidence.py",
     "source-registry-reconciliation-h1-tests": "tests/test_source_registry_h1_contract.py",
     "source-registry-reconciliation-tests": "tests/test_source_registry_contract.py",
+    **fault_store_evidence.INPUT_PATHS,
     **path_identity_evidence.INPUT_PATHS,
     "release-contracts-validator": "src/quarry_recon/release_contracts.py",
     "resource-gate-report-validator": "src/quarry_recon/resource_contract.py",

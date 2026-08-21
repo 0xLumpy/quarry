@@ -315,6 +315,15 @@ boundary. A result is not green merely because the process exits.
 | `C-FAULT-RESOLVER` | Hung resolver, late response, worker crash, huge corpus, cancellation | Outstanding work/processes and total deadline are bounded; late results cannot mutate sealed state |
 | `C-FAULT-INTERRUPT` | Interrupt at every externally visible transition | Exit/result precedence is deterministic; committed evidence remains readable; resumption is explicit |
 
+The committed `C-FAULT-STORE` v1 case manifest freezes nine production
+boundaries and 45 exact pytest node IDs.  Its candidate-bound companion is a
+source plan only: every case is `not_executed`, every outcome digest is null,
+and all signing, H0 isolation, ownership, interval and toolchain claims are
+false.  Local execution of the roster checks the implementation during
+development, but it is not release evidence.  `C-FAULT-STORE` therefore stays
+`OPEN` until an accepted signed H0 instance owns and reconciles the exact
+outcomes without changing this frozen plan.
+
 #### Performance and scale matrix
 
 Performance claims require a versioned benchmark manifest. It identifies the
