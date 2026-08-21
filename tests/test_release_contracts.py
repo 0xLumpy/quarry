@@ -13,7 +13,7 @@ import zipfile
 from pathlib import Path, PurePosixPath
 
 import pytest
-from jsonschema import Draft202012Validator
+from jsonschema import Draft202012Validator, FormatChecker
 
 from quarry_recon import release_contracts as contracts
 from quarry_recon import release_evidence as evidence
@@ -1313,6 +1313,65 @@ def _supporting_bodies(
         }
         sbom["sbom_digest"] = contracts.raw_sha256(contracts.canonical_json_line(sbom))
         bodies["sbom"] = contracts.canonical_json_line(sbom)
+    elif gate_id == "C-VULNERABILITY":
+        for observation_name in contracts._SBOM_OBSERVATION_NAMES:
+            minor = observation_name.removeprefix("sbom-observation-")
+            observation = json.loads(emitted[("C-SBOM", observation_name)])
+            raw = {
+                "bomFormat": "CycloneDX", "components": [
+                    {"bom-ref": f"pkg:{row['name']}", "name": row["name"], "version": row["version"]}
+                    for row in observation["components"] if row["name"] != "quarry-recon"
+                ], "specVersion": "1.4", "vulnerabilities": [],
+            }
+            requirements = ("\n".join(sorted(
+                f"{row['name']}=={row['version']}" for row in observation["components"]
+                if row["name"] != "quarry-recon"
+            )) + "\n").encode()
+            bodies[f"vulnerability-observation-{minor}"] = contracts.canonical_json_line({
+                "artifact_type": "vulnerability-observation", "exit_status": 0,
+                "finished_at": "2026-08-14T10:20:01Z",
+                "requirements": "base64:" + base64.b64encode(requirements).decode("ascii"),
+                "scanner": {"argv": ["pip-audit", "--strict", "--no-deps", "--disable-pip", "-r", "/dev/stdin", "--format", "cyclonedx-json", "--progress-spinner", "off"], "name": "pip-audit", "version": "2.10.1"},
+                "schema_version": "quarry.vulnerability-observation.v1", "stderr": "base64:",
+                "started_at": "2026-08-14T10:20:00Z",
+                "stdout": "base64:" + base64.b64encode(contracts.canonical_json_line(raw)).decode("ascii"),
+                "subject": {"kind": "resolved-sbom-closure", "requirements_digest": contracts.raw_sha256(requirements), "sbom_observation": observation_name},
+            })
+        final_sbom = json.loads(emitted[("C-SBOM", "sbom")])
+        scans = []
+        for instance, observation_name in zip(evidence_instances, contracts._SBOM_OBSERVATION_NAMES, strict=True):
+            minor = observation_name.removeprefix("sbom-observation-")
+            raw_observation = bodies[f"vulnerability-observation-{minor}"]
+            raw_document = json.loads(raw_observation)
+            cyclonedx = base64.b64decode(raw_document["stdout"][7:])
+            scans.append({
+                "cyclonedx_digest": contracts.raw_sha256(cyclonedx), "environment": instance["environment"],
+                "evidence_instance_id": instance["id"], "exit_status": 0, "finished_at": raw_document["finished_at"],
+                "name": f"vulnerability-observation-{minor}", "observation_digest": contracts.raw_sha256(raw_observation),
+                "sbom_observation_digest": contracts.raw_sha256(emitted[("C-SBOM", observation_name)]),
+                "sbom_observation_name": observation_name, "started_at": raw_document["started_at"],
+            })
+        external = ([{"advisories": [], "subject": {"digest": digest, "kind": "runner_image"}}
+                     for digest in sorted({row["environment"]["runner_image"] for row in evidence_instances})] +
+                    [{"advisories": [], "subject": {"digest": row["content_digest"], "kind": row["relationship"], "name": row["name"], "version": row["version"]}}
+                     for row in final_sbom["components"] if row["relationship"] in {"tool", "template"}])
+        snapshot = {"digest": _digest("4"), "id": "test-snapshot", "source": "test-authority"}
+        freshness = {"observed_at": "2026-08-14T10:20:00Z", "expires_at": "2026-08-14T11:20:01Z"}
+        attestation_payload = {"database_snapshot": snapshot, "dependency_scans": scans, "external_results": external,
+                               "freshness": freshness, "issuer": "test-authority", "provider": "release-vulnerability-authority"}
+        payload_digest = contracts.raw_sha256(contracts.canonical_json_line(attestation_payload))
+        message = contracts.signature_preimage(role="approval", payload_digest=payload_digest,
+            candidate_identity_digest=evidence.canonical_digest(identity), trust_policy_digest=evidence.canonical_digest(policy))
+        provider = {"database_snapshot": snapshot, "dependency_scans": scans, "external_results": external,
+                    "freshness": freshness, "name": "release-vulnerability-authority",
+                    "trusted_attestation": {"issuer": "test-authority", "signature": {"algorithm": "ed25519", "candidate_identity_digest": evidence.canonical_digest(identity), "key_id": "test-approval-v1", "payload_digest": payload_digest, "role": "approval", "schema_version": contracts.SIGNATURE_ENVELOPE_SCHEMA, "signature": "base64:" + base64.b64encode(_sign(message, seed=APPROVAL_SEED)).decode("ascii"), "trust_policy_digest": evidence.canonical_digest(policy)}}}
+        bodies["vulnerability-findings"] = contracts.canonical_json_line({
+            "artifact_type": "vulnerability-findings", "candidate_identity_digest": evidence.canonical_digest(identity),
+            "dispositions": [], "findings": [], "gate_id": gate_id,
+            "provider": provider,
+            "raw_scans": scans, "release": "0.3.10", "schema_version": contracts.VULNERABILITY_FINDINGS_SCHEMA,
+            "unaccepted_findings": 0,
+        })
     elif gate_id == "C-PROVENANCE":
         by_key = {(row["gate_id"], row["name"]): row for row in indexed}
         subjects = [{
@@ -1470,6 +1529,7 @@ def _ready_contracts(
         {"digest": _digest("d"), "license": "TEST-ONLY", "name": "coverage", "version": "7.15.4"},
         {"digest": _digest("f"), "license": "TEST-ONLY", "name": "detect-secrets", "version": "1.5.0"},
         {"digest": _digest("b"), "license": "TEST-ONLY", "name": "mypy", "version": "2.3.1"},
+        {"digest": _digest("9"), "license": "TEST-ONLY", "name": "pip-audit", "version": "2.10.1"},
         {"digest": _digest("a"), "license": "TEST-ONLY", "name": "pytest", "version": "9.1.1"},
         {"digest": _digest("c"), "license": "TEST-ONLY", "name": "ruff", "version": "0.16.3"},
     ]
@@ -1660,6 +1720,7 @@ def _scenario(tmp_path: Path, *, approved_at: str = "2026-08-01T00:00:00Z"):
         gate_toolchain = (
             [tool for tool in supported_toolchain if tool["name"] in {"mypy", "pytest", "ruff"}]
             if gate_id == "B-QUALITY" else supported_toolchain if gate_id == "C-TOOLS" else
+            [tool for tool in supported_toolchain if tool["name"] == "pip-audit"] if gate_id == "C-VULNERABILITY" else
             [tool for tool in supported_toolchain if tool["name"] in {"coverage", "pytest"}]
             if gate_id == "B-COVERAGE" else [tool for tool in supported_toolchain if tool["name"] == "pytest"]
             if gate_id != "B-STATIC-SECURITY" else [tool for tool in supported_toolchain if tool["name"] in {"bandit", "detect-secrets", "pytest"}]
@@ -1670,7 +1731,7 @@ def _scenario(tmp_path: Path, *, approved_at: str = "2026-08-01T00:00:00Z"):
                     environment for environment in supported_environments
                     if environment["lane"] == "H0-hermetic"
                 ]
-            elif gate_id in {"C-PACKAGE-BUILD", "C-PACKAGE-INSTALL", "C-SBOM"}:
+            elif gate_id in {"C-PACKAGE-BUILD", "C-PACKAGE-INSTALL", "C-SBOM", "C-VULNERABILITY"}:
                 instance_specs = [
                     environment for environment in supported_environments
                     if environment["lane"] == "P0-package-supply"
@@ -1844,8 +1905,9 @@ def _scenario(tmp_path: Path, *, approved_at: str = "2026-08-01T00:00:00Z"):
                     key: artifact[key] for key in ("digest", "media_type", "name")
                 })
                 target_instance = instances[0]
-                if gate_id == "C-SBOM" and artifact_name.startswith("sbom-observation-"):
-                    minor = artifact_name.removeprefix("sbom-observation-")
+                if gate_id in {"C-SBOM", "C-VULNERABILITY"} and (
+                        artifact_name.startswith("sbom-observation-") or artifact_name.startswith("vulnerability-observation-")):
+                    minor = artifact_name.rsplit("-", 1)[1]
                     target_instance = next(
                         instance for instance in instances
                         if instance["environment"]["python"].startswith(minor + ".")
@@ -1854,6 +1916,8 @@ def _scenario(tmp_path: Path, *, approved_at: str = "2026-08-01T00:00:00Z"):
                     "digest": artifact["digest"],
                     "name": artifact_name,
                 })
+            for instance in instances:
+                instance["artifacts"].sort(key=lambda row: row["name"])
             report = {
                 "benchmark": copy.deepcopy(benchmark),
                 "candidate_identity_digest": evidence.canonical_digest(identity),
@@ -2490,13 +2554,108 @@ class TestIncompleteSemanticRegistry:
             | {
                 "A-IDENTITY", "A-EVIDENCE-SCHEMA", "A-TAXONOMY", "A-CORPUS", "A-THRESHOLDS", "A-SUPPORT",
                 "B-HERMETIC-ALL", "B-SCHEMA", "B-DOCS-POLICY", "B-MANIFEST", "B-QUALITY", "B-COVERAGE", "B-STATIC-SECURITY", "B-DETERMINISM",
-                "C-PACKAGE-BUILD", "C-PACKAGE-INSTALL", "C-PYTHON-MATRIX", "C-SBOM", "C-NETWORK-BOUNDARY", "C-NET-DENY",
+                "C-PACKAGE-BUILD", "C-PACKAGE-INSTALL", "C-PYTHON-MATRIX", "C-SBOM", "C-VULNERABILITY", "C-NETWORK-BOUNDARY", "C-NET-DENY",
                 *contracts.V310_05_SEMANTIC_GATES,
             }
         )
         assert "C-PERF-PHASE-FAIRNESS" not in contracts.SEMANTIC_VERIFIERS
         arguments = _scenario(tmp_path)
-        with pytest.raises(evidence.EvidenceError, match="gate C-VULNERABILITY"):
+        with pytest.raises(evidence.EvidenceError, match="gate C-PROVENANCE"):
+            contracts.aggregate_records(**arguments)
+
+
+class TestVulnerabilitySemanticEvidence:
+    @staticmethod
+    def _document(arguments: dict, name: str) -> dict:
+        artifact = next(row for row in arguments["artifact_index"]["artifacts"]
+                        if row["gate_id"] == "C-VULNERABILITY" and row["name"] == name)
+        return json.loads((arguments["artifact_root"] / artifact["path"]).read_bytes())
+
+    @staticmethod
+    def _resign_provider(document: dict, arguments: dict) -> None:
+        provider = document["provider"]
+        payload = {
+            "database_snapshot": provider["database_snapshot"],
+            "dependency_scans": provider["dependency_scans"],
+            "external_results": provider["external_results"],
+            "freshness": provider["freshness"],
+            "issuer": provider["trusted_attestation"]["issuer"],
+            "provider": provider["name"],
+        }
+        digest = contracts.raw_sha256(contracts.canonical_json_line(payload))
+        message = contracts.signature_preimage(
+            role="approval", payload_digest=digest,
+            candidate_identity_digest=evidence.canonical_digest(arguments["identity"]),
+            trust_policy_digest=evidence.canonical_digest(arguments["trust_policy"]),
+        )
+        provider["trusted_attestation"]["signature"] = {
+            "algorithm": "ed25519", "candidate_identity_digest": evidence.canonical_digest(arguments["identity"]),
+            "key_id": "test-approval-v1", "payload_digest": digest, "role": "approval",
+            "schema_version": contracts.SIGNATURE_ENVELOPE_SCHEMA,
+            "signature": "base64:" + base64.b64encode(_sign(message, seed=APPROVAL_SEED)).decode("ascii"),
+            "trust_policy_digest": evidence.canonical_digest(arguments["trust_policy"]),
+        }
+
+    def test_positive_documents_validate_both_vulnerability_schemas(self, tmp_path):
+        arguments = _scenario(tmp_path)
+        findings = self._document(arguments, "vulnerability-findings")
+        observation = self._document(arguments, "vulnerability-observation-3.10")
+        for path, document in (
+            ("release/evidence/schemas/vulnerability-findings-v1.schema.json", findings),
+            ("release/evidence/schemas/vulnerability-observation-v1.schema.json", observation),
+        ):
+            schema = json.loads((ROOT / path).read_bytes())
+            Draft202012Validator.check_schema(schema)
+            assert list(Draft202012Validator(schema, format_checker=FormatChecker()).iter_errors(document)) == []
+
+    def test_vulnerability_schemas_reject_wrong_argv_timestamp_and_provider_shape(self, tmp_path):
+        arguments = _scenario(tmp_path)
+        observation = self._document(arguments, "vulnerability-observation-3.10")
+        observation["scanner"]["argv"][1] = "--not-strict"
+        observation_schema = Draft202012Validator(json.loads((ROOT / "release/evidence/schemas/vulnerability-observation-v1.schema.json").read_bytes()), format_checker=FormatChecker())
+        assert list(observation_schema.iter_errors(observation))
+        findings = self._document(arguments, "vulnerability-findings")
+        findings["provider"]["freshness"]["observed_at"] = "2026-08-14 10:20:00"
+        findings["provider"]["database_snapshot"]["unexpected"] = 1
+        findings_schema = Draft202012Validator(json.loads((ROOT / "release/evidence/schemas/vulnerability-findings-v1.schema.json").read_bytes()), format_checker=FormatChecker())
+        assert list(findings_schema.iter_errors(findings))
+
+    @pytest.mark.parametrize(("mutate", "expected"), [
+        (lambda doc: doc["provider"]["external_results"][0]["subject"].__setitem__("digest", _digest("7")), "external result"),
+        (lambda doc: doc["provider"]["dependency_scans"][0].__setitem__("sbom_observation_digest", _digest("6")), "dependency scans"),
+    ])
+    def test_provider_subject_and_scan_substitutions_fail_after_resigning_outer_record(self, tmp_path, mutate, expected):
+        arguments = _scenario(tmp_path)
+        document = self._document(arguments, "vulnerability-findings")
+        mutate(document)
+        self._resign_provider(document, arguments)
+        _rewrite_supporting_artifact(arguments, "C-VULNERABILITY", "vulnerability-findings", contracts.canonical_json_line(document))
+        with pytest.raises(evidence.EvidenceError, match=expected):
+            contracts.aggregate_records(**arguments)
+
+    def test_expired_accepted_external_exception_fails_after_all_approval_envelopes_recompute(self, tmp_path):
+        arguments = _scenario(tmp_path)
+        document = self._document(arguments, "vulnerability-findings")
+        result = document["provider"]["external_results"][0]
+        exception = {"expires_at": "2026-08-14T10:20:01Z", "owner": "test-owner", "rationale": "Synthetic expiry-path exception rationale."}
+        payload = {"expires_at": exception["expires_at"], "id": "OSV-test-1", "owner": exception["owner"], "rationale": exception["rationale"], "subject": result["subject"]}
+        digest = contracts.raw_sha256(contracts.canonical_json_line(payload))
+        message = contracts.signature_preimage(role="approval", payload_digest=digest,
+            candidate_identity_digest=evidence.canonical_digest(arguments["identity"]), trust_policy_digest=evidence.canonical_digest(arguments["trust_policy"]))
+        exception["approval"] = {"algorithm": "ed25519", "candidate_identity_digest": evidence.canonical_digest(arguments["identity"]), "key_id": "test-approval-v1", "payload_digest": digest, "role": "approval", "schema_version": contracts.SIGNATURE_ENVELOPE_SCHEMA, "signature": "base64:" + base64.b64encode(_sign(message, seed=APPROVAL_SEED)).decode("ascii"), "trust_policy_digest": evidence.canonical_digest(arguments["trust_policy"])}
+        result["advisories"] = [{"exception": exception, "id": "OSV-test-1", "state": "accepted_exception"}]
+        self._resign_provider(document, arguments)
+        _rewrite_supporting_artifact(arguments, "C-VULNERABILITY", "vulnerability-findings", contracts.canonical_json_line(document))
+        with pytest.raises(evidence.EvidenceError, match="external exception"):
+            contracts.aggregate_records(**arguments)
+
+    def test_provider_freshness_cannot_predate_the_signed_p0_interval(self, tmp_path):
+        arguments = _scenario(tmp_path)
+        document = self._document(arguments, "vulnerability-findings")
+        document["provider"]["freshness"]["observed_at"] = "2026-08-14T10:19:59Z"
+        self._resign_provider(document, arguments)
+        _rewrite_supporting_artifact(arguments, "C-VULNERABILITY", "vulnerability-findings", contracts.canonical_json_line(document))
+        with pytest.raises(evidence.EvidenceError, match="freshness"):
             contracts.aggregate_records(**arguments)
 
 

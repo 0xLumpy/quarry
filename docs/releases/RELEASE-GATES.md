@@ -232,7 +232,7 @@ remain open; these checks do not close the release gate.
 | `C-PACKAGE-INSTALL` | `P0` | Install into a clean disposable prefix and exercise public imports/CLI from the installed artifact, never the checkout | Install inventory, import/CLI results, environment identity |
 | `C-PYTHON-MATRIX` | `P0`/`H0` | Oldest and every stable Python minor satisfying the published metadata pass required gates. Every accepted H0/P0 support environment binds its exact B-HERMETIC-ALL or C-PACKAGE-BUILD/C-PACKAGE-INSTALL evidence instance; the report separately rehashes the shared candidate package/install source artifacts | One candidate-bound `quarry.python-matrix-report.v1`, which binds and parses the exact package metadata range; any missing or substituted environment, run, source instance or artifact is `blocked` |
 | `C-SBOM` | `P0` | Three raw installed-runtime observations, one for each accepted P0 Python 3.10/3.11/3.12 environment, are merged into a candidate-bound direct/transitive dependency and bundled-tool/template inventory with licenses and content identities | Three raw observation records plus the merged candidate-bound SBOM digest and inventory reconciliation report |
-| `C-VULNERABILITY` | `P0` | Dependency/container/tool advisories meet the reviewed disposition policy; exceptions are explicit, owned, and time-bounded | Scanner DB timestamp, findings, signed dispositions |
+| `C-VULNERABILITY` | `P0` | Three retained `pip-audit` observations of the exact resolved non-root C-SBOM dependency closure are reconciled with their matching C-SBOM environments. A pass additionally requires a trusted, fresh database snapshot attestation that covers dependency, container, tool, and template subjects; exceptions are explicit, owned, approved, and time-bounded. | Three raw observation wrappers (exact stdout/stderr/status and argv), candidate findings/dispositions, and the provider attestation |
 | `C-PROVENANCE` | `P0` | Release artifacts bind source candidate, builder identity, inputs, dependencies, and subjects; signatures/digests verify | Provenance and signature verification report |
 | `C-INSTALL-ROLLBACK` | `H1`/`P0` | Failure at every acquisition/verification/activation point preserves the last-known-good install and never exposes a partial active version | Fault matrix, before/after identities, filesystem trace |
 
@@ -242,6 +242,16 @@ release collector must bind all three raw observations to their exact accepted
 P0 evidence instances and merge them into the candidate-bound C-SBOM. The
 accepted P0 runtime and signing evidence remain `OPEN`; CI observations are
 inputs and do not close the gate.
+
+The same one `pip-audit --strict --no-deps --disable-pip -r /dev/stdin`
+invocation per P0 row audits the exact, sorted non-root dependency closure
+derived from that row's C-SBOM observation. Its bounded C-VULNERABILITY wrapper
+contains the canonical input roster plus exact CycloneDX stdout, stderr, exit
+status, scanner argv, and C-SBOM subject. It is source substrate only: pip-audit output supplies neither a
+trusted database snapshot nor current freshness; an independent release
+vulnerability authority must return explicit advisory results for every P0
+runner-image, tool, and template subject. Until a trusted collector provides that
+attestation, this gate and `RG02` remain `OPEN`.
 
 #### Tool integration and compatibility
 

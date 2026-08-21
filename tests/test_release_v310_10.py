@@ -96,7 +96,7 @@ def test_pull_request_ci_selects_every_public_nonlive_lane_separately():
         if name == "offline":
             expected_actions.append(UPLOAD_ARTIFACT)
         elif name == "package":
-            expected_actions.extend([UPLOAD_ARTIFACT, UPLOAD_ARTIFACT])
+            expected_actions.extend([UPLOAD_ARTIFACT, UPLOAD_ARTIFACT, UPLOAD_ARTIFACT])
         assert actions == expected_actions
         assert job["timeout-minutes"] <= 45
     assert jobs["offline"]["strategy"]["matrix"]["python-version"] == ["3.10", "3.11", "3.12"]
@@ -135,6 +135,21 @@ def test_pull_request_ci_selects_every_public_nonlive_lane_separately():
         "path": "${{ runner.temp }}/sbom-observation-${{ matrix.python-version }}.json",
         "if-no-files-found": "error",
     }
+    audit = [step for step in package_steps if step.get("name") == "Audit the exact resolved C-SBOM dependency closure once"]
+    audit_upload = [step for step in package_steps if step.get("name") == "Upload raw C-VULNERABILITY observation"]
+    enforce = [step for step in package_steps if step.get("name") == "Enforce the retained pip-audit result without rerunning it"]
+    assert len(audit) == len(audit_upload) == len(enforce) == 1
+    assert audit[0]["run"].count("pip-audit --strict --no-deps --disable-pip -r /dev/stdin --format cyclonedx-json --progress-spinner off") == 1
+    assert "scripts/emit_vulnerability_requirements.py" in audit[0]["run"]
+    assert audit_upload[0]["uses"] == UPLOAD_ARTIFACT
+    assert audit_upload[0]["if"] == "${{ always() }}"
+    assert audit_upload[0]["with"] == {
+        "name": "vulnerability-observation-${{ matrix.python-version }}",
+        "path": "${{ runner.temp }}/vulnerability-observation-${{ matrix.python-version }}.json",
+        "if-no-files-found": "error",
+    }
+    assert enforce[0]["if"] == "${{ always() }}"
+    assert "exit_status" in enforce[0]["run"] and "pip-audit --" not in enforce[0]["run"]
 
 
 def test_offline_and_authorized_live_diagnostics_are_separate():

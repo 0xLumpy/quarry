@@ -209,13 +209,61 @@ jobs:
           name: sbom-observation-${{ matrix.python-version }}
           path: ${{ runner.temp }}/sbom-observation-${{ matrix.python-version }}.json
           if-no-files-found: error
-      - name: Audit declared dependencies and emit dependency SBOM
-        run: >-
-          pip-audit --strict . --format cyclonedx-json
-          --output "$RUNNER_TEMP/quarry-dependencies.cdx.json"
+      - name: Audit the exact resolved C-SBOM dependency closure once
+        run: |
+          pins="$RUNNER_TEMP/vulnerability-requirements-${{ matrix.python-version }}.txt"
+          raw="$RUNNER_TEMP/quarry-dependencies.cdx.json"
+          stderr="$RUNNER_TEMP/pip-audit-${{ matrix.python-version }}.stderr"
+          python scripts/emit_vulnerability_requirements.py \
+            --observation "$RUNNER_TEMP/sbom-observation-${{ matrix.python-version }}.json" \
+            --output "$pins"
+          scan_started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          set +e
+          pip-audit --strict --no-deps --disable-pip -r /dev/stdin --format cyclonedx-json --progress-spinner off <"$pins" >"$raw" 2>"$stderr"
+          scan_status=$?
+          set -e
+          scan_finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          PINS="$pins" RAW="$raw" STDERR="$stderr" STATUS="$scan_status" STARTED_AT="$scan_started_at" FINISHED_AT="$scan_finished_at" OUTPUT="$RUNNER_TEMP/vulnerability-observation-${{ matrix.python-version }}.json" python - <<'PY'
+          import base64
+          import json
+          import os
+          from pathlib import Path
+          raw = Path(os.environ["RAW"]).read_bytes()
+          stderr = Path(os.environ["STDERR"]).read_bytes()
+          requirements = Path(os.environ["PINS"]).read_bytes()
+          if len(raw) > 512 * 1024 or len(stderr) > 64 * 1024 or len(requirements) > 64 * 1024:
+              raise SystemExit("bounded vulnerability observation input exceeded")
+          document = {
+              "artifact_type": "vulnerability-observation",
+              "exit_status": int(os.environ["STATUS"]),
+              "finished_at": os.environ["FINISHED_AT"],
+              "requirements": "base64:" + base64.b64encode(requirements).decode("ascii"),
+              "scanner": {"argv": ["pip-audit", "--strict", "--no-deps", "--disable-pip", "-r", "/dev/stdin", "--format", "cyclonedx-json", "--progress-spinner", "off"], "name": "pip-audit", "version": "2.10.1"},
+              "schema_version": "quarry.vulnerability-observation.v1",
+              "started_at": os.environ["STARTED_AT"],
+              "stderr": "base64:" + base64.b64encode(stderr).decode("ascii"),
+              "stdout": "base64:" + base64.b64encode(raw).decode("ascii"),
+              "subject": {"kind": "resolved-sbom-closure", "requirements_digest": "sha256:" + __import__("hashlib").sha256(requirements).hexdigest(), "sbom_observation": "sbom-observation-${{ matrix.python-version }}"},
+          }
+          Path(os.environ["OUTPUT"]).write_text(json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+          if Path(os.environ["OUTPUT"]).stat().st_size > 1024 * 1024:
+              raise SystemExit("bounded vulnerability observation output exceeded")
+          PY
+      - name: Upload raw C-VULNERABILITY observation
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vulnerability-observation-${{ matrix.python-version }}
+          path: ${{ runner.temp }}/vulnerability-observation-${{ matrix.python-version }}.json
+          if-no-files-found: error
       - name: P0 package and supply tests
         env:
           QUARRY_DEPENDENCY_SBOM: ${{ runner.temp }}/quarry-dependencies.cdx.json
           QUARRY_PACKAGE_ARTIFACT_DIR: ${{ runner.temp }}/quarry-build-a/dist
           QUARRY_PACKAGE_INSTALL_PREFIX: ${{ runner.temp }}/quarry-install-prefix
         run: pytest -m packaging --quarry-taxonomy-manifest "$RUNNER_TEMP/quarry-taxonomy.json"
+      - name: Enforce the retained pip-audit result without rerunning it
+        if: ${{ always() }}
+        run: >-
+          OBSERVATION="$RUNNER_TEMP/vulnerability-observation-${{ matrix.python-version }}.json"
+          python -c 'import json, os, pathlib; document=json.loads(pathlib.Path(os.environ["OBSERVATION"]).read_text(encoding="utf-8")); status=document.get("exit_status"); raise SystemExit(0 if type(status) is int and status == 0 else "retained pip-audit status is nonzero or malformed")'

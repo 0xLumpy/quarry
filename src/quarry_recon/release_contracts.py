@@ -64,6 +64,7 @@ COVERAGE_SHARD_SCHEMA = "quarry.coverage-shard.v1"
 STATIC_SECURITY_POLICY_SCHEMA = "quarry.static-security-policy.v1"
 STATIC_SECURITY_FRAGMENT_SCHEMA = "quarry.static-security-scan-fragment.v1"
 SECURITY_FINDINGS_SCHEMA = "quarry.security-findings.v1"
+VULNERABILITY_FINDINGS_SCHEMA = "quarry.vulnerability-findings.v1"
 DETERMINISM_FIXTURE_SCHEMA = "quarry.determinism-fixture.v1"
 DETERMINISM_FRAGMENT_SCHEMA = "quarry.determinism-tree-diff-fragment.v1"
 ARTIFACT_TREE_DIFF_SCHEMA = "quarry.artifact-tree-diff.v1"
@@ -346,7 +347,12 @@ REQUIRED_ARTIFACTS = {
         ("sbom-observation-3.11", "application/json"),
         ("sbom-observation-3.12", "application/json"),
     ),
-    "C-VULNERABILITY": (("vulnerability-findings", "application/json"),),
+    "C-VULNERABILITY": (
+        ("vulnerability-findings", "application/json"),
+        ("vulnerability-observation-3.10", "application/json"),
+        ("vulnerability-observation-3.11", "application/json"),
+        ("vulnerability-observation-3.12", "application/json"),
+    ),
     "C-PROVENANCE": (
         ("provenance", "application/json"),
         ("signature-verification", "application/json"),
@@ -440,6 +446,8 @@ SCHEMA_PATHS = {
     "static-security-policy-schema": "release/evidence/schemas/static-security-policy-v1.schema.json",
     "static-security-fragment-schema": "release/evidence/schemas/static-security-scan-fragment-v1.schema.json",
     "security-findings-schema": "release/evidence/schemas/security-findings-v1.schema.json",
+    "vulnerability-findings-schema": "release/evidence/schemas/vulnerability-findings-v1.schema.json",
+    "vulnerability-observation-schema": "release/evidence/schemas/vulnerability-observation-v1.schema.json",
     "determinism-fixture-schema": "release/evidence/schemas/determinism-fixture-v1.schema.json",
     "determinism-fragment-schema": "release/evidence/schemas/determinism-tree-diff-fragment-v1.schema.json",
     "artifact-tree-diff-schema": "release/evidence/schemas/artifact-tree-diff-v1.schema.json",
@@ -469,6 +477,8 @@ SCHEMA_VERSIONS = {
     "static-security-policy-schema": STATIC_SECURITY_POLICY_SCHEMA,
     "static-security-fragment-schema": STATIC_SECURITY_FRAGMENT_SCHEMA,
     "security-findings-schema": SECURITY_FINDINGS_SCHEMA,
+    "vulnerability-findings-schema": VULNERABILITY_FINDINGS_SCHEMA,
+    "vulnerability-observation-schema": "quarry.vulnerability-observation.v1",
     "determinism-fixture-schema": DETERMINISM_FIXTURE_SCHEMA,
     "determinism-fragment-schema": DETERMINISM_FRAGMENT_SCHEMA,
     "artifact-tree-diff-schema": ARTIFACT_TREE_DIFF_SCHEMA,
@@ -529,6 +539,8 @@ SCOPE_INPUT_PATHS = {
     "determinism-report-truth": "src/quarry_recon/report_truth.py",
     "sbom-observation-producer": "scripts/emit_sbom_observation.py",
     "sbom-observation-tests": "tests/test_emit_sbom_observation.py",
+    "vulnerability-requirements-producer": "scripts/emit_vulnerability_requirements.py",
+    "vulnerability-contract-tests": "tests/test_vulnerability_contract.py",
     "release-v310-10-tests": "tests/test_release_v310_10.py",
     "package-metadata": "pyproject.toml",
     "docs-parity-tests": "tests/test_docs_parity.py",
@@ -4129,6 +4141,318 @@ _SBOM_OBSERVATION_NAMES = (
 _SBOM_MAX_COMPONENTS = 128
 _SBOM_MAX_FILES = 4_000
 _SBOM_MAX_REQUIREMENTS = 256
+_VULNERABILITY_OBSERVATION_NAMES = tuple(
+    f"vulnerability-observation-{minor}" for minor in ("3.10", "3.11", "3.12")
+)
+_VULNERABILITY_MAX_FINDINGS = 4_096
+
+
+def _vulnerability_observation(body: bytes, name: str, *, expected_python: str, sbom: dict) -> tuple[bytes, int, str, str, object, object]:
+    """Read one canonical wrapper retaining every byte from one pip-audit run."""
+    doc = _object(_artifact_document(body, "C-VULNERABILITY", name), "vulnerability observation", {
+        "artifact_type", "exit_status", "finished_at", "requirements", "scanner", "schema_version", "started_at", "stderr", "stdout", "subject",
+    })
+    if doc["artifact_type"] != "vulnerability-observation" or doc["schema_version"] != "quarry.vulnerability-observation.v1":
+        raise evidence.EvidenceError("vulnerability observation has an unsupported schema")
+    scanner = _object(doc["scanner"], "vulnerability scanner", {"argv", "name", "version"})
+    if scanner["name"] != "pip-audit" or scanner["version"] != "2.10.1":
+        raise evidence.EvidenceError("vulnerability observation has an unsupported scanner identity")
+    argv = _array(scanner["argv"], "vulnerability scanner argv")
+    if (not all(type(value) is str for value in argv) or len(argv) != 10 or
+            argv[:6] != ["pip-audit", "--strict", "--no-deps", "--disable-pip", "-r", "/dev/stdin"] or
+            argv[6:] != ["--format", "cyclonedx-json", "--progress-spinner", "off"]):
+        raise evidence.EvidenceError("vulnerability observation scanner argv is not the retained strict resolved-SBOM invocation")
+    subject = _object(doc["subject"], "vulnerability scan subject", {"kind", "requirements_digest", "sbom_observation"})
+    requirements = _string(doc["requirements"], "vulnerability observation.requirements")
+    if not requirements.startswith("base64:"):
+        raise evidence.EvidenceError("vulnerability observation requirements are not base64")
+    try:
+        requirements_body = base64.b64decode(requirements[7:], validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise evidence.EvidenceError("vulnerability observation requirements are malformed") from exc
+    if "base64:" + base64.b64encode(requirements_body).decode("ascii") != requirements:
+        raise evidence.EvidenceError("vulnerability observation requirements are not canonical base64")
+    expected_pins = [f"{row['name']}=={row['version']}" for row in sbom["components"] if row["name"] != "quarry-recon"]
+    expected_pins.sort()
+    expected_requirements = ("\n".join(expected_pins) + "\n").encode()
+    if subject != {"kind": "resolved-sbom-closure", "requirements_digest": raw_sha256(expected_requirements), "sbom_observation": f"sbom-observation-{expected_python}"} or requirements_body != expected_requirements:
+        raise evidence.EvidenceError("vulnerability observation does not bind the exact non-root C-SBOM dependency closure")
+    if type(doc["exit_status"]) is not int or doc["exit_status"] not in {0, 1}:
+        raise evidence.EvidenceError("vulnerability scanner exit status is not the exact pip-audit 0/1 contract")
+    decoded = {}
+    for field, bound in (("stdout", 512 * 1024), ("stderr", 64 * 1024)):
+        value = _string(doc[field], f"vulnerability observation.{field}")
+        if not value.startswith("base64:"):
+            raise evidence.EvidenceError("vulnerability observation raw stream is not base64")
+        try:
+            raw = base64.b64decode(value[7:], validate=True)
+        except (ValueError, binascii.Error) as exc:
+            raise evidence.EvidenceError("vulnerability observation raw stream is malformed") from exc
+        if "base64:" + base64.b64encode(raw).decode("ascii") != value:
+            raise evidence.EvidenceError("vulnerability observation raw stream is not canonical base64")
+        if len(raw) > bound:
+            raise evidence.EvidenceError("vulnerability observation raw stream exceeds its bound")
+        decoded[field] = raw
+    started_at = _timestamp(doc["started_at"], "vulnerability observation.started_at")
+    finished_at = _timestamp(doc["finished_at"], "vulnerability observation.finished_at")
+    if finished_at < started_at:
+        raise evidence.EvidenceError("vulnerability observation finished before it started")
+    return decoded["stdout"], doc["exit_status"], doc["started_at"], doc["finished_at"], started_at, finished_at
+
+
+def _vulnerability_raw(body: bytes, name: str) -> tuple[set[tuple[str, str]], list[dict]]:
+    """Extract the bounded, source-owned advisory facts from pip-audit CycloneDX."""
+    doc = evidence.load_json_bytes(body, maximum=8 * 1024 * 1024)
+    if type(doc) is not dict:
+        raise evidence.EvidenceError("vulnerability raw scan must be an object")
+    if doc.get("bomFormat") != "CycloneDX" or doc.get("specVersion") != "1.4":
+        raise evidence.EvidenceError("vulnerability raw scan is not a CycloneDX 1.4 document")
+    components = _array(doc.get("components"), "vulnerability raw components")
+    if not components or len(components) > _SBOM_MAX_COMPONENTS:
+        raise evidence.EvidenceError("vulnerability raw component roster is empty or exceeds the bound")
+    references: dict[str, tuple[str, str]] = {}
+    component_facts: set[tuple[str, str]] = set()
+    for index, value in enumerate(components):
+        if type(value) is not dict:
+            raise evidence.EvidenceError("vulnerability raw component is not an object")
+        component = _object(value, f"vulnerability raw components[{index}]", {
+            *value.keys(),
+        })
+        normalized = _sbom_name(component.get("name"), f"vulnerability raw components[{index}].name")
+        version = _string(component.get("version"), f"vulnerability raw components[{index}].version")
+        fact = (normalized, version)
+        if fact in component_facts:
+            raise evidence.EvidenceError("vulnerability raw components are not unique")
+        component_facts.add(fact)
+        reference = component.get("bom-ref")
+        if type(reference) is str:
+            _string(reference, f"vulnerability raw components[{index}].bom-ref")
+            if reference in references:
+                raise evidence.EvidenceError("vulnerability raw component references are not unique")
+            references[reference] = fact
+    vulnerabilities = doc.get("vulnerabilities", [])
+    vulnerabilities = _array(vulnerabilities, "vulnerability raw advisories")
+    if len(vulnerabilities) > _VULNERABILITY_MAX_FINDINGS:
+        raise evidence.EvidenceError("vulnerability raw advisory roster exceeds the bound")
+    findings = []
+    for index, value in enumerate(vulnerabilities):
+        if type(value) is not dict:
+            raise evidence.EvidenceError("vulnerability raw advisory is not an object")
+        advisory = _object(value, f"vulnerability raw advisories[{index}]", {*value.keys()})
+        advisory_id = _token(advisory.get("id"), f"vulnerability raw advisories[{index}].id")
+        affects = _array(advisory.get("affects"), f"vulnerability raw advisories[{index}].affects")
+        if not affects:
+            raise evidence.EvidenceError("vulnerability raw advisory omits its affected component")
+        for affected_index, affected in enumerate(affects):
+            if type(affected) is not dict:
+                raise evidence.EvidenceError("vulnerability raw affected component is not an object")
+            row = _object(affected, f"vulnerability raw advisories[{index}].affects[{affected_index}]", {*affected.keys()})
+            reference = _string(row.get("ref"), "vulnerability raw affected component reference")
+            component = references.get(reference)
+            if component is None:
+                raise evidence.EvidenceError("vulnerability raw advisory references an unknown component")
+            findings.append({"advisory_id": advisory_id, "component": {
+                "name": component[0], "version": component[1],
+            }})
+    findings.sort(key=lambda row: (row["advisory_id"], row["component"]["name"], row["component"]["version"]))
+    if len({(row["advisory_id"], row["component"]["name"], row["component"]["version"])
+            for row in findings}) != len(findings):
+        raise evidence.EvidenceError("vulnerability raw advisory facts are duplicated")
+    return component_facts, findings
+
+
+def _validate_vulnerability_findings(
+    body: bytes, *, identity: dict, report: dict, resolver: ArtifactResolver,
+    support: dict, thresholds: dict, bodies: Mapping[str, bytes], policy: dict,
+) -> None:
+    """Fail closed unless raw advisories, SBOM environments, and authority all reconcile."""
+    doc = _object(_artifact_document(body, "C-VULNERABILITY", "vulnerability-findings"),
+                  "vulnerability findings", {
+        "artifact_type", "candidate_identity_digest", "dispositions", "findings", "gate_id",
+        "provider", "raw_scans", "release", "schema_version", "unaccepted_findings",
+    })
+    if {key: doc[key] for key in ("artifact_type", "candidate_identity_digest", "gate_id", "release", "schema_version")} != {
+        "artifact_type": "vulnerability-findings", "candidate_identity_digest": evidence.canonical_digest(identity),
+        "gate_id": "C-VULNERABILITY", "release": RELEASE, "schema_version": VULNERABILITY_FINDINGS_SCHEMA,
+    }:
+        raise evidence.EvidenceError("vulnerability findings have the wrong candidate, gate or release")
+    provider = _object(doc["provider"], "vulnerability provider", {
+        "database_snapshot", "dependency_scans", "external_results", "freshness", "name", "trusted_attestation",
+    })
+    if provider["name"] != "release-vulnerability-authority":
+        raise evidence.EvidenceError("vulnerability findings name an unsupported provider")
+    # A raw pip-audit document does not prove database provenance or currency.  These
+    # fields intentionally remain mandatory and independently attested before a pass.
+    if any(provider[field] is None for field in ("database_snapshot", "freshness", "trusted_attestation")):
+        raise evidence.EvidenceError("vulnerability provider database snapshot, freshness or trusted attestation is absent")
+    snapshot = _object(provider["database_snapshot"], "vulnerability database snapshot", {"digest", "id", "source"})
+    _digest(snapshot["digest"], "vulnerability database snapshot.digest")
+    _token(snapshot["id"], "vulnerability database snapshot.id")
+    _string(snapshot["source"], "vulnerability database snapshot.source")
+    freshness = _object(provider["freshness"], "vulnerability database freshness", {"expires_at", "observed_at"})
+    observed_at = _timestamp(freshness["observed_at"], "vulnerability database freshness.observed_at")
+    expires_at = _timestamp(freshness["expires_at"], "vulnerability database freshness.expires_at")
+    interval_start = min(_timestamp(row["started_at"], "vulnerability evidence started_at") for row in report["instances"])
+    interval_end = max(_timestamp(row["finished_at"], "vulnerability evidence finished_at") for row in report["instances"])
+    if expires_at <= observed_at:
+        raise evidence.EvidenceError("vulnerability provider database freshness is stale")
+    final_sbom = _artifact_document(resolver.read("C-SBOM", "sbom"), "C-SBOM", "sbom")
+    expected_subjects = [{"digest": row["content_digest"], "name": row["name"], "relationship": row["relationship"], "version": row["version"]}
+                         for row in final_sbom["components"] if row["relationship"] in {"tool", "template"}]
+    expected_environments = [row for row in support["environments"] if row["lane"] == "P0-package-supply"]
+    expected_environments.sort(key=lambda row: row["python"])
+    if any(next((tool for tool in row["toolchain"] if tool["name"] == "pip-audit"), None) is None or
+           next(tool for tool in row["toolchain"] if tool["name"] == "pip-audit")["version"] != "2.10.1"
+           for row in report["instances"]):
+        raise evidence.EvidenceError("vulnerability findings do not bind the exact pip-audit tool identity/version")
+    scans = _array(doc["raw_scans"], "vulnerability raw scans")
+    if len(scans) != 3:
+        raise evidence.EvidenceError("vulnerability raw scans do not cover the frozen P0 topology")
+    sbom = final_sbom
+    sbom_by_python = {row["environment"]["python"]: row["name"] for row in sbom["observations"]}
+    raw_findings = []
+    expected_scans = []
+    for environment, raw_name in zip(expected_environments, _VULNERABILITY_OBSERVATION_NAMES, strict=True):
+        sbom_name = sbom_by_python.get(environment["python"])
+        if sbom_name is None:
+            raise evidence.EvidenceError("vulnerability scan lacks a matching C-SBOM environment")
+        observation = _artifact_document(resolver.read("C-SBOM", sbom_name), "C-SBOM", sbom_name)
+        raw, exit_status, scan_started_text, scan_finished_text, scan_started_at, scan_finished_at = _vulnerability_observation(
+            bodies[raw_name], raw_name, expected_python=environment["python"].rsplit(".", 1)[0], sbom=observation,
+        )
+        components, findings = _vulnerability_raw(raw, raw_name)
+        if (exit_status == 0) != (not findings):
+            raise evidence.EvidenceError("vulnerability scanner exit status does not reconcile with raw advisories")
+        sbom_components = {(_sbom_name(row["name"], "C-SBOM component"), row["version"])
+                           for row in _array(observation["components"], "C-SBOM observation components")
+                           if row["name"] != "quarry-recon"}
+        if components != sbom_components:
+            raise evidence.EvidenceError("vulnerability raw components do not reconcile with the matching C-SBOM environment")
+        instance = next((row for row in report["instances"] if row["environment"] == {key: environment[key] for key in ("architecture", "isolation_profile", "os", "python", "runner_image")}), None)
+        if instance is None:
+            raise evidence.EvidenceError("vulnerability raw scan lacks an exact signed P0 evidence instance")
+        instance_started_at = _timestamp(instance["started_at"], "vulnerability P0 instance.started_at")
+        instance_finished_at = _timestamp(instance["finished_at"], "vulnerability P0 instance.finished_at")
+        if scan_started_at < instance_started_at or scan_finished_at > instance_finished_at:
+            raise evidence.EvidenceError("vulnerability raw scan lies outside its exact signed P0 instance interval")
+        expected_scans.append({
+            "cyclonedx_digest": raw_sha256(raw), "environment": instance["environment"],
+            "evidence_instance_id": instance["id"], "name": raw_name,
+            "exit_status": exit_status, "finished_at": scan_finished_text,
+            "observation_digest": raw_sha256(bodies[raw_name]), "sbom_observation_digest": raw_sha256(resolver.read("C-SBOM", sbom_name)),
+            "sbom_observation_name": sbom_name, "started_at": scan_started_text,
+        })
+        raw_findings.extend({**finding, "environment": instance["environment"], "raw_scan": raw_name}
+                            for finding in findings)
+    if scans != expected_scans:
+        raise evidence.EvidenceError("vulnerability raw scan roster does not bind exact retained bytes and P0 instances")
+    if provider["dependency_scans"] != expected_scans:
+        raise evidence.EvidenceError("vulnerability provider attestation does not bind the exact retained dependency scans")
+    if observed_at < interval_start or \
+            observed_at > min(_timestamp(row["started_at"], "vulnerability scan.started_at") for row in expected_scans) or \
+            expires_at < interval_end or \
+            expires_at < max(_timestamp(row["finished_at"], "vulnerability scan.finished_at") for row in expected_scans):
+        raise evidence.EvidenceError("vulnerability provider database freshness does not cover every dependency scan")
+    external_subjects = ([{"digest": digest, "kind": "runner_image"} for digest in sorted({row["environment"]["runner_image"] for row in report["instances"]})] +
+                         [{"digest": row["digest"], "kind": row["relationship"], "name": row["name"], "version": row["version"]}
+                          for row in expected_subjects])
+    external = _array(provider["external_results"], "vulnerability external results")
+    if len(external) != len(external_subjects):
+        raise evidence.EvidenceError("vulnerability external results do not cover the exact runner-image/tool/template roster")
+    external_unaccepted = 0
+    for index, value in enumerate(external):
+        row = _object(value, f"vulnerability external results[{index}]", {"advisories", "subject"})
+        if row["subject"] != external_subjects[index]:
+            raise evidence.EvidenceError("vulnerability external result has an invented or missing subject")
+        advisories = _array(row["advisories"], "vulnerability external advisories")
+        if len(advisories) > _VULNERABILITY_MAX_FINDINGS:
+            raise evidence.EvidenceError("vulnerability external advisory roster exceeds the bound")
+        previous = None
+        for advisory in advisories:
+            item = _object(advisory, "vulnerability external advisory", {"exception", "id", "state"})
+            advisory_id = _token(item["id"], "vulnerability external advisory.id")
+            if previous is not None and advisory_id <= previous:
+                raise evidence.EvidenceError("vulnerability external advisories are not sorted and unique")
+            previous = advisory_id
+            if item["state"] == "unaccepted":
+                if item["exception"] is not None:
+                    raise evidence.EvidenceError("unaccepted external advisory has an exception")
+                external_unaccepted += 1
+            elif item["state"] == "accepted_exception":
+                exception = _object(item["exception"], "vulnerability external exception", {"approval", "expires_at", "owner", "rationale"})
+                _string(exception["owner"], "vulnerability external exception.owner")
+                _string(exception["rationale"], "vulnerability external exception.rationale")
+                if len(exception["rationale"]) < 20 or _timestamp(exception["expires_at"], "vulnerability external exception.expires_at") <= interval_end or type(exception["approval"]) is not dict:
+                    raise evidence.EvidenceError("vulnerability external exception is not approved, rationalized and unexpired")
+                verify_signature_envelope(exception["approval"], policy=policy, role="approval", gate_id="C-VULNERABILITY",
+                    payload_digest=raw_sha256(canonical_json_line({"expires_at": exception["expires_at"], "id": advisory_id, "owner": exception["owner"], "rationale": exception["rationale"], "subject": row["subject"]})),
+                    candidate_identity_digest=evidence.canonical_digest(identity), at=interval_end)
+            else:
+                raise evidence.EvidenceError("vulnerability external advisory state is unsupported")
+    attestation = _object(provider["trusted_attestation"], "vulnerability database attestation", {"issuer", "signature"})
+    _string(attestation["issuer"], "vulnerability database attestation.issuer")
+    if type(attestation["signature"]) is not dict:
+        raise evidence.EvidenceError("vulnerability provider database attestation is untrusted")
+    verify_signature_envelope(
+        attestation["signature"], policy=policy, role="approval", gate_id="C-VULNERABILITY",
+        payload_digest=raw_sha256(canonical_json_line({"database_snapshot": snapshot, "dependency_scans": expected_scans,
+            "external_results": external, "freshness": freshness, "issuer": attestation["issuer"], "provider": provider["name"]})),
+        candidate_identity_digest=evidence.canonical_digest(identity), at=interval_end,
+    )
+    if len(raw_findings) > _VULNERABILITY_MAX_FINDINGS:
+        raise evidence.EvidenceError("vulnerability finding roster exceeds the bound")
+    raw_findings.sort(key=lambda row: (row["advisory_id"], row["component"]["name"], row["component"]["version"], row["environment"]["python"]))
+    if doc["findings"] != raw_findings:
+        raise evidence.EvidenceError("vulnerability findings dropped or invented raw advisory facts")
+    dispositions = _array(doc["dispositions"], "vulnerability dispositions")
+    if len(dispositions) != len(raw_findings):
+        raise evidence.EvidenceError("vulnerability dispositions do not cover the exact finding roster")
+    expected_keys = [(row["advisory_id"], row["component"], row["environment"], row["raw_scan"]) for row in raw_findings]
+    unaccepted = 0
+    for index, disposition in enumerate(dispositions):
+        row = _object(disposition, f"vulnerability dispositions[{index}]", {
+            "advisory_id", "component", "environment", "exception", "raw_scan", "state",
+        })
+        key = (row["advisory_id"], row["component"], row["environment"], row["raw_scan"])
+        if key != expected_keys[index]:
+            raise evidence.EvidenceError("vulnerability dispositions are not the exact sorted finding roster")
+        if row["state"] == "unaccepted":
+            if row["exception"] is not None:
+                raise evidence.EvidenceError("unaccepted vulnerability disposition has an exception")
+            unaccepted += 1
+        elif row["state"] == "accepted_exception":
+            exception = _object(row["exception"], "vulnerability exception", {"approval", "expires_at", "owner", "rationale"})
+            _string(exception["owner"], "vulnerability exception.owner")
+            _string(exception["rationale"], "vulnerability exception.rationale")
+            if len(exception["rationale"]) < 20:
+                raise evidence.EvidenceError("vulnerability exception rationale is too short")
+            if _timestamp(exception["expires_at"], "vulnerability exception.expires_at") <= interval_end:
+                raise evidence.EvidenceError("vulnerability exception is expired")
+            if type(exception["approval"]) is not dict:
+                raise evidence.EvidenceError("vulnerability exception approval is absent")
+            verify_signature_envelope(
+                exception["approval"], policy=policy,
+                payload_digest=raw_sha256(canonical_json_line({"advisory_id": row["advisory_id"], "component": row["component"], "environment": row["environment"], "expires_at": exception["expires_at"], "owner": exception["owner"], "rationale": exception["rationale"]})),
+                candidate_identity_digest=evidence.canonical_digest(identity), role="approval",
+                at=interval_end, gate_id="C-VULNERABILITY",
+            )
+        else:
+            raise evidence.EvidenceError("vulnerability disposition state is unsupported")
+    unaccepted += external_unaccepted
+    if doc["unaccepted_findings"] != unaccepted:
+        raise evidence.EvidenceError("vulnerability unaccepted finding count does not recompute")
+    thresholds = [row for row in thresholds["thresholds"] if row["gate_id"] == "C-VULNERABILITY"]
+    expected_threshold = ("C-VULNERABILITY", "absolute", "unaccepted_findings", "at_most", "maximum", "count")
+    if [tuple(row[key] for key in ("gate_id", "class", "metric", "operator", "statistic", "unit")) for row in thresholds] != [expected_threshold]:
+        raise evidence.EvidenceError("vulnerability threshold metric contract is not frozen")
+    threshold = thresholds[0]
+    expected_measurement = [{
+        "baseline_digest": threshold["baseline_digest"], "class": "absolute", "invalidated_trials": 0,
+        "metric": "unaccepted_findings", "observed_trials": 1, "statistic": "maximum",
+        "unit": "count", "value": unaccepted,
+    }]
+    if report["measurements"] != expected_measurement:
+        raise evidence.EvidenceError("vulnerability gate-evidence measurement does not recompute from findings")
 
 
 def _sbom_name(value: object, name: str) -> str:
@@ -4800,6 +5124,16 @@ def _semantic_sbom(
         ),
         report=context["report"],
         bodies=bodies,
+    )
+
+
+def _semantic_vulnerability(
+    _gate: dict, bodies: Mapping[str, bytes], **context: object,
+) -> None:
+    _validate_vulnerability_findings(
+        bodies["vulnerability-findings"],
+        identity=context["identity"], report=context["report"], resolver=context["resolver"],
+        support=context["support"], thresholds=context["thresholds"], bodies=bodies, policy=context["policy"],
     )
 
 
@@ -6546,6 +6880,7 @@ SEMANTIC_VERIFIERS = MappingProxyType({
     "C-NET-DENY": _semantic_network_denial,
     "C-PACKAGE-INSTALL": _semantic_package_install,
     "C-SBOM": _semantic_sbom,
+    "C-VULNERABILITY": _semantic_vulnerability,
     "C-FAULT-DISK": _semantic_resource_fault,
     "C-FAULT-RESOLVER": _semantic_resource_fault,
     "C-PERF-INGEST": _semantic_resource_benchmark,
