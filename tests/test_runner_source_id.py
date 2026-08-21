@@ -481,7 +481,9 @@ def test_bound_policy_payload_is_attached_before_supervise_and_settles_allow(tmp
 
     monkeypatch.setattr(runner_repository, "supervise_repository_execution", supervise)
 
-    _managed_call(run, ["fixture", "--exact"], source_id="fixture.source")
+    result = _managed_call(
+        run, ["fixture", "--exact"], source_id="fixture.source",
+    )
 
     assert scope.prepared == {
         "request_id": ANY,
@@ -498,6 +500,14 @@ def test_bound_policy_payload_is_attached_before_supervise_and_settles_allow(tmp
         "reason": "repository supervisor returned an authenticated outcome",
         "summary": {"runner": "repository"},
     }]
+    assert result.meta["runtime_identity"] == prepared.record
+    assert result.meta["runtime_identity_ref"] == "identity"
+    assert result.meta["runtime_source_argv_indexes"] == [0, 1]
+    assert result.meta["execution_terminal"] == "complete"
+    assert result.meta["process_group_settled"] is True
+    assert result.meta["process_tree_settled"] is False
+    assert result.meta["execution_request_id"] == scope.prepared["request_id"]
+    assert result.meta["execution_detail"] is None
 
 
 def test_bound_policy_forwards_caller_owned_approved_peers(tmp_path, monkeypatch):

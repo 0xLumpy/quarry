@@ -176,6 +176,11 @@ def test_only_witnessed_post_sigint_exit_one_can_be_clean(tmp_path):
 
     assert clean.status is runner.Status.EMPTY
     assert clean.meta["deadline_sigint"] is True
+    assert clean.meta["execution_terminal"] == "complete"
+    assert clean.meta["process_group_settled"] is True
+    assert clean.meta["process_tree_settled"] is False
+    assert clean.meta["execution_request_id"] == request.request_id
+    assert clean.meta["execution_detail"] == "sigint_deadline_exit"
     assert early.status is runner.Status.FAILED
 
 

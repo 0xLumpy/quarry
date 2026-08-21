@@ -1586,6 +1586,13 @@ def _repository_run_result(
     if stderr.disposition is ArtifactDisposition.PUBLISH:
         meta["stderr_published"] = stderr_final is not None
     if settlement is not None:
+        # Public, authenticated execution testimony for release collectors.  This
+        # is a projection of the supervisor settlement, never collector input.
+        meta["execution_terminal"] = settlement.terminal.value
+        meta["process_group_settled"] = settlement.process_group_settled
+        meta["process_tree_settled"] = settlement.process_tree_settled
+        meta["execution_request_id"] = settlement.request_id
+        meta["execution_detail"] = settlement.detail
         meta["streams"] = {
             stream.role.value: stream.to_dict() for stream in settlement.streams
         }
@@ -2084,6 +2091,9 @@ def _run_with_repository(
     runtime_meta = {
         "runtime_identity": prepared.record,
         "runtime_identity_ref": identity_ref,
+        # The execution collector needs the same source-to-runtime argv mapping
+        # that admission used; it must not infer it from rewritten paths.
+        "runtime_source_argv_indexes": list(prepared.source_argv_indexes),
     }
 
     started_at = time.monotonic()
