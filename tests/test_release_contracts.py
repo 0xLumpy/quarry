@@ -672,6 +672,42 @@ def _supporting_bodies(
             "schema_version": contracts.SECURITY_FINDINGS_SCHEMA,
             "toolchain": toolchain,
         })
+    elif gate_id == "B-DETERMINISM":
+        h0 = evidence.load_json_bytes(emitted[("B-HERMETIC-ALL", "test-report")][:-1])
+        h0_run = next(row for row in h0["runs"] if row["environment"]["python"].startswith("3.12."))
+        instance = evidence_instances[0]
+        instance["environment"] = h0_run["environment"]
+        instance["id"] = h0_run["evidence_instance_id"]
+        fixture_body = (ROOT / contracts.MANIFEST_PATHS["determinism-fixture"]).read_bytes()
+        fixture = contracts.read_determinism_fixture(fixture_body)
+        h0_digest = next(row["digest"] for row in h0_run["fragments"]
+                         if row["job_instance_id"] == contracts._DETERMINISM_JOB_ID)
+        runs = [
+            contracts._determinism_expected_tree(fixture, "run-1"),
+            contracts._determinism_expected_tree(fixture, "run-2"),
+        ]
+        fragment = {
+            "artifact_differences": 0, "artifact_type": "artifact-tree-diff-fragment",
+            "differences": [], "fixture_digest": runs[0]["tree_digest"],
+            "fixture_manifest_digest": contracts.raw_sha256(fixture_body),
+            "h0_fragment_digest": h0_digest, "job_instance_id": contracts._DETERMINISM_JOB_ID,
+            "release": "0.3.10", "runs": runs,
+            "schema_version": contracts.DETERMINISM_FRAGMENT_SCHEMA,
+        }
+        bodies["artifact-tree-diff-fragment"] = contracts.canonical_json_line(fragment)
+        bindings = {row["name"]: row for row in scope["input_bindings"]}
+        bodies["artifact-tree-diff"] = contracts.canonical_json_line({
+            **fragment, "artifact_type": "artifact-tree-diff",
+            "bindings": [{"digest": bindings[name]["digest"], "name": name,
+                          "path": bindings[name]["path"]}
+                         for name in contracts._DETERMINISM_BINDINGS],
+            "candidate_identity_digest": evidence.canonical_digest(identity),
+            "environment": instance["environment"], "evidence_finished_at": instance["finished_at"],
+            "evidence_instance_id": instance["id"], "evidence_started_at": instance["started_at"],
+            "gate_id": gate_id, "name": "artifact-tree-diff",
+            "raw_fragment_digest": contracts.raw_sha256(bodies["artifact-tree-diff-fragment"]),
+            "schema_version": contracts.ARTIFACT_TREE_DIFF_SCHEMA, "toolchain": toolchain,
+        })
     elif gate_id == "B-MANIFEST":
         instance = evidence_instances[0]
         cases_body = (ROOT / contracts.MANIFEST_PATHS["manifest-evidence-cases"]).read_bytes()
@@ -1261,7 +1297,7 @@ def _ready_contracts(
     })
     for row in thresholds["thresholds"]:
         row["limit"] = 0 if (
-            row["gate_id"] == "B-QUALITY" or
+            row["gate_id"] in {"B-QUALITY", "B-DETERMINISM"} or
             row["metric"] in resource_contract._ZERO_INVARIANTS
         ) else 1
         if row["class"] == "regression":
@@ -2220,7 +2256,7 @@ class TestIncompleteSemanticRegistry:
             set(contracts.RESOURCE_SEMANTIC_GATES)
             | {
                 "A-IDENTITY", "A-EVIDENCE-SCHEMA", "A-TAXONOMY", "A-CORPUS", "A-THRESHOLDS", "A-SUPPORT",
-                "B-HERMETIC-ALL", "B-SCHEMA", "B-DOCS-POLICY", "B-MANIFEST", "B-QUALITY", "B-COVERAGE", "B-STATIC-SECURITY",
+                "B-HERMETIC-ALL", "B-SCHEMA", "B-DOCS-POLICY", "B-MANIFEST", "B-QUALITY", "B-COVERAGE", "B-STATIC-SECURITY", "B-DETERMINISM",
                 "C-PACKAGE-BUILD", "C-PACKAGE-INSTALL", "C-NETWORK-BOUNDARY", "C-NET-DENY",
                 *contracts.V310_05_SEMANTIC_GATES,
             }
@@ -2229,7 +2265,7 @@ class TestIncompleteSemanticRegistry:
         arguments = _scenario(tmp_path)
         with pytest.raises(
             evidence.EvidenceError,
-            match="B-DETERMINISM has no registered obligation-specific semantic verifier",
+            match="C-PYTHON-MATRIX has no registered obligation-specific semantic verifier",
         ):
             contracts.aggregate_records(**arguments)
 
@@ -3929,3 +3965,62 @@ class TestStaticSecuritySemanticEvidence:
         threshold["limit"] = 0
         with pytest.raises(evidence.EvidenceError, match="threshold breach"):
             self._verify(arguments, findings, fragment)
+
+
+class TestDeterminismSemanticEvidence:
+    def test_boolean_zero_cannot_satisfy_the_signed_integer_contract(self, tmp_path):
+        arguments = _scenario(tmp_path)
+        wrapper_index = next(row for row in arguments["artifact_index"]["artifacts"]
+                             if row["gate_id"] == "B-DETERMINISM" and
+                             row["name"] == "artifact-tree-diff")
+        wrapper = json.loads((arguments["artifact_root"] / wrapper_index["path"]).read_bytes())
+        wrapper["artifact_differences"] = False
+        _rewrite_supporting_artifact(
+            arguments, "B-DETERMINISM", "artifact-tree-diff",
+            contracts.canonical_json_line(wrapper),
+        )
+        _resign_gate(_gate(arguments, "B-DETERMINISM"), arguments["identity"],
+                     arguments["trust_policy"])
+        with pytest.raises(evidence.EvidenceError, match="exact non-negative integer"):
+            contracts.aggregate_records(**arguments)
+
+    def test_equal_forged_trees_are_refused_when_fixture_bytes_do_not_rebuild_them(self, tmp_path):
+        arguments = _scenario(tmp_path)
+        index = next(row for row in arguments["artifact_index"]["artifacts"]
+                     if row["gate_id"] == "B-DETERMINISM" and
+                     row["name"] == "artifact-tree-diff-fragment")
+        fragment = json.loads((arguments["artifact_root"] / index["path"]).read_bytes())
+        forged_files = [
+            {"bytes": 1, "digest": _digest(str(index)), "path": row["path"]}
+            for index, row in enumerate(fragment["runs"][0]["files"])
+        ]
+        forged_tree = evidence.canonical_digest(forged_files)
+        fragment["runs"] = [
+            {"files": copy.deepcopy(forged_files), "id": "run-1", "tree_digest": forged_tree},
+            {"files": copy.deepcopy(forged_files), "id": "run-2", "tree_digest": forged_tree},
+        ]
+        fragment["fixture_digest"] = forged_tree
+        raw_body = contracts.canonical_json_line(fragment)
+        # The raw reader accepts internally consistent paired facts; the gate verifier
+        # must additionally rebuild every file from the frozen fixture.
+        contracts.read_determinism_fragment(raw_body)
+        _rewrite_supporting_artifact(
+            arguments, "B-DETERMINISM", "artifact-tree-diff-fragment", raw_body,
+        )
+        wrapper_index = next(row for row in arguments["artifact_index"]["artifacts"]
+                             if row["gate_id"] == "B-DETERMINISM" and
+                             row["name"] == "artifact-tree-diff")
+        wrapper = json.loads((arguments["artifact_root"] / wrapper_index["path"]).read_bytes())
+        wrapper.update({
+            "fixture_digest": forged_tree,
+            "raw_fragment_digest": contracts.raw_sha256(raw_body),
+            "runs": copy.deepcopy(fragment["runs"]),
+        })
+        _rewrite_supporting_artifact(
+            arguments, "B-DETERMINISM", "artifact-tree-diff",
+            contracts.canonical_json_line(wrapper),
+        )
+        _resign_gate(_gate(arguments, "B-DETERMINISM"), arguments["identity"],
+                     arguments["trust_policy"])
+        with pytest.raises(evidence.EvidenceError, match="trees do not recompute"):
+            contracts.aggregate_records(**arguments)

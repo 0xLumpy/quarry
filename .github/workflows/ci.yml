@@ -78,6 +78,14 @@ jobs:
           --job-instance-id ".github/workflows/ci.yml#jobs.offline[python-version=3.12,shard=0]"
           --policy release/evidence/static-security-policy-v1.json
           --output "$RUNNER_TEMP/security-scan-fragment.json"
+      - name: Determinism paired artifact-tree diff (existing Python 3.12 shard 0)
+        if: ${{ matrix.python-version == '3.12' && matrix.shard == '0' }}
+        run: >-
+          python scripts/emit_determinism.py
+          --fixture release/evidence/determinism-fixture-v1.json
+          --h0-fragment "$RUNNER_TEMP/h0-shard-3.12-0.json"
+          --job-instance-id ".github/workflows/ci.yml#jobs.offline[python-version=3.12,shard=0]"
+          --output "$RUNNER_TEMP/artifact-tree-diff-fragment.json"
       - name: Upload H0 shard outcome
         if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -89,6 +97,7 @@ jobs:
             ${{ runner.temp }}/quarry-coverage-3.12-${{ matrix.shard }}*
             ${{ runner.temp }}/coverage-shard-${{ matrix.shard }}.json
             ${{ runner.temp }}/security-scan-fragment.json
+            ${{ runner.temp }}/artifact-tree-diff-fragment.json
           if-no-files-found: error
 
   integration:

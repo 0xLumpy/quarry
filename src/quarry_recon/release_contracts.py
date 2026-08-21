@@ -26,8 +26,10 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from types import MappingProxyType
 
 from . import release_evidence as evidence
+from . import report_truth
 from . import release_v310_05
 from . import resource_contract
+from . import run_manifest
 
 
 RELEASE_SCOPE_SCHEMA = "quarry.release-scope.v1"
@@ -62,6 +64,9 @@ COVERAGE_SHARD_SCHEMA = "quarry.coverage-shard.v1"
 STATIC_SECURITY_POLICY_SCHEMA = "quarry.static-security-policy.v1"
 STATIC_SECURITY_FRAGMENT_SCHEMA = "quarry.static-security-scan-fragment.v1"
 SECURITY_FINDINGS_SCHEMA = "quarry.security-findings.v1"
+DETERMINISM_FIXTURE_SCHEMA = "quarry.determinism-fixture.v1"
+DETERMINISM_FRAGMENT_SCHEMA = "quarry.determinism-tree-diff-fragment.v1"
+ARTIFACT_TREE_DIFF_SCHEMA = "quarry.artifact-tree-diff.v1"
 
 RELEASE = evidence.RELEASE_SCOPE
 LANE_ORDER = (
@@ -318,7 +323,10 @@ REQUIRED_ARTIFACTS = {
         ("security-findings", "application/json"),
         ("security-scan-fragment", "application/json"),
     ),
-    "B-DETERMINISM": (("artifact-tree-diff", "application/json"),),
+    "B-DETERMINISM": (
+        ("artifact-tree-diff", "application/json"),
+        ("artifact-tree-diff-fragment", "application/json"),
+    ),
     "B-DOCS-POLICY": (("parity-report", "application/json"),),
     "C-PACKAGE-BUILD": (
         ("build-log", "application/json"),
@@ -426,6 +434,9 @@ SCHEMA_PATHS = {
     "static-security-policy-schema": "release/evidence/schemas/static-security-policy-v1.schema.json",
     "static-security-fragment-schema": "release/evidence/schemas/static-security-scan-fragment-v1.schema.json",
     "security-findings-schema": "release/evidence/schemas/security-findings-v1.schema.json",
+    "determinism-fixture-schema": "release/evidence/schemas/determinism-fixture-v1.schema.json",
+    "determinism-fragment-schema": "release/evidence/schemas/determinism-tree-diff-fragment-v1.schema.json",
+    "artifact-tree-diff-schema": "release/evidence/schemas/artifact-tree-diff-v1.schema.json",
 }
 SCHEMA_VERSIONS = {
     "aggregate-schema": AGGREGATE_SCHEMA,
@@ -451,6 +462,9 @@ SCHEMA_VERSIONS = {
     "static-security-policy-schema": STATIC_SECURITY_POLICY_SCHEMA,
     "static-security-fragment-schema": STATIC_SECURITY_FRAGMENT_SCHEMA,
     "security-findings-schema": SECURITY_FINDINGS_SCHEMA,
+    "determinism-fixture-schema": DETERMINISM_FIXTURE_SCHEMA,
+    "determinism-fragment-schema": DETERMINISM_FRAGMENT_SCHEMA,
+    "artifact-tree-diff-schema": ARTIFACT_TREE_DIFF_SCHEMA,
 }
 MANIFEST_PATHS = {
     "aggregator-conformance-manifest": "release/evidence/aggregator-conformance-v1.json",
@@ -462,6 +476,7 @@ MANIFEST_PATHS = {
     "quality-policy": "release/evidence/quality-policy-v1.json",
     "coverage-policy": "release/evidence/coverage-policy-v1.json",
     "static-security-policy": "release/evidence/static-security-policy-v1.json",
+    "determinism-fixture": "release/evidence/determinism-fixture-v1.json",
 }
 SCHEMA_VALIDATION_FIXTURE_MANIFEST_PATH = "release/evidence/schema-validation-fixtures-v1.json"
 SCHEMA_VALIDATION_FIXTURE_PATHS = {
@@ -493,12 +508,17 @@ SCOPE_INPUT_PATHS = {
     "coverage-config": ".coveragerc",
     "coverage-shard-producer": "scripts/emit_coverage_shard.py",
     "static-security-producer": "scripts/emit_static_security.py",
+    "determinism-producer": "scripts/emit_determinism.py",
     "security-exceptions": "release/evidence/security-exceptions-v1.json",
     "security-exception-checker": "scripts/check_security_exceptions.py",
     "secret-baseline": ".secrets.baseline",
     "static-security-config-tests": "tests/test_config.py",
     "static-security-path-tests": "tests/test_phase1_privfs_core.py",
     "static-security-archive-tests": "tests/test_release_h0.py",
+    "determinism-contract-tests": "tests/test_determinism_contract.py",
+    "determinism-release-evidence": "src/quarry_recon/release_evidence.py",
+    "determinism-run-manifest": "src/quarry_recon/run_manifest.py",
+    "determinism-report-truth": "src/quarry_recon/report_truth.py",
     "package-metadata": "pyproject.toml",
     "docs-parity-tests": "tests/test_docs_parity.py",
     "docs-policy-readme": "README.md",
@@ -588,6 +608,13 @@ _STATIC_SECURITY_BINDINGS = (
     "static-security-producer", "secret-baseline",
     "static-security-config-tests", "static-security-path-tests",
     "static-security-archive-tests", "package-metadata",
+)
+_DETERMINISM_JOB_ID = _STATIC_SECURITY_JOB_ID
+_DETERMINISM_BINDINGS = (
+    "determinism-fixture", "determinism-fixture-schema",
+    "determinism-fragment-schema", "artifact-tree-diff-schema",
+    "determinism-producer", "determinism-release-evidence",
+    "determinism-run-manifest", "determinism-report-truth",
 )
 _COVERAGE_CONFIG_PATH = ".coveragerc"
 _COVERAGE_CONFIG_BYTES = b"[run]\nbranch = True\nparallel = False\nrelative_files = True\nsource = src/quarry_recon\n"
@@ -870,6 +897,107 @@ def _static_security_checks(fragment: Mapping[str, object]) -> list[dict]:
     )
     return [{"id": name, "result_digest": evidence.canonical_digest(fact), "status": "pass"}
             for name, fact in facts]
+
+
+def read_determinism_fixture(data: bytes) -> dict:
+    """Read the small, source-controlled artifact fixture for B-DETERMINISM."""
+    doc = _object(_canonical_reader(data, "determinism fixture"), "determinism fixture", {
+        "artifacts", "release", "schema_version",
+    })
+    _schema(doc, DETERMINISM_FIXTURE_SCHEMA, "determinism fixture")
+    if doc["schema_version"] != DETERMINISM_FIXTURE_SCHEMA or doc["release"] != RELEASE:
+        raise evidence.EvidenceError("determinism fixture has unsupported identity")
+    rows = _array(doc["artifacts"], "determinism fixture artifacts")
+    if len(rows) != 3:
+        raise evidence.EvidenceError("determinism fixture must have exactly three artifacts")
+    expected_builders = ("release-evidence", "run-manifest", "report-truth")
+    paths = []
+    for index, row in enumerate(rows):
+        item = _object(row, f"determinism fixture artifacts[{index}]", {
+            "builder", "document", "path",
+        })
+        if item["builder"] != expected_builders[index] or type(item["document"]) is not dict:
+            raise evidence.EvidenceError("determinism fixture builder roster is not frozen")
+        path = _string(item["path"], "determinism fixture path")
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*\.json", path) is None:
+            raise evidence.EvidenceError("determinism fixture path is invalid")
+        paths.append(path)
+    if paths != sorted(paths) or len(set(paths)) != len(paths):
+        raise evidence.EvidenceError("determinism fixture paths are not canonical")
+    return doc
+
+
+def _determinism_expected_tree(fixture: Mapping[str, object], run_id: str) -> dict:
+    """Rebuild every retained deterministic byte from the frozen fixture."""
+    builders = {
+        "release-evidence": lambda value: evidence.canonical_json_bytes(value) + b"\n",
+        "run-manifest": run_manifest.canonical_json_bytes,
+        "report-truth": report_truth.canonical_json_bytes,
+    }
+    files = []
+    for row in fixture["artifacts"]:
+        item = _object(row, "determinism fixture artifact", {"builder", "document", "path"})
+        builder = builders[item["builder"]]
+        try:
+            body = builder(item["document"])
+        except (TypeError, ValueError, run_manifest.ManifestError, report_truth.ReportTruthError) as exc:
+            raise evidence.EvidenceError("determinism fixture cannot be rebuilt") from exc
+        files.append({"bytes": len(body), "digest": raw_sha256(body), "path": item["path"]})
+    return {"files": files, "id": run_id, "tree_digest": evidence.canonical_digest(files)}
+
+
+def _read_determinism_run(value: object, label: str) -> dict:
+    run = _object(value, label, {"files", "id", "tree_digest"})
+    _token(run["id"], f"{label} id")
+    _digest(run["tree_digest"], f"{label} tree digest")
+    files = _array(run["files"], f"{label} files")
+    if len(files) != 3:
+        raise evidence.EvidenceError("determinism tree must retain exactly three files")
+    parsed = []
+    for index, row in enumerate(files):
+        item = _object(row, f"{label} files[{index}]", {"bytes", "digest", "path"})
+        size = _integer(item["bytes"], f"{label} file bytes")
+        if size < 0:
+            raise evidence.EvidenceError("determinism file size is negative")
+        _digest(item["digest"], f"{label} file digest")
+        path = _string(item["path"], f"{label} file path")
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*\.json", path) is None:
+            raise evidence.EvidenceError("determinism file path is invalid")
+        parsed.append(item)
+    if parsed != sorted(parsed, key=lambda row: row["path"]) or len({row["path"] for row in parsed}) != len(parsed):
+        raise evidence.EvidenceError("determinism tree files are not canonically ordered")
+    if run["tree_digest"] != evidence.canonical_digest(parsed):
+        raise evidence.EvidenceError("determinism tree digest does not recompute from retained file facts")
+    return run
+
+
+def read_determinism_fragment(data: bytes) -> dict:
+    """Read a canonical raw paired-tree diff emitted in the exact shard-0 job."""
+    doc = _object(_canonical_reader(data, "determinism tree diff fragment"),
+                  "determinism tree diff fragment", {
+        "artifact_differences", "artifact_type", "differences", "fixture_digest",
+        "fixture_manifest_digest", "h0_fragment_digest", "job_instance_id", "release", "runs", "schema_version",
+    })
+    _schema(doc, DETERMINISM_FRAGMENT_SCHEMA, "determinism tree diff fragment")
+    if ({key: doc[key] for key in ("artifact_type", "job_instance_id", "release", "schema_version")} != {
+            "artifact_type": "artifact-tree-diff-fragment", "job_instance_id": _DETERMINISM_JOB_ID,
+            "release": RELEASE, "schema_version": DETERMINISM_FRAGMENT_SCHEMA}):
+        raise evidence.EvidenceError("determinism fragment has unsupported identity")
+    for field in ("fixture_digest", "fixture_manifest_digest", "h0_fragment_digest"):
+        _digest(doc[field], f"determinism fragment {field}")
+    runs = [_read_determinism_run(row, f"determinism run {index}")
+            for index, row in enumerate(_array(doc["runs"], "determinism runs"))]
+    if [row["id"] for row in runs] != ["run-1", "run-2"] or len(runs) != 2:
+        raise evidence.EvidenceError("determinism fragment must contain exactly two isolated runs")
+    left, right = ({row["path"]: row for row in run["files"]} for run in runs)
+    expected = [
+        {"left": left.get(path), "path": path, "right": right.get(path)}
+        for path in sorted(set(left) | set(right)) if left.get(path) != right.get(path)
+    ]
+    differences = _array(doc["differences"], "determinism differences")
+    if differences != expected or _integer(doc["artifact_differences"], "artifact differences") != len(expected):
+        raise evidence.EvidenceError("determinism differences do not recompute from both retained trees")
+    return doc
 
 _MANIFEST_TEST_SOURCES = (
     "manifest-run-contract-tests",
@@ -5168,6 +5296,105 @@ def _semantic_static_security(
         raise evidence.EvidenceError("static security gate-evidence measurements do not match recomputed findings")
 
 
+def _semantic_determinism(
+    gate: dict, bodies: Mapping[str, bytes], **context: object,
+) -> None:
+    """Reconcile the candidate-bound diff with its retained two-run shard fragment."""
+    identity, report, scope, resolver, inputs, thresholds = (
+        context["identity"], context["report"], context["scope"], context["resolver"],
+        context["input_bodies"], context["thresholds"],
+    )
+    if (not all(isinstance(value, dict) for value in (identity, report, scope, thresholds)) or
+            not isinstance(resolver, ArtifactResolver) or not isinstance(inputs, Mapping)):
+        raise evidence.EvidenceError("determinism verifier requires accepted release context")
+    signed = {item["name"]: item for item in gate["artifacts"]}
+    body = bodies.get("artifact-tree-diff")
+    if type(body) is not bytes or signed.get("artifact-tree-diff", {}).get("digest") != raw_sha256(body):
+        raise evidence.EvidenceError("artifact tree diff does not match its exact signed digest")
+    doc = _object(_artifact_document(body, "B-DETERMINISM", "artifact-tree-diff"),
+                  "artifact tree diff", {
+        "artifact_differences", "artifact_type", "bindings", "candidate_identity_digest",
+        "differences", "environment", "evidence_finished_at", "evidence_instance_id",
+        "evidence_started_at", "fixture_digest", "fixture_manifest_digest", "gate_id", "h0_fragment_digest",
+        "job_instance_id", "name", "raw_fragment_digest", "release", "runs",
+        "schema_version", "toolchain",
+    })
+    _schema(doc, ARTIFACT_TREE_DIFF_SCHEMA, "artifact tree diff")
+    if {key: doc[key] for key in ("artifact_type", "candidate_identity_digest", "gate_id", "name", "release", "schema_version")} != {
+        "artifact_type": "artifact-tree-diff", "candidate_identity_digest": evidence.canonical_digest(identity),
+        "gate_id": "B-DETERMINISM", "name": "artifact-tree-diff", "release": RELEASE,
+        "schema_version": ARTIFACT_TREE_DIFF_SCHEMA,
+    }:
+        raise evidence.EvidenceError("artifact tree diff has the wrong candidate, gate or release")
+    _integer(doc["artifact_differences"], "artifact tree diff difference count")
+    wrapper_runs = [
+        _read_determinism_run(row, f"artifact tree diff run {index}")
+        for index, row in enumerate(_array(doc["runs"], "artifact tree diff runs"))
+    ]
+    if [row["id"] for row in wrapper_runs] != ["run-1", "run-2"] or len(wrapper_runs) != 2:
+        raise evidence.EvidenceError("artifact tree diff must contain exactly two isolated runs")
+    instances = report["instances"]
+    if len(instances) != 1 or instances[0]["lane"] != "H0-hermetic" or instances[0]["environment"]["python"].rsplit(".", 1)[0] != "3.12":
+        raise evidence.EvidenceError("artifact tree diff requires one exact Python 3.12 H0 instance")
+    instance = instances[0]
+    if (any(doc[field] != instance[key] for field, key in (
+                ("evidence_instance_id", "id"), ("environment", "environment"),
+                ("evidence_started_at", "started_at"), ("evidence_finished_at", "finished_at"))) or
+            doc["toolchain"] != instance["toolchain"]):
+        raise evidence.EvidenceError("artifact tree diff does not bind its exact signed H0 instance/toolchain")
+    expected_bindings = []
+    by_name = {row["name"]: row for row in scope["input_bindings"]}
+    for name in _DETERMINISM_BINDINGS:
+        row, input_body = by_name.get(name), inputs.get(name)
+        if row is None or type(input_body) is not bytes or raw_sha256(input_body) != row["digest"]:
+            raise evidence.EvidenceError("determinism source binding is absent or drifted")
+        expected_bindings.append({"digest": row["digest"], "name": name, "path": row["path"]})
+    if doc["bindings"] != expected_bindings:
+        raise evidence.EvidenceError("artifact tree diff does not bind the exact fixture/source manifests")
+    fixture_body = inputs.get("determinism-fixture")
+    if type(fixture_body) is not bytes:
+        raise evidence.EvidenceError("determinism fixture source is absent")
+    fixture = read_determinism_fixture(fixture_body)
+    fragment_body = resolver.read("B-DETERMINISM", "artifact-tree-diff-fragment")
+    fragment = read_determinism_fragment(fragment_body)
+    if doc["raw_fragment_digest"] != raw_sha256(fragment_body):
+        raise evidence.EvidenceError("artifact tree diff does not bind its retained raw fragment")
+    for field in ("artifact_differences", "differences", "fixture_digest", "fixture_manifest_digest", "h0_fragment_digest", "job_instance_id", "release", "runs"):
+        if doc[field] != fragment[field]:
+            raise evidence.EvidenceError("artifact tree diff does not reproduce the exact raw paired-tree facts")
+    if (doc["fixture_manifest_digest"] != raw_sha256(fixture_body) or
+            len(fixture["artifacts"]) != len(fragment["runs"][0]["files"])):
+        raise evidence.EvidenceError("artifact tree diff fixture binding does not reconcile")
+    expected_runs = [
+        _determinism_expected_tree(fixture, "run-1"),
+        _determinism_expected_tree(fixture, "run-2"),
+    ]
+    if fragment["runs"] != expected_runs:
+        raise evidence.EvidenceError("determinism trees do not recompute from the frozen fixture bytes")
+    if doc["fixture_digest"] != expected_runs[0]["tree_digest"]:
+        raise evidence.EvidenceError("determinism fixture digest is not the derived fixture-tree identity")
+    h0 = _artifact_document(resolver.read("B-HERMETIC-ALL", "test-report"), "B-HERMETIC-ALL", "test-report")
+    run = next((row for row in h0["runs"] if row["environment"]["python"].rsplit(".", 1)[0] == "3.12"), None)
+    if (doc["job_instance_id"] != _DETERMINISM_JOB_ID or run is None or
+            run["evidence_instance_id"] != instance["id"] or
+            next((row["digest"] for row in run["fragments"] if row["job_instance_id"] == _DETERMINISM_JOB_ID), None) != doc["h0_fragment_digest"]):
+        raise evidence.EvidenceError("artifact tree diff does not bind the exact shard-0 H0 fragment")
+    rows = [row for row in thresholds["thresholds"] if row["gate_id"] == "B-DETERMINISM"]
+    expected_threshold = ("B-DETERMINISM", "absolute", "artifact_differences", "at_most", "maximum", "count")
+    if [tuple(row[key] for key in ("gate_id", "class", "metric", "operator", "statistic", "unit")) for row in rows] != [expected_threshold]:
+        raise evidence.EvidenceError("determinism threshold metric contract is not frozen")
+    threshold = rows[0]
+    if threshold["limit"] != 0 or doc["artifact_differences"] > threshold["limit"]:
+        raise evidence.EvidenceError("artifact tree diff contains a definitionally required threshold breach")
+    expected_measurements = [{
+        "baseline_digest": threshold["baseline_digest"], "class": threshold["class"],
+        "invalidated_trials": 0, "metric": "artifact_differences", "observed_trials": 1,
+        "statistic": "maximum", "unit": "count", "value": doc["artifact_differences"],
+    }]
+    if report["measurements"] != expected_measurements:
+        raise evidence.EvidenceError("determinism gate-evidence measurements do not match recomputed diff")
+
+
 def _semantic_manifest(
     gate: dict, bodies: Mapping[str, bytes], **context: object,
 ) -> None:
@@ -5800,6 +6027,7 @@ SEMANTIC_VERIFIERS = MappingProxyType({
     "B-QUALITY": _semantic_quality,
     "B-COVERAGE": _semantic_coverage,
     "B-STATIC-SECURITY": _semantic_static_security,
+    "B-DETERMINISM": _semantic_determinism,
     "C-PACKAGE-BUILD": _semantic_package_build,
     "C-NETWORK-BOUNDARY": _semantic_network_boundary,
     "C-NET-DENY": _semantic_network_denial,

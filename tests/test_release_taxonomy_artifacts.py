@@ -707,6 +707,21 @@ class TestCommittedWorkflowParity:
         ] == [expected_report] * 2
         assert test_step["env"]["QUARRY_OFFLINE_CI"] == "1"
 
+        determinism_steps = [
+            step for step in offline["steps"]
+            if step.get("name") == "Determinism paired artifact-tree diff (existing Python 3.12 shard 0)"
+        ]
+        assert len(determinism_steps) == 1
+        determinism = determinism_steps[0]
+        assert determinism["if"] == "${{ matrix.python-version == '3.12' && matrix.shard == '0' }}"
+        assert shlex.split(determinism["run"]) == [
+            "python", "scripts/emit_determinism.py", "--fixture",
+            "release/evidence/determinism-fixture-v1.json", "--h0-fragment",
+            "$RUNNER_TEMP/h0-shard-3.12-0.json", "--job-instance-id",
+            ".github/workflows/ci.yml#jobs.offline[python-version=3.12,shard=0]",
+            "--output", "$RUNNER_TEMP/artifact-tree-diff-fragment.json",
+        ]
+
         upload_steps = [
             step for step in offline["steps"]
             if step.get("name") == "Upload H0 shard outcome"
@@ -725,6 +740,7 @@ class TestCommittedWorkflowParity:
                 "${{ runner.temp }}/quarry-coverage-3.12-${{ matrix.shard }}*\n"
                 "${{ runner.temp }}/coverage-shard-${{ matrix.shard }}.json\n"
                 "${{ runner.temp }}/security-scan-fragment.json\n"
+                "${{ runner.temp }}/artifact-tree-diff-fragment.json\n"
             ),
             "if-no-files-found": "error",
         }

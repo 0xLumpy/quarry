@@ -4,7 +4,7 @@
   "additionalProperties": false,
   "properties": {
     "approval": {"oneOf": [{"$ref": "#/$defs/review"}, {"type": "null"}]},
-    "input_bindings": {"items": {"$ref": "#/$defs/binding"}, "maxItems": 99, "minItems": 99, "type": "array", "uniqueItems": true},
+    "input_bindings": {"items": {"$ref": "#/$defs/binding"}, "maxItems": 108, "minItems": 108, "type": "array", "uniqueItems": true},
     "obligations": {"items": {"$ref": "#/$defs/obligation"}, "maxItems": 64, "minItems": 64, "type": "array", "uniqueItems": true},
     "production_trust_policy": {
       "additionalProperties": false,
@@ -12,7 +12,7 @@
       "required": ["digest", "name", "path", "required_before_nomination"],
       "type": "object"
     },
-    "record_inputs": {"items": {"$ref": "#/$defs/token"}, "maxItems": 102, "minItems": 102, "type": "array", "uniqueItems": true},
+    "record_inputs": {"items": {"$ref": "#/$defs/token"}, "maxItems": 111, "minItems": 111, "type": "array", "uniqueItems": true},
     "release": {"const": "0.3.10"},
     "schema_version": {"const": "quarry.release-scope.v1"},
     "selected_record_slots": {"items": {"$ref": "#/$defs/gate"}, "maxItems": 56, "minItems": 56, "type": "array", "uniqueItems": true},
