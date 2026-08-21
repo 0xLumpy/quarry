@@ -365,6 +365,8 @@ def _h0_collection_nodes() -> list[str]:
         nodeid for case in fault_store_evidence.CASES for nodeid in case["nodeids"]
     )
     nodes.extend(contracts._FAULT_REVISION_NODEIDS)
+    nodes.extend(contracts._FAULT_FINALIZE_NODEIDS)
+    nodes.extend(contracts._FAULT_CAMPAIGN_NODEIDS)
     return sorted(set(nodes), key=lambda value: value.encode("utf-8"))
 
 
@@ -515,6 +517,15 @@ def _supporting_bodies(
                 gate_id=gate_id,
                 identity=identity,
                 nodeids=contracts._FAULT_REVISION_NODEIDS,
+            )
+        )
+    elif gate_id in contracts._FAULT_H0_MATRIX_CONTRACTS:
+        nodeids, _source_names = contracts._FAULT_H0_MATRIX_CONTRACTS[gate_id]
+        bodies["fault-matrix"] = contracts.canonical_json_line(
+            contracts._h0_fault_matrix_document(
+                gate_id=gate_id,
+                identity=identity,
+                nodeids=nodeids,
             )
         )
     elif gate_id == "B-SCHEMA":
@@ -1885,6 +1896,13 @@ def _scenario(tmp_path: Path, *, approved_at: str = "2026-08-01T00:00:00Z"):
                         "passed": count, "selected": count, "skipped": 0,
                         "xfailed": 0, "xpassed": 0,
                     }
+                if gate_id in contracts._FAULT_H0_MATRIX_CONTRACTS:
+                    count = len(contracts._FAULT_H0_MATRIX_CONTRACTS[gate_id][0])
+                    selection = {
+                        "collected": count, "deselected": 0, "failed": 0,
+                        "passed": count, "selected": count, "skipped": 0,
+                        "xfailed": 0, "xpassed": 0,
+                    }
                 if gate_id == "B-DOCS-POLICY":
                     selection = {
                         "collected": len(contracts._DOCS_POLICY_TEST_ROSTER), "deselected": 0,
@@ -2085,7 +2103,9 @@ def _scenario(tmp_path: Path, *, approved_at: str = "2026-08-01T00:00:00Z"):
             selection = copy.deepcopy(instances[0]["selection"])
         if gate_id == "B-MANIFEST":
             selection = copy.deepcopy(instances[0]["selection"])
-        if gate_id in {"C-FAULT-STORE", "C-FAULT-REVISION"}:
+        if gate_id in {
+            "C-FAULT-STORE", "C-FAULT-REVISION", *contracts._FAULT_H0_MATRIX_CONTRACTS,
+        }:
             selection = copy.deepcopy(instances[0]["selection"])
         rule = None
         reason = None
@@ -2708,7 +2728,7 @@ class TestIncompleteSemanticRegistry:
             | {
                 "A-IDENTITY", "A-EVIDENCE-SCHEMA", "A-TAXONOMY", "A-CORPUS", "A-THRESHOLDS", "A-SUPPORT",
                 "B-HERMETIC-ALL", "B-SCHEMA", "B-DOCS-POLICY", "B-MANIFEST", "B-QUALITY", "B-COVERAGE", "B-STATIC-SECURITY", "B-DETERMINISM",
-                "C-PACKAGE-BUILD", "C-PACKAGE-INSTALL", "C-PYTHON-MATRIX", "C-SBOM", "C-VULNERABILITY", "C-PROVENANCE", "C-SOURCE-REGISTRY", "C-PATH-IDENTITY", "C-FAULT-STORE", "C-FAULT-REVISION", "C-NETWORK-BOUNDARY", "C-NET-DENY",
+                "C-PACKAGE-BUILD", "C-PACKAGE-INSTALL", "C-PYTHON-MATRIX", "C-SBOM", "C-VULNERABILITY", "C-PROVENANCE", "C-SOURCE-REGISTRY", "C-PATH-IDENTITY", "C-FAULT-STORE", "C-FAULT-REVISION", "C-FAULT-FINALIZE", "C-FAULT-CAMPAIGN", "C-NETWORK-BOUNDARY", "C-NET-DENY",
                 *contracts.V310_05_SEMANTIC_GATES,
             }
         )
@@ -2904,6 +2924,64 @@ class TestFaultRevisionSemanticEvidence:
         document["records"][0]["result"]["subject"] = "tests/substituted.py::test_case"
         document["records"][0]["result_digest"] = evidence.canonical_digest(
             document["records"][0]["result"]
+        )
+        bodies["fault-matrix"] = contracts.canonical_json_line(document)
+        digest = contracts.raw_sha256(bodies["fault-matrix"])
+        next(row for row in gate["artifacts"] if row["name"] == "fault-matrix")["digest"] = digest
+        report["instances"][0]["artifacts"][0]["digest"] = digest
+        with pytest.raises(evidence.EvidenceError, match="exact frozen H0 roster"):
+            self._verify(arguments, gate, bodies, report)
+
+
+class TestFinalizeCampaignFaultSemanticEvidence:
+    @staticmethod
+    def _case(tmp_path, gate_id):
+        arguments = _scenario(tmp_path)
+        gate = _gate(arguments, gate_id)
+        indexed = {
+            row["name"]: row for row in arguments["artifact_index"]["artifacts"]
+            if row["gate_id"] == gate_id
+        }
+        bodies = {
+            "fault-matrix": (
+                arguments["artifact_root"] / indexed["fault-matrix"]["path"]
+            ).read_bytes(),
+        }
+        report = contracts.read_evidence_report(
+            (arguments["artifact_root"] / indexed["gate-evidence"]["path"]).read_bytes(),
+            identity=arguments["identity"],
+            gate_id=gate_id,
+        )
+        return arguments, gate, bodies, report
+
+    @staticmethod
+    def _verify(arguments, gate, bodies, report):
+        with contracts.ArtifactResolver(
+            arguments["artifact_root"], arguments["artifact_index"],
+            identity=arguments["identity"],
+        ) as resolver:
+            contracts._semantic_fault_h0_matrix(
+                gate,
+                bodies,
+                identity=arguments["identity"],
+                input_bodies=arguments["input_bodies"],
+                report=report,
+                resolver=resolver,
+                scope=arguments["scope"],
+            )
+
+    @pytest.mark.parametrize("gate_id", tuple(contracts._FAULT_H0_MATRIX_CONTRACTS))
+    def test_exact_fault_matrix_reuses_the_validated_h0_run(self, tmp_path, gate_id):
+        arguments, gate, bodies, report = self._case(tmp_path, gate_id)
+        self._verify(arguments, gate, bodies, report)
+
+    @pytest.mark.parametrize("gate_id", tuple(contracts._FAULT_H0_MATRIX_CONTRACTS))
+    def test_fault_case_substitution_fails_after_digest_rebinding(self, tmp_path, gate_id):
+        arguments, gate, bodies, report = self._case(tmp_path, gate_id)
+        document = json.loads(bodies["fault-matrix"])
+        document["records"][-1]["result"]["subject"] = "tests/substituted.py::test_case"
+        document["records"][-1]["result_digest"] = evidence.canonical_digest(
+            document["records"][-1]["result"]
         )
         bodies["fault-matrix"] = contracts.canonical_json_line(document)
         digest = contracts.raw_sha256(bodies["fault-matrix"])

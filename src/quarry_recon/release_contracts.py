@@ -555,6 +555,9 @@ RUN_MANIFEST_INPUT_PATHS = {
     "manifest-run-contract-tests": "tests/test_run_manifest_contract.py",
     "manifest-revision-tests": "tests/test_v310_revision_transaction.py",
     "manifest-campaign-tests": "tests/test_v310_campaign_truth.py",
+    "fault-campaign-settlement-tests": "tests/test_qr39_012_settlement.py",
+    "fault-finalize-lifecycle-tests": "tests/test_qr39_016_finalization.py",
+    "fault-finalize-seal-tests": "tests/test_phase1_finalization_seal.py",
 }
 SCOPE_INPUT_PATHS = {
     **SCHEMA_PATHS,
@@ -1131,6 +1134,95 @@ _FAULT_REVISION_NODEIDS = (
     "tests/test_v310_revision_transaction.py::test_post_durability_segment_substitution_never_settles_landed[False]",
     "tests/test_v310_revision_transaction.py::test_post_durability_segment_substitution_never_settles_landed[True]",
 )
+_FAULT_FINALIZE_NODEIDS = (
+    "tests/test_qr39_016_finalization.py::test_a_finished_run_walks_the_declared_states",
+    "tests/test_qr39_016_finalization.py::test_a_created_run_is_persisted_before_any_phase_runs",
+    "tests/test_qr39_016_finalization.py::test_illegal_transitions_are_refused[created-finalizing]",
+    "tests/test_qr39_016_finalization.py::test_illegal_transitions_are_refused[created-finished]",
+    "tests/test_qr39_016_finalization.py::test_illegal_transitions_are_refused[running-finished]",
+    "tests/test_qr39_016_finalization.py::test_illegal_transitions_are_refused[finished-running]",
+    "tests/test_qr39_016_finalization.py::test_illegal_transitions_are_refused[finished-created]",
+    "tests/test_qr39_016_finalization.py::test_a_report_only_failure_keeps_the_base_run_and_exits_five",
+    "tests/test_qr39_016_finalization.py::test_a_finalisation_failure_is_a_publication_fault_in_the_verdict",
+    "tests/test_qr39_016_finalization.py::test_the_operator_is_told_how_to_resume",
+    "tests/test_qr39_016_finalization.py::test_report_resumes_a_failed_finalisation_without_rescanning",
+    "tests/test_qr39_016_finalization.py::test_resumed_report_is_built_after_the_fault_clearing_manifest_rewrite",
+    "tests/test_qr39_016_finalization.py::test_a_resume_that_fails_again_stays_resumable",
+    "tests/test_qr39_016_finalization.py::test_a_published_view_is_generation_addressed_and_skipped_when_current",
+    "tests/test_qr39_016_finalization.py::test_finished_run_rejects_new_base_evidence_and_keeps_views_current",
+    "tests/test_phase1_finalization_seal.py::test_begin_finalization_fsyncs_canonical_base_files_and_directories_before_seal",
+    "tests/test_phase1_finalization_seal.py::test_a_base_fsync_failure_leaves_the_run_unsealed",
+    "tests/test_phase1_finalization_seal.py::test_a_thread_losing_to_the_seal_cannot_gain_base_authority[append]",
+    "tests/test_phase1_finalization_seal.py::test_a_thread_losing_to_the_seal_cannot_gain_base_authority[claim]",
+    "tests/test_phase1_finalization_seal.py::test_a_process_append_settles_before_the_waiting_seal",
+    "tests/test_phase1_finalization_seal.py::test_legacy_finalizing_transition_cannot_bypass_a_live_claim",
+    "tests/test_phase1_finalization_seal.py::test_finished_run_reopens_only_derived_publication_metadata",
+    "tests/test_phase1_finalization_seal.py::test_derived_reopen_refuses_manifest_damage_without_transition",
+    "tests/test_phase1_finalization_seal.py::test_cli_runs_base_classifiers_and_events_before_begin_finalization",
+    "tests/test_phase1_finalization_seal.py::test_report_uses_the_derived_reopen_and_leaves_base_bytes_unchanged",
+)
+_FAULT_CAMPAIGN_NODEIDS = (
+    "tests/test_qr39_012_settlement.py::TestResumeAtEveryBoundary::test_a_child_killed_BEFORE_its_run_existed_is_relaunched",
+    "tests/test_qr39_012_settlement.py::TestResumeAtEveryBoundary::test_a_child_killed_MID_PHASE_is_abandoned_and_the_campaign_goes_on",
+    "tests/test_qr39_012_settlement.py::TestResumeAtEveryBoundary::test_a_child_killed_AFTER_its_manifest_is_adopted_not_rerun",
+    "tests/test_qr39_012_settlement.py::TestResumeAtEveryBoundary::test_a_kill_between_ABSORBING_and_recording_replays_the_same_deltas",
+    "tests/test_qr39_012_settlement.py::TestResumeAtEveryBoundary::test_a_kill_between_children_resumes_at_the_next_one",
+    "tests/test_qr39_012_settlement.py::TestResumeAtEveryBoundary::test_what_the_killed_children_LEARNED_reaches_the_next_one",
+    "tests/test_qr39_012_settlement.py::TestResumeAtEveryBoundary::test_a_resumed_campaign_keeps_its_OBLIGATIONS",
+    "tests/test_qr39_012_settlement.py::TestResumeAtEveryBoundary::test_a_kill_between_DECIDING_and_recording_the_stop_runs_no_further_child",
+    "tests/test_qr39_012_settlement.py::TestResumeAtEveryBoundary::test_a_persisted_max_runs_decision_is_not_reinterpreted_under_a_larger_resume_bound",
+    "tests/test_qr39_012_settlement.py::TestResumeAtEveryBoundary::test_an_abandoned_child_is_a_TERMINAL_ledger_state",
+    "tests/test_qr39_012_settlement.py::TestResumeAtEveryBoundary::test_a_child_RESERVED_when_the_campaign_stops_is_not_left_dangling",
+    "tests/test_qr39_012_settlement.py::TestResumeAtEveryBoundary::test_a_FINISHED_campaign_is_still_refused",
+    "tests/test_qr39_012_settlement.py::TestResumeAtEveryBoundary::test_a_CORRUPT_ledger_is_never_resumed",
+    "tests/test_qr39_012_settlement.py::TestResumeAtEveryBoundary::test_a_resume_takes_the_project_LEASE_like_any_campaign",
+    "tests/test_qr39_012_settlement.py::TestAbsorbingIsIdempotent::test_absorbing_one_run_TWICE_reports_the_deltas_once",
+    "tests/test_qr39_012_settlement.py::TestAbsorbingIsIdempotent::test_a_replayed_absorb_survives_a_REOPEN",
+    "tests/test_qr39_012_settlement.py::TestAbsorbingIsIdempotent::test_an_UNREADABLE_absorption_record_is_not_believed",
+    "tests/test_v310_campaign_truth.py::test_a_later_silent_child_cannot_launder_an_earlier_gap",
+    "tests/test_v310_campaign_truth.py::test_optional_gap_identity_fields_have_a_total_canonical_order",
+    "tests/test_v310_campaign_truth.py::test_only_matching_positive_coverage_resolves_the_historical_gap",
+    "tests/test_v310_campaign_truth.py::test_mismatched_or_incomplete_coverage_cannot_resolve_a_gap[wrong-source]",
+    "tests/test_v310_campaign_truth.py::test_mismatched_or_incomplete_coverage_cannot_resolve_a_gap[wrong-measure]",
+    "tests/test_v310_campaign_truth.py::test_mismatched_or_incomplete_coverage_cannot_resolve_a_gap[incomplete-coverage]",
+    "tests/test_v310_campaign_truth.py::test_matching_obligation_evidence_can_resolve_an_unmeasured_remainder_gap",
+    "tests/test_v310_campaign_truth.py::test_gap_history_and_resolution_survive_reload",
+    "tests/test_v310_campaign_truth.py::test_contradictory_terminal_documents_are_unusable[success]",
+    "tests/test_v310_campaign_truth.py::test_contradictory_terminal_documents_are_unusable[clean]",
+    "tests/test_v310_campaign_truth.py::test_contradictory_terminal_documents_are_unusable[terminal]",
+    "tests/test_v310_campaign_truth.py::test_contradictory_terminal_documents_are_unusable[non-terminal]",
+    "tests/test_v310_campaign_truth.py::test_contradictory_terminal_documents_are_unusable[open-gaps]",
+    "tests/test_v310_campaign_truth.py::test_a_forged_resolution_without_matching_evidence_is_unusable",
+    "tests/test_v310_campaign_truth.py::test_persisted_spend_rows_must_keep_the_strict_run_summary_shape",
+    "tests/test_v310_campaign_truth.py::test_duplicate_coverage_proofs_are_not_a_second_resolution_fact",
+    "tests/test_v310_campaign_truth.py::test_an_intentional_limit_does_not_redefine_fixed_point_cleanliness",
+    "tests/test_v310_campaign_truth.py::test_fixed_point_success_can_coexist_with_abandonment_but_is_not_clean",
+    "tests/test_v310_campaign_truth.py::test_terminal_breakdown_must_equal_the_final_obligation_totals",
+    "tests/test_v310_campaign_truth.py::test_a_manifested_child_cannot_erase_the_mandatory_obligation_roster",
+    "tests/test_v310_campaign_truth.py::test_a_later_child_cannot_erase_a_previously_named_obligation_unit",
+    "tests/test_v310_campaign_truth.py::test_a_symlinked_campaign_directory_cannot_supply_or_receive_the_ledger",
+    "tests/test_v310_campaign_truth.py::test_a_nonprivate_or_nonregular_ledger_is_never_campaign_authority[symlink]",
+    "tests/test_v310_campaign_truth.py::test_a_nonprivate_or_nonregular_ledger_is_never_campaign_authority[hardlink]",
+    "tests/test_v310_campaign_truth.py::test_a_nonprivate_or_nonregular_ledger_is_never_campaign_authority[mode]",
+    "tests/test_v310_campaign_truth.py::test_a_nonprivate_or_nonregular_ledger_is_never_campaign_authority[fifo]",
+    "tests/test_v310_campaign_truth.py::test_a_ledger_changed_during_its_descriptor_read_is_unusable",
+    "tests/test_v310_campaign_truth.py::test_union_recovery_is_a_permanent_campaign_cleanliness_debt",
+    "tests/test_v310_campaign_truth.py::test_a_finished_campaign_cannot_read_clean_after_its_union_is_deleted",
+    "tests/test_v310_campaign_truth.py::test_a_symlinked_union_artifact_cannot_certify_campaign_cleanliness[pointer]",
+    "tests/test_v310_campaign_truth.py::test_a_symlinked_union_artifact_cannot_certify_campaign_cleanliness[generation]",
+    "tests/test_v310_campaign_truth.py::test_a_zero_count_obligation_cannot_claim_a_nonzero_disposition[terminal]",
+    "tests/test_v310_campaign_truth.py::test_a_zero_count_obligation_cannot_claim_a_nonzero_disposition[remainder]",
+)
+_FAULT_H0_MATRIX_CONTRACTS = MappingProxyType({
+    "C-FAULT-FINALIZE": (
+        _FAULT_FINALIZE_NODEIDS,
+        ("fault-finalize-lifecycle-tests", "fault-finalize-seal-tests"),
+    ),
+    "C-FAULT-CAMPAIGN": (
+        _FAULT_CAMPAIGN_NODEIDS,
+        ("fault-campaign-settlement-tests", "manifest-campaign-tests"),
+    ),
+})
 # This is the owner subset for B-MANIFEST's semantic authority.  Candidate
 # identity still binds the full source closure; projections and durability have
 # different gate owners and are intentionally not duplicated here.
@@ -6622,6 +6714,65 @@ def _semantic_fault_revision(
     )
 
 
+def _semantic_fault_h0_matrix(
+    gate: dict, bodies: Mapping[str, bytes], **context: object,
+) -> None:
+    """Reconcile one frozen finalization/campaign matrix with retained H0."""
+    gate_id = gate["gate_id"]
+    contract = _FAULT_H0_MATRIX_CONTRACTS.get(gate_id)
+    identity = context["identity"]
+    report = context["report"]
+    resolver = context["resolver"]
+    scope = context["scope"]
+    inputs = context["input_bodies"]
+    if (contract is None or not isinstance(identity, dict) or not isinstance(report, dict) or
+            not isinstance(resolver, ArtifactResolver) or not isinstance(scope, dict) or
+            not isinstance(inputs, Mapping)):
+        raise evidence.EvidenceError("fault H0 matrix verifier requires accepted aggregate context")
+    nodeids, source_names = contract
+    bindings = {row["name"]: row for row in scope["input_bindings"]}
+    for source_name in source_names:
+        binding = bindings.get(source_name)
+        source_body = inputs.get(source_name)
+        if (binding is None or binding["path"] != SCOPE_INPUT_PATHS[source_name] or
+                type(source_body) is not bytes or raw_sha256(source_body) != binding["digest"]):
+            raise evidence.EvidenceError(f"{gate_id} test source is absent, redirected or drifted")
+
+    matrix_body = bodies.get("fault-matrix")
+    matrix_record = next(
+        (row for row in gate["artifacts"] if row["name"] == "fault-matrix"), None,
+    )
+    if (type(matrix_body) is not bytes or matrix_record is None or
+            matrix_record["media_type"] != "application/json" or
+            matrix_record["digest"] != raw_sha256(matrix_body)):
+        raise evidence.EvidenceError(f"{gate_id} matrix does not match its signed gate record")
+    _validate_h0_fault_matrix(
+        matrix_body, gate_id=gate_id, identity=identity, nodeids=nodeids,
+    )
+
+    instances = report["instances"]
+    count = len(nodeids)
+    selection = {
+        "collected": count, "deselected": 0, "failed": 0, "passed": count,
+        "selected": count, "skipped": 0, "xfailed": 0, "xpassed": 0,
+    }
+    if len(instances) != 1 or instances[0]["lane"] != "H0-hermetic":
+        raise evidence.EvidenceError(f"{gate_id} evidence requires one exact signed H0 instance")
+    instance = instances[0]
+    if (instance["selection"] != selection or gate["selection"] != selection or
+            instance["artifacts"] != [{"digest": raw_sha256(matrix_body), "name": "fault-matrix"}]):
+        raise evidence.EvidenceError(
+            f"{gate_id} signed H0 record does not own and select the exact frozen roster"
+        )
+    _reconcile_h0_node_subset(
+        resolver=resolver,
+        identity=identity,
+        instance=instance,
+        nodeids=nodeids,
+        label=gate_id,
+    )
+
+
 def _semantic_manifest(
     gate: dict, bodies: Mapping[str, bytes], **context: object,
 ) -> None:
@@ -7424,6 +7575,8 @@ SEMANTIC_VERIFIERS = MappingProxyType({
     "C-PATH-IDENTITY": _semantic_path_identity,
     "C-FAULT-STORE": _semantic_fault_store,
     "C-FAULT-REVISION": _semantic_fault_revision,
+    "C-FAULT-FINALIZE": _semantic_fault_h0_matrix,
+    "C-FAULT-CAMPAIGN": _semantic_fault_h0_matrix,
     "C-PACKAGE-BUILD": _semantic_package_build,
     "C-PYTHON-MATRIX": _semantic_python_matrix,
     "C-NETWORK-BOUNDARY": _semantic_network_boundary,

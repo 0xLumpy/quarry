@@ -342,6 +342,13 @@ path-substitution refusals.  The verifier binds that exact source and roster to
 one complete passing `B-HERMETIC-ALL` run; it never launches a duplicate suite.
 The gate remains `OPEN` until the signed H0 record is accepted.
 
+`C-FAULT-FINALIZE` and `C-FAULT-CAMPAIGN` follow that same no-rerun model.
+The former freezes 25 lifecycle, retry, publication and seal cases.  The latter
+freezes 50 resume-boundary, absorption, historical-gap, terminal-ledger and
+union-truth cases.  Their source files and exact node projections are scope
+bound, and each verifier requires one complete passing retained H0 run.  Both
+remain `OPEN` until their signed H0 records are accepted.
+
 #### Performance and scale matrix
 
 Performance claims require a versioned benchmark manifest. It identifies the
