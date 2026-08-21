@@ -544,15 +544,18 @@ class _WrapSink:
     """Wraps a real file handle, delegating flush/fileno/context so `_write_and_measure` sees the true
     on-disk size, but letting `write` lie about how many bytes it stored."""
 
-    def __init__(self, fh, writer):
+    def __init__(self, fh, writer, flusher=None):
         self.fh = fh
         self._writer = writer
+        self._flusher = flusher
 
     def write(self, data):
         return self._writer(self.fh, data)
 
     def flush(self):
-        self.fh.flush()
+        if self._flusher is None:
+            return self.fh.flush()
+        return self._flusher(self.fh)
 
     def fileno(self):
         return self.fh.fileno()
@@ -565,10 +568,12 @@ class _WrapSink:
         return self.fh.__exit__(*a)
 
 
-def _inject_sink(monkeypatch, writer):
+def _inject_sink(monkeypatch, writer, flusher=None):
     """Patch the `.part` opener to wrap the real (O_NOFOLLOW) handle with a writer that can lie."""
     real = contract._open_part_wb
-    monkeypatch.setattr(contract, "_open_part_wb", lambda p: _WrapSink(real(p), writer))
+    monkeypatch.setattr(
+        contract, "_open_part_wb", lambda p: _WrapSink(real(p), writer, flusher),
+    )
 
 
 class TestDurableByteAccounting:
@@ -616,11 +621,14 @@ class TestDurableByteAccounting:
 
     def test_a_flush_failure_keeps_the_retained_bytes_charged(self, tmp_path, monkeypatch):
         # the reservation must NOT be fully refunded when bytes landed on disk before the flush failed
-        def _land_then_fail(fh, data):
-            fh.write(data)
+        def _land(fh, data):
+            return fh.write(data)
+
+        def _flush_then_fail(fh):
             fh.flush()                                # the 20 bytes reach disk...
-            raise OSError("flush failed")             # ...then the flush raises
-        _inject_sink(monkeypatch, _land_then_fail)
+            raise OSError("flush failed")             # ...then flush itself reports failure
+
+        _inject_sink(monkeypatch, _land, _flush_then_fail)
         state = tmp_path / "state" / "acquire-project-bytes.json"
         state.parent.mkdir(parents=True)
         gov = contract.DiskGovernor(run_max=100, project_max=100, reserve_bytes=0, project_state=state)

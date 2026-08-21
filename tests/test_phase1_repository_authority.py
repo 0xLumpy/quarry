@@ -80,6 +80,19 @@ def _mutate_base(run, operation):
         return run.add("subdomain", {"host": "late.acme.example", "source": "authority-test"})
     if operation == "inherit":
         return run.inherit("subdomain", {"host": "inherited.acme.example", "source": "authority-test"})
+    if operation == "fresh_artifact_dir":
+        return run.fresh_artifact_dir("raw", "authority-test", "late")
+    if operation == "create_artifact_dir":
+        return run.create_artifact_dir("raw", "authority-test", "late-exact")
+    if operation == "artifact_claim":
+        with run.artifact_claim("raw", "authority-test", "late.bin"):
+            return None
+    if operation == "managed_acquisition_claim":
+        with run.managed_acquisition_claim("raw", "authority-test", "late.bin"):
+            return None
+    if operation == "managed_acquisition_discard_claim":
+        with run.managed_acquisition_discard_claim("raw", "authority-test", "late.bin"):
+            return None
     raise AssertionError(operation)
 
 
@@ -114,6 +127,8 @@ def test_run_open_does_not_materialize_the_lock_or_missing_run_directories(tmp_p
 @pytest.mark.parametrize("lifecycle", ["finalizing", "finished", "finalization_failed"])
 @pytest.mark.parametrize("operation", [
     "raw_path", "record", "commit_fault", "commit_gap", "add", "inherit",
+    "fresh_artifact_dir", "create_artifact_dir", "artifact_claim",
+    "managed_acquisition_claim", "managed_acquisition_discard_claim",
 ])
 def test_every_public_base_mutator_rejects_after_the_base_seal(tmp_path, lifecycle, operation):
     run = _running_run(tmp_path)

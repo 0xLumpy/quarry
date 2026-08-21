@@ -69,6 +69,11 @@ _SEALED_NODEIDS = tuple(
         "commit_gap",
         "add",
         "inherit",
+        "fresh_artifact_dir",
+        "create_artifact_dir",
+        "artifact_claim",
+        "managed_acquisition_claim",
+        "managed_acquisition_discard_claim",
     )
     for lifecycle in ("finalizing", "finished", "finalization_failed")
 )
@@ -112,7 +117,7 @@ CASES = (
     _case(
         "manifest-boundary",
         "manifest",
-        "the canonical manifest commits exact base bytes and every semantic corruption fails closed",
+        "the canonical manifest commits exact base bytes and all seven frozen semantic corruptions fail closed",
         "tests/test_run_manifest_contract.py::"
         "test_writer_emits_one_canonical_reconciled_v1_manifest",
         *(
@@ -143,7 +148,7 @@ CASES = (
     _case(
         "reopen-boundary",
         "reopen",
-        "reopen preserves degradation and classifies every torn journal suffix as a durable gap",
+        "reopen preserves degradation and classifies the three frozen torn-suffix classes as durable gaps",
         "tests/test_events.py::TestDegradationDurableAcrossResume::"
         "test_persisted_degradation_reloaded_on_reconfigure",
         "tests/test_phase1_mutation_authority.py::"
@@ -156,7 +161,7 @@ CASES = (
     _case(
         "seal-boundary",
         "seal",
-        "every public base mutator and authority-owned event path refuse without mutation after sealing",
+        "all eleven frozen public base mutators and authority-owned claim/event paths refuse without mutation after sealing",
         *_SEALED_NODEIDS,
         "tests/test_phase1_artifact_claim_authority.py::"
         "test_path_scoped_claim_refuses_after_seal_without_a_stage_side_effect",
@@ -166,7 +171,7 @@ CASES = (
     _case(
         "close-reconciliation",
         "close",
-        "reported close faults distinguish a durable commit from an unchanged prior journal",
+        "reported post-durability close faults remain explicit while preserving exact committed bytes",
         "tests/test_phase1_mutation_authority.py::"
         "test_normalized_journal_fault_rolls_back_exact_prior[close]",
         "tests/test_phase1_privfs_core.py::"
@@ -216,6 +221,21 @@ def _pairs(pairs):
     return result
 
 
+def _same_json_type(left: object, right: object) -> bool:
+    """Compare parsed JSON without Python's bool/int or int/float coercions."""
+    if type(left) is not type(right):
+        return False
+    if type(left) is dict:
+        return left.keys() == right.keys() and all(
+            _same_json_type(left[key], right[key]) for key in left
+        )
+    if type(left) is list:
+        return len(left) == len(right) and all(
+            _same_json_type(a, b) for a, b in zip(left, right)
+        )
+    return left == right
+
+
 def _parse(raw: bytes) -> dict:
     if type(raw) is not bytes or not raw or len(raw) > MAX_BYTES:
         raise FaultStoreEvidenceError(
@@ -231,7 +251,7 @@ def _parse(raw: bytes) -> dict:
         )
     except FaultStoreEvidenceError:
         raise
-    except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
+    except (UnicodeError, json.JSONDecodeError, RecursionError, ValueError) as exc:
         raise FaultStoreEvidenceError("fault-store JSON is invalid") from exc
     if type(document) is not dict:
         raise FaultStoreEvidenceError("fault-store document must be an object")
@@ -264,7 +284,7 @@ def canonical_case_manifest_bytes() -> bytes:
 
 def read_case_manifest(raw: bytes) -> dict:
     document = _parse(raw)
-    if document != case_manifest_document():
+    if not _same_json_type(document, case_manifest_document()):
         raise FaultStoreEvidenceError(
             "fault-store case manifest differs from the frozen v1 roster"
         )
@@ -348,7 +368,7 @@ def verify_source_plan(
         candidate_identity_digest=candidate_identity_digest,
         input_bodies=input_bodies,
     )
-    if document != expected:
+    if not _same_json_type(document, expected):
         raise FaultStoreEvidenceError(
             "fault-store source plan differs from exact candidate inputs"
         )

@@ -316,7 +316,7 @@ boundary. A result is not green merely because the process exits.
 | `C-FAULT-INTERRUPT` | Interrupt at every externally visible transition | Exit/result precedence is deterministic; committed evidence remains readable; resumption is explicit |
 
 The committed `C-FAULT-STORE` v1 case manifest freezes nine production
-boundaries and 45 exact pytest node IDs.  Its candidate-bound companion is a
+boundaries and 60 exact pytest node IDs.  Its candidate-labeled companion is a
 source plan only: every case is `not_executed`, every outcome digest is null,
 and all signing, H0 isolation, ownership, interval and toolchain claims are
 false.  Local execution of the roster checks the implementation during

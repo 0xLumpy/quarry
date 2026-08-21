@@ -46,7 +46,7 @@ def test_committed_case_manifest_is_the_exact_canonical_source_roster():
     document = fault_store.read_case_manifest(raw)
     assert raw == fault_store.canonical_case_manifest_bytes()
     assert document["case_count"] == fault_store.CASE_COUNT == 9
-    assert document["node_count"] == fault_store.NODE_COUNT == 45
+    assert document["node_count"] == fault_store.NODE_COUNT == 60
     assert [case["boundary"] for case in document["cases"]] == [
         "write",
         "flush",
@@ -59,7 +59,7 @@ def test_committed_case_manifest_is_the_exact_canonical_source_roster():
         "close",
     ]
     nodeids = [nodeid for case in document["cases"] for nodeid in case["nodeids"]]
-    assert len(nodeids) == len(set(nodeids)) == 45
+    assert len(nodeids) == len(set(nodeids)) == 60
     assert all(
         nodeid.startswith("tests/") and "::test_" in nodeid for nodeid in nodeids
     )
@@ -83,7 +83,7 @@ def test_source_plan_binds_exact_candidate_inputs_but_claims_no_execution(source
         )
         == document
     )
-    assert document["case_count"] == 9 and document["node_count"] == 45
+    assert document["case_count"] == 9 and document["node_count"] == 60
     assert all(case["execution_status"] == "not_executed" for case in document["cases"])
     assert all(case["outcome_digest"] is None for case in document["cases"])
     assert document["attestation"] == {
@@ -120,6 +120,8 @@ def test_source_plan_binds_exact_candidate_inputs_but_claims_no_execution(source
         "execution",
         "outcome",
         "promotion",
+        "numeric-promotion",
+        "float-count",
         "attestation",
         "unknown",
     ],
@@ -146,6 +148,10 @@ def test_manual_reader_rejects_substitution_and_promotion(source_plan, mutation)
         changed["cases"][0]["outcome_digest"] = "sha256:" + "c" * 64
     elif mutation == "promotion":
         changed["semantic_promotion"] = True
+    elif mutation == "numeric-promotion":
+        changed["semantic_promotion"] = 0
+    elif mutation == "float-count":
+        changed["case_count"] = 9.0
     elif mutation == "attestation":
         changed["attestation"]["signed"] = True
     else:
@@ -189,6 +195,9 @@ def test_schema_and_manual_shape_contracts_are_exact(source_plan):
         reordered["cases"][0],
     )
     malformed.append((reordered, manifest_validator))
+    numeric_manifest = copy.deepcopy(manifest)
+    numeric_manifest["semantic_promotion"] = 0
+    malformed.append((numeric_manifest, manifest_validator))
     promoted = copy.deepcopy(document)
     promoted["semantic_promotion"] = True
     malformed.append((promoted, plan_validator))
@@ -215,6 +224,17 @@ def test_schema_and_manual_shape_contracts_are_exact(source_plan):
             candidate_identity_digest=_CANDIDATE,
             input_bodies=bodies,
         )
+    nested = b"[" * 2048 + b"0" + b"]" * 2048 + b"\n"
+    with pytest.raises(fault_store.FaultStoreEvidenceError):
+        fault_store.read_source_plan(
+            nested,
+            candidate_identity_digest=_CANDIDATE,
+            input_bodies=bodies,
+        )
+
+    numeric_manifest_raw = fault_store._canonical(numeric_manifest)
+    with pytest.raises(fault_store.FaultStoreEvidenceError):
+        fault_store.read_case_manifest(numeric_manifest_raw)
 
 
 def test_producer_emits_only_canonical_non_promoting_outputs(tmp_path):
