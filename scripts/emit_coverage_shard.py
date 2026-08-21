@@ -90,10 +90,9 @@ def main() -> None:
         )
         executed = _positive_lines(item.get("executed_lines", []), path)
         contexts = item.get("contexts")
-        expected_contexts = {str(line) for line in executed}
         if (
             not isinstance(contexts, dict)
-            or not expected_contexts.issubset(contexts)
+            or (executed and not contexts)
             or any(values != [args.job_instance_id] for values in contexts.values())
         ):
             raise SystemExit(

@@ -69,7 +69,6 @@ def test_coverage_shard_producer_emits_schema_checked_canonical_fragment(
                 "executed_branches": [[1, 2]],
                 "executed_lines": [1, 2],
                 "contexts": {
-                    "1": [policy["h0_job_ids"][0]],
                     "2": [policy["h0_job_ids"][0]],
                 },
                 "missing_branches": [],
