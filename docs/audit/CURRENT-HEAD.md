@@ -170,7 +170,7 @@ source” refers to `474d848`, not the current taxonomy-reconciliation identity.
 | `VERIFIED-NARROW` | `QR39-006` | Newly created run/evidence artifacts use private creation primitives rather than depending on umask. | `7e44385`; `src/quarry_recon/privfs.py`; `tests/test_qr39_006_permissions.py` | Existing files, symlinks, ownership and migration remain open in `HEAD-02`/`HEAD-05`. |
 | `VERIFIED-NARROW` | `QR39-009` | Normal delayed-OOB ingestion routes through revision supplements rather than appending normalized evidence to a sealed base. | `d598dd7`; `src/quarry_recon/revision.py::ingest`; `tests/test_qr39_009_oob_revision.py`; `tests/test_qr39_009_revision_sealing.py` | Base sealing has narrow Phase 1 evidence in `HEAD-02`; revision publication/certification remains open in `HEAD-03`. |
 | `VERIFIED-NARROW` | `QR39-015` | A timed-out individual resolver worker is killable and reclaimed. | `901e093`; `src/quarry_recon/netguard.py::_resolve_batch`; `tests/test_qr39_015_resolver_reclaim.py` | Corpus-wide duration and portable worker-start behavior remain open in `HEAD-06`. |
-| `VERIFIED-NARROW` | `QR39-001`, `QR39-030` | The runner supervises a killable execution owner, authenticates typed stream settlement and publishes requested outputs only through explicit repository policies. Preserved prior finals are not current output. | `579631e`, `246ad1e`, `e27a492`, `00c1095`, `4d1d736`, `5d1b828`; worker, supervisor, repository-composition, contract and stdout-currentness regressions | Candidate-wide `B-HERMETIC-ALL`, `C-OUTPUT-CONTRACT`, `C-FAULT-RUNNER` and `C-PERF-RUNNER` evidence remains open. |
+| `VERIFIED-NARROW` | `QR39-001`, `QR39-030` | The runner supervises a killable execution owner, authenticates typed stream settlement and publishes requested outputs only through explicit repository policies. Preserved prior finals are not current output. | `579631e`, `246ad1e`, `e27a492`, `00c1095`, `4d1d736`, `5d1b828`, `7a60bfb`, `fedd292`, `3f1bd6b`; worker, supervisor, repository-composition, contract, currentness and nine-case output-contract checks | `C-OUTPUT-CONTRACT` passed the internal nine-case run; candidate-wide `B-HERMETIC-ALL`, `C-FAULT-RUNNER` and the integrity-class `C-PERF-RUNNER` outcome remain separate. |
 | `VERIFIED-NARROW` | `QR39-005`, `QR39-006`, `QR39-009`, `QR39-016`, `QR39-032` | Production Run-base writers share mutation/artifact authority; managed HTTP body/receipt acquisition and conditional discard are one serialized transaction; budget-ledger persistence and canonical removal use the same authority; the base seal is irreversible. | `2448b07`, `8b084bf`, `e092fcb`, `53af5f7`, `d11637b`, `117f21e`, `b4a5a13`, `b036a86`, `1f8981b`, `eee5d64`; Phase 1 mutation, claim, finalization, OOB, budget and managed-acquisition regressions | Strict manifest semantics, revision certification and all canonical `V310-02` evidence slots remain open. |
 
 These repaired foundations remain narrow: their full QR39 rows are not release-closed without the
@@ -199,11 +199,11 @@ regressions cover the former reproduced failures.
 publication no longer returns an authoritative current artifact. Prior committed evidence is preserved
 without being reported as this attempt's output.
 
-**Residual release work.** `V310-01` remains `OPEN`: no accepted candidate-wide hermetic selection,
-resolver-indexed output-contract matrix/raw receipt, fault record, performance threshold, or machine
-evidence for `B-HERMETIC-ALL`, `C-OUTPUT-CONTRACT`, `C-FAULT-RUNNER` and `C-PERF-RUNNER` exists. The
-in-tree C-OUTPUT source substrate is non-promoting and is not a release verifier or gate record. Resource
-envelope interactions remain in `HEAD-06`.
+**Residual release work.** `V310-01` remains `OPEN` for candidate-wide hermetic selection,
+`C-FAULT-RUNNER`, and the integrity-class `C-PERF-RUNNER` outcome. `C-OUTPUT-CONTRACT` passed its
+internal nine-case execution and separate receipt/matrix verification on candidate `3f1bd6b`; this is an
+internal integrity record, not a signed distribution attestation. Resource-envelope interactions remain
+in `HEAD-06`.
 
 ### `HEAD-02` — repository boundary, object identity and sealed-run immutability
 
