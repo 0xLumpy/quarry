@@ -4710,16 +4710,81 @@ def _validate_sbom(
         raise evidence.EvidenceError("SBOM top-level digest does not recompute")
 
 
-def _package_subjects(resolver: ArtifactResolver) -> list[dict]:
+_PROVENANCE_MATERIAL_ARTIFACTS = (
+    ("C-PACKAGE-BUILD", "gate-evidence"),
+    ("C-PACKAGE-INSTALL", "gate-evidence"),
+    ("C-SBOM", "sbom"),
+    ("C-VULNERABILITY", "vulnerability-findings"),
+)
+
+
+def _provenance_subjects(resolver: ArtifactResolver) -> list[dict]:
+    """The two releasable package subjects (the established SLSA boundary)."""
     return [{
         "digest": resolver.record("C-PACKAGE-BUILD", name)["digest"],
         "name": name,
     } for name in ("sdist", "wheel")]
 
 
+def _provenance_materials(identity: dict, resolver: ArtifactResolver) -> list[dict]:
+    materials = [{
+        "digest": evidence.canonical_digest(identity),
+        "name": "candidate-identity",
+    }] + [{"digest": row["digest"], "name": row["name"]} for row in identity["inputs"]] + [{
+        "digest": resolver.record(gate_id, name)["digest"],
+        "name": f"{gate_id}/{name}",
+    } for gate_id, name in _PROVENANCE_MATERIAL_ARTIFACTS]
+    materials.sort(key=lambda row: row["name"])
+    return materials
+
+
+def _provenance_owner(report: dict, bodies: Mapping[str, bytes], *, gate: dict) -> dict:
+    """Return the one trusted P0 execution that produced this signed assertion."""
+    expected = {
+        ("provenance", raw_sha256(bodies["provenance"])),
+        ("signature-verification", raw_sha256(bodies["signature-verification"])),
+    }
+    owners = [
+        instance for instance in report["instances"]
+        if expected.issubset({(artifact["name"], artifact["digest"]) for artifact in instance["artifacts"]})
+    ]
+    if len(owners) != 1:
+        raise evidence.EvidenceError(
+            "provenance artifacts are not referenced by one exact signed P0 evidence instance"
+        )
+    owner = owners[0]
+    if (owner["lane"] != "P0-package-supply" or owner["environment"] != gate["environment"] or
+            owner["toolchain"] != gate["toolchain"]):
+        raise evidence.EvidenceError(
+            "provenance execution identity does not match its signed P0 environment/toolchain"
+        )
+    return owner
+
+
+def _provenance_builder_owner(resolver: ArtifactResolver, *, identity: dict) -> dict:
+    """Resolve the trusted P0 build execution from its complete signed output set."""
+    report = read_evidence_report(
+        resolver.read("C-PACKAGE-BUILD", "gate-evidence"),
+        identity=identity, gate_id="C-PACKAGE-BUILD",
+    )
+    expected = {
+        (name, resolver.record("C-PACKAGE-BUILD", name)["digest"])
+        for name in ("build-log", "package-inventory", "sdist", "wheel")
+    }
+    owners = [
+        instance for instance in report["instances"]
+        if expected.issubset({(artifact["name"], artifact["digest"]) for artifact in instance["artifacts"]})
+    ]
+    if len(owners) != 1 or owners[0]["lane"] != "P0-package-supply":
+        raise evidence.EvidenceError(
+            "package build artifacts are not referenced by one exact signed P0 builder evidence instance"
+        )
+    return owners[0]
+
+
 def _validate_provenance_artifacts(
     bodies: Mapping[str, bytes], *, gate: dict, identity: dict, resolver: ArtifactResolver,
-    policy: dict,
+    report: dict, policy: dict,
 ) -> None:
     provenance = _object(
         _artifact_document(bodies["provenance"], "C-PROVENANCE", "provenance"),
@@ -4729,14 +4794,21 @@ def _validate_provenance_artifacts(
             "release", "schema_version", "subjects",
         },
     )
-    expected_materials = [{
-        "digest": evidence.canonical_digest(identity),
-        "name": "candidate-identity",
-    }] + [{"digest": row["digest"], "name": row["name"]} for row in identity["inputs"]]
-    expected_materials.sort(key=lambda row: row["name"])
+    owner = _provenance_owner(report, bodies, gate=gate)
+    builder_owner = _provenance_builder_owner(resolver, identity=identity)
+    # A provenance collector may seal a builder's output only from the same
+    # accepted execution context.  Referencing its instance id alone would let
+    # a differently tooled P0 execution make that substitution.
+    if (owner["environment"] != builder_owner["environment"] or
+            owner["toolchain"] != builder_owner["toolchain"]):
+        raise evidence.EvidenceError(
+            "provenance execution context does not match the exact signed P0 package builder"
+        )
+    expected_materials = _provenance_materials(identity, resolver)
     expected_builder = {
-        "environment": gate["environment"],
-        "toolchain": gate["toolchain"],
+        "environment": builder_owner["environment"],
+        "evidence_instance_id": builder_owner["id"],
+        "toolchain": builder_owner["toolchain"],
     }
     if provenance != {
         "artifact_type": "provenance",
@@ -4746,9 +4818,11 @@ def _validate_provenance_artifacts(
         "materials": expected_materials,
         "release": RELEASE,
         "schema_version": GATE_ARTIFACT_SCHEMA,
-        "subjects": _package_subjects(resolver),
+        "subjects": _provenance_subjects(resolver),
     }:
-        raise evidence.EvidenceError("provenance does not bind the candidate, builder, inputs and packages")
+        raise evidence.EvidenceError(
+            "provenance does not bind the candidate, trusted execution identity, inputs and release evidence graph"
+        )
     envelope = _artifact_document(
         bodies["signature-verification"], "C-PROVENANCE", "signature-verification",
     )
@@ -5145,6 +5219,7 @@ def _semantic_provenance(
         gate=gate,
         identity=context["identity"],
         resolver=context["resolver"],
+        report=context["report"],
         policy=context["policy"],
     )
 
@@ -5164,7 +5239,6 @@ def _semantic_publication_subjects(
 # sufficient to close its whole normative obligation yet (for example transitive
 # dependency closure belongs to later owners).
 PROVISIONAL_SEMANTIC_VERIFIERS = MappingProxyType({
-    "C-PROVENANCE": _semantic_provenance,
     **{gate_id: _semantic_benchmark for gate_id in PERFORMANCE_OPERATIONS},
     "E-ARTIFACTS": _semantic_publication_subjects,
 })
@@ -6881,6 +6955,7 @@ SEMANTIC_VERIFIERS = MappingProxyType({
     "C-PACKAGE-INSTALL": _semantic_package_install,
     "C-SBOM": _semantic_sbom,
     "C-VULNERABILITY": _semantic_vulnerability,
+    "C-PROVENANCE": _semantic_provenance,
     "C-FAULT-DISK": _semantic_resource_fault,
     "C-FAULT-RESOLVER": _semantic_resource_fault,
     "C-PERF-INGEST": _semantic_resource_benchmark,

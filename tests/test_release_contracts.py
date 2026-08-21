@@ -1381,11 +1381,31 @@ def _supporting_bodies(
         materials = [{
             "digest": evidence.canonical_digest(identity),
             "name": "candidate-identity",
-        }] + [{"digest": row["digest"], "name": row["name"]} for row in identity["inputs"]]
+        }] + [{"digest": row["digest"], "name": row["name"]} for row in identity["inputs"]] + [{
+            "digest": by_key[(subject_gate, name)]["digest"],
+            "name": f"{subject_gate}/{name}",
+        } for subject_gate, name in contracts._PROVENANCE_MATERIAL_ARTIFACTS]
         materials.sort(key=lambda row: row["name"])
+        package_build_report = json.loads(emitted[("C-PACKAGE-BUILD", "gate-evidence")])
+        package_build_artifacts = {
+            (name, by_key[("C-PACKAGE-BUILD", name)]["digest"])
+            for name in ("build-log", "package-inventory", "sdist", "wheel")
+        }
+        package_builders = [
+            instance for instance in package_build_report["instances"]
+            if package_build_artifacts.issubset({
+                (artifact["name"], artifact["digest"]) for artifact in instance["artifacts"]
+            })
+        ]
+        assert len(package_builders) == 1
+        package_builder = package_builders[0]
         bodies["provenance"] = contracts.canonical_json_line({
             "artifact_type": "provenance",
-            "builder": {"environment": environment, "toolchain": toolchain},
+            "builder": {
+                "environment": package_builder["environment"],
+                "evidence_instance_id": package_builder["id"],
+                "toolchain": package_builder["toolchain"],
+            },
             "candidate_identity_digest": evidence.canonical_digest(identity),
             "gate_id": gate_id,
             "materials": materials,
@@ -1942,6 +1962,7 @@ def _scenario(tmp_path: Path, *, approved_at: str = "2026-08-01T00:00:00Z"):
                 "size": len(body),
             }
             indexed.append(artifact)
+            emitted[(gate_id, "gate-evidence")] = body
             artifacts.append({key: artifact[key] for key in ("digest", "media_type", "name")})
             artifacts.sort(key=lambda row: row["name"])
         count = len(instances)
@@ -2084,6 +2105,38 @@ def _rewrite_supporting_artifact(
     _resign_gate(gate, arguments["identity"], arguments["trust_policy"])
 
 
+def _rewrite_signed_provenance(arguments: dict, mutate) -> None:
+    """Keep the provenance envelope and its enclosing signed record coherent."""
+    provenance_index = next(
+        row for row in arguments["artifact_index"]["artifacts"]
+        if row["gate_id"] == "C-PROVENANCE" and row["name"] == "provenance"
+    )
+    provenance = json.loads((arguments["artifact_root"] / provenance_index["path"]).read_bytes())
+    mutate(provenance)
+    provenance_body = contracts.canonical_json_line(provenance)
+    payload_digest = contracts.raw_sha256(provenance_body)
+    message = contracts.signature_preimage(
+        role="gate",
+        payload_digest=payload_digest,
+        candidate_identity_digest=evidence.canonical_digest(arguments["identity"]),
+        trust_policy_digest=evidence.canonical_digest(arguments["trust_policy"]),
+    )
+    envelope = {
+        "algorithm": "ed25519",
+        "candidate_identity_digest": evidence.canonical_digest(arguments["identity"]),
+        "key_id": "test-gate-v1",
+        "payload_digest": payload_digest,
+        "role": "gate",
+        "schema_version": contracts.SIGNATURE_ENVELOPE_SCHEMA,
+        "signature": "base64:" + base64.b64encode(_sign(message, seed=GATE_SEED)).decode("ascii"),
+        "trust_policy_digest": evidence.canonical_digest(arguments["trust_policy"]),
+    }
+    _rewrite_supporting_artifact(arguments, "C-PROVENANCE", "provenance", provenance_body)
+    _rewrite_supporting_artifact(
+        arguments, "C-PROVENANCE", "signature-verification", contracts.canonical_json_line(envelope),
+    )
+
+
 def _rewrite_resource_report(arguments: dict, gate_id: str, mutate) -> None:
     indexed = next(
         record for record in arguments["artifact_index"]["artifacts"]
@@ -2136,7 +2189,7 @@ def _rebind_scenario(arguments: dict) -> None:
     }
     emitted = {
         key: (arguments["artifact_root"] / row["path"]).read_bytes()
-        for key, row in index_by_key.items() if key[1] != "gate-evidence"
+        for key, row in index_by_key.items()
     }
     for gate in arguments["records"]:
         gate_id = gate["gate_id"]
@@ -2179,6 +2232,7 @@ def _rebind_scenario(arguments: dict) -> None:
             path.write_bytes(body)
             indexed_report["digest"] = contracts.raw_sha256(body)
             indexed_report["size"] = len(body)
+            emitted[(gate_id, "gate-evidence")] = body
             next(
                 row for row in gate["artifacts"] if row["name"] == "gate-evidence"
             )["digest"] = indexed_report["digest"]
@@ -2554,13 +2608,13 @@ class TestIncompleteSemanticRegistry:
             | {
                 "A-IDENTITY", "A-EVIDENCE-SCHEMA", "A-TAXONOMY", "A-CORPUS", "A-THRESHOLDS", "A-SUPPORT",
                 "B-HERMETIC-ALL", "B-SCHEMA", "B-DOCS-POLICY", "B-MANIFEST", "B-QUALITY", "B-COVERAGE", "B-STATIC-SECURITY", "B-DETERMINISM",
-                "C-PACKAGE-BUILD", "C-PACKAGE-INSTALL", "C-PYTHON-MATRIX", "C-SBOM", "C-VULNERABILITY", "C-NETWORK-BOUNDARY", "C-NET-DENY",
+                "C-PACKAGE-BUILD", "C-PACKAGE-INSTALL", "C-PYTHON-MATRIX", "C-SBOM", "C-VULNERABILITY", "C-PROVENANCE", "C-NETWORK-BOUNDARY", "C-NET-DENY",
                 *contracts.V310_05_SEMANTIC_GATES,
             }
         )
         assert "C-PERF-PHASE-FAIRNESS" not in contracts.SEMANTIC_VERIFIERS
         arguments = _scenario(tmp_path)
-        with pytest.raises(evidence.EvidenceError, match="gate C-PROVENANCE"):
+        with pytest.raises(evidence.EvidenceError, match="gate C-TOOLS"):
             contracts.aggregate_records(**arguments)
 
 
@@ -3097,6 +3151,105 @@ class TestPackageInstallSemanticEvidence:
                     record["digest"] = contracts.raw_sha256(bodies[artifact])
         with pytest.raises(evidence.EvidenceError, match=match):
             self._verify(arguments, gate, bodies, report)
+
+
+class TestProvenanceSemanticEvidence:
+    def test_aggregate_reaches_the_next_unimplemented_gate_after_provenance_promotion(self, tmp_path):
+        arguments = _scenario(tmp_path)
+        # C-TOOLS is intentionally still outside the promoted registry.  Reaching
+        # it proves the full aggregate accepted the preceding C-PROVENANCE graph.
+        with pytest.raises(evidence.EvidenceError, match="gate C-TOOLS"):
+            contracts.aggregate_records(**arguments)
+
+    def test_rebound_provenance_derives_the_current_package_build_report(self, tmp_path):
+        arguments = _scenario(tmp_path)
+        arguments["support_matrix"]["approval"]["review_id"] = "rebound-support-review"
+        _sign_contract_review(
+            arguments["support_matrix"], arguments["trust_policy"],
+            approved_at=arguments["support_matrix"]["approval"]["approved_at"],
+        )
+        _rebind_scenario(arguments)
+        gate = _gate(arguments, "C-PROVENANCE")
+        bodies = {
+            row["name"]: (arguments["artifact_root"] / row["path"]).read_bytes()
+            for row in arguments["artifact_index"]["artifacts"]
+            if row["gate_id"] == "C-PROVENANCE" and row["name"] != "gate-evidence"
+        }
+        report_index = next(
+            row for row in arguments["artifact_index"]["artifacts"]
+            if row["gate_id"] == "C-PROVENANCE" and row["name"] == "gate-evidence"
+        )
+        report = contracts.read_evidence_report(
+            (arguments["artifact_root"] / report_index["path"]).read_bytes(),
+            identity=arguments["identity"], gate_id="C-PROVENANCE",
+        )
+        with contracts.ArtifactResolver(
+            arguments["artifact_root"], arguments["artifact_index"], identity=arguments["identity"],
+        ) as resolver:
+            contracts._semantic_provenance(
+                gate, bodies, identity=arguments["identity"], report=report,
+                resolver=resolver, policy=arguments["trust_policy"],
+            )
+
+    def test_schema_and_manual_provenance_roster_stay_in_lockstep(self, tmp_path):
+        schema = json.loads((ROOT / contracts.SCHEMA_PATHS["gate-artifact-schema"]).read_bytes())
+        provenance = schema["$defs"]["provenance"]
+        assert schema["$defs"]["builder"]["required"] == [
+            "environment", "evidence_instance_id", "toolchain",
+        ]
+        assert provenance["properties"]["subjects"]["minItems"] == 2
+        assert provenance["properties"]["subjects"]["maxItems"] == 2
+        assert provenance["properties"]["materials"]["minItems"] == \
+            provenance["properties"]["materials"]["maxItems"] == 131
+        assert len(contracts._PROVENANCE_MATERIAL_ARTIFACTS) == 4
+        assert "C-PROVENANCE" in contracts.SEMANTIC_VERIFIERS
+        assert "C-PROVENANCE" not in contracts.PROVISIONAL_SEMANTIC_VERIFIERS
+
+        arguments = _scenario(tmp_path)
+        record = next(row for row in arguments["artifact_index"]["artifacts"]
+                      if row["gate_id"] == "C-PROVENANCE" and row["name"] == "provenance")
+        document = json.loads((arguments["artifact_root"] / record["path"]).read_bytes())
+        validator = Draft202012Validator(schema, format_checker=FormatChecker())
+        assert list(validator.iter_errors(document)) == []
+        assert len(document["materials"]) == 1 + len(arguments["identity"]["inputs"]) + \
+            len(contracts._PROVENANCE_MATERIAL_ARTIFACTS)
+        assert [row["name"] for row in document["subjects"]] == ["sdist", "wheel"]
+        expected_names = {"candidate-identity"}
+        expected_names.update(f"{gate}/{name}" for gate, name in contracts._PROVENANCE_MATERIAL_ARTIFACTS)
+        assert expected_names.issubset({row["name"] for row in document["materials"]})
+
+    @pytest.mark.parametrize(
+        ("material_name", "match"),
+        [
+            ("C-PACKAGE-BUILD/gate-evidence", "release evidence graph"),
+            ("C-PACKAGE-INSTALL/gate-evidence", "release evidence graph"),
+            ("C-SBOM/sbom", "release evidence graph"),
+            ("C-VULNERABILITY/vulnerability-findings", "release evidence graph"),
+        ],
+    )
+    def test_cross_gate_material_substitution_fails_after_resigning(self, tmp_path, material_name, match):
+        arguments = _scenario(tmp_path)
+
+        def mutate(document):
+            material = next(row for row in document["materials"] if row["name"] == material_name)
+            material["digest"] = _digest("f")
+
+        _rewrite_signed_provenance(arguments, mutate)
+        with pytest.raises(evidence.EvidenceError, match=match):
+            contracts.aggregate_records(**arguments)
+
+    @pytest.mark.parametrize(
+        ("mutate", "match"),
+        [
+            (lambda document: document["subjects"][0].update(digest=_digest("e")), "release evidence graph"),
+            (lambda document: document["builder"].update(evidence_instance_id="forged-instance"), "release evidence graph"),
+        ],
+    )
+    def test_subject_and_execution_identity_substitutions_fail_after_resigning(self, tmp_path, mutate, match):
+        arguments = _scenario(tmp_path)
+        _rewrite_signed_provenance(arguments, mutate)
+        with pytest.raises(evidence.EvidenceError, match=match):
+            contracts.aggregate_records(**arguments)
 
 
 class TestPythonMatrixSemanticEvidence:
