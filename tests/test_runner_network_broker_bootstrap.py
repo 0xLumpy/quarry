@@ -768,6 +768,7 @@ def test_gowitness_settlement_orders_controller_cdp_browser_and_reap(monkeypatch
     monkeypatch.setattr(
         runner_worker.signal, "pidfd_send_signal",
         lambda _fd, sig: events.append("pidfd_probe" if sig == 0 else "pidfd_kill"),
+        raising=False,
     )
     monkeypatch.setattr(
         runner_worker.os, "killpg",
@@ -972,10 +973,12 @@ def test_failed_partial_start_pidfd_kills_each_adopted_direct_child(monkeypatch)
     monkeypatch.setattr(
         runner_worker.os, "pidfd_open",
         lambda pid, flags: events.append(("open", pid, flags)) or pid + 100,
+        raising=False,
     )
     monkeypatch.setattr(
         runner_worker.signal, "pidfd_send_signal",
         lambda fd, sig: events.append(("kill", fd, sig)),
+        raising=False,
     )
     monkeypatch.setattr(
         runner_worker.os, "close", lambda fd: events.append(("close", fd)),
@@ -1008,6 +1011,7 @@ def test_browser_pidfd_is_tombstoned_before_ambiguous_close(monkeypatch):
     launcher = SimpleNamespace(_browser_pid=43210, _browser_pidfd=99)
     monkeypatch.setattr(
         runner_worker.signal, "pidfd_send_signal", lambda *_args: None,
+        raising=False,
     )
     monkeypatch.setattr(runner_worker.os, "killpg", lambda *_args: None)
 

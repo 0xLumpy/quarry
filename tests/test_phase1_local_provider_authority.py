@@ -240,7 +240,7 @@ def test_vertical_sources_hold_claim_across_contact_publication_and_entities(tmp
     monkeypatch.setattr(vertical.secrets, "censys", lambda: {"token": "censys-token", "org": "org-1"})
     monkeypatch.setattr(vertical, "censys_entitlement_skip", lambda _cfg, _roots: False)
 
-    def crtsh(_apex):
+    def crtsh(_apex, **_kwargs):
         entered.set()
         assert release.wait(5), "seal-race fixture was not released"
         return {"ct.acme.example", "*.wildct.acme.example"}
@@ -291,7 +291,9 @@ def test_vertical_publication_fault_preserves_prior_and_cannot_cite_it_as_curren
     monkeypatch.setattr(vertical, "run_provider", lambda _source, call, **_kwargs: call())
     monkeypatch.setattr(vertical.secrets, "certspotter", lambda: None)
     monkeypatch.setattr(vertical.settings, "concurrency", lambda _name, _default: 5)
-    monkeypatch.setattr(vertical, "_crtsh", lambda _apex: {"newct.acme.example"})
+    monkeypatch.setattr(
+        vertical, "_crtsh", lambda _apex, **_kwargs: {"newct.acme.example"},
+    )
     monkeypatch.setattr(vertical, "_certspotter", lambda *_args, **_kwargs: set())
     monkeypatch.setattr(vertical.settings, "openintel", lambda: {})
     monkeypatch.setattr(vertical.secrets, "censys", lambda: {})

@@ -457,6 +457,53 @@ EXCLUDED: dict[str, tuple[str, str]] = {
     "quarry_recon.privfs:_MAX_WORKER_PID": (
         "identity", "the accepted operating-system PID domain for a stage-handoff correlation identity; "
                     "it does not bound child execution"),
+    "quarry_recon.fault_runner_evidence:MAX_BYTES": (
+        "resource", "the allocation bound for one C-FAULT-RUNNER source-substrate control document; "
+                    "oversize input is rejected rather than truncated"),
+    "quarry_recon.fault_runner_evidence:MAX_INTEGER": (
+        "parser", "the portable signed-integer range of the C-FAULT-RUNNER control contract, not a "
+                  "reconnaissance volume allowance"),
+    "quarry_recon.fault_store_evidence:MAX_BYTES": (
+        "resource", "the allocation bound for one C-FAULT-STORE source-substrate control document; "
+                    "oversize input is rejected rather than truncated"),
+    "quarry_recon.fault_store_evidence:MAX_INTEGER": (
+        "parser", "the portable signed-integer range of the C-FAULT-STORE control contract, not a "
+                  "reconnaissance volume allowance"),
+    "quarry_recon.output_contract:MAX_MANIFEST_BYTES": (
+        "resource", "the allocation bound for one frozen C-OUTPUT fixture manifest; oversize input is "
+                    "rejected rather than partially interpreted"),
+    "quarry_recon.output_contract:MAX_RECEIPT_BYTES": (
+        "resource", "the allocation bound for one shape-only C-OUTPUT receipt; oversize input is "
+                    "rejected rather than accepted as complete"),
+    "quarry_recon.output_contract:MAX_STREAM_BYTES": (
+        "resource", "the per-stream C-OUTPUT control-fixture bound; overflow is explicit and never "
+                    "silently treated as complete output"),
+    "quarry_recon.output_contract:RETAINED_STREAM_CAP_BYTES": (
+        "resource", "the fixed retained diagnostic projection for a bounded C-OUTPUT fixture stream, "
+                    "not a limit on target evidence collection"),
+    "quarry_recon.path_identity_evidence:MAX_BYTES": (
+        "resource", "the allocation bound for one C-PATH source-substrate control document; oversize "
+                    "input is rejected rather than truncated"),
+    "quarry_recon.path_identity_evidence:MAX_INTEGER": (
+        "parser", "the portable signed-integer range of the C-PATH control contract, not a work limit"),
+    "quarry_recon.private_files_evidence:_MAX_INT": (
+        "parser", "the portable signed-integer range of the C-PRIVATE-FILES control contract, not a "
+                  "private-artifact volume allowance"),
+    "quarry_recon.release_contracts:_SBOM_MAX_COMPONENTS": (
+        "resource", "the finite component-count allocation bound for one release SBOM; overflow refuses "
+                    "the SBOM rather than accepting an incomplete dependency graph"),
+    "quarry_recon.release_contracts:_SBOM_MAX_FILES": (
+        "resource", "the finite file-inventory allocation bound for one release SBOM; overflow refuses "
+                    "the whole artifact rather than retaining a prefix"),
+    "quarry_recon.release_contracts:_SBOM_MAX_REQUIREMENTS": (
+        "resource", "the finite requirement-edge allocation bound for one release SBOM; overflow refuses "
+                    "the whole dependency graph rather than retaining a prefix"),
+    "quarry_recon.release_contracts:_VULNERABILITY_MAX_FINDINGS": (
+        "resource", "the finite finding-count allocation bound for one vulnerability report; overflow "
+                    "refuses the report rather than claiming an incomplete clean result"),
+    "quarry_recon.source_registry_evidence:MAX_BYTES": (
+        "resource", "the allocation bound for one C-SOURCE-REGISTRY control document; oversize input is "
+                    "rejected rather than truncated or accepted as complete"),
     "quarry_recon.phases.vertical:SHODAN_DOMAIN_READ_LIMIT": (
         "resource", "the bounded acquisition-response allocation for one Shodan domain payload; an "
                     "oversized response is rejected rather than truncated or accepted as complete"),

@@ -412,10 +412,14 @@ class TestTheREALLaneNotJustTheScheduler:
         monkeypatch.setattr(probe, "_shodan_page",
                             lambda *a, **k: pages.append(a) or ([], None, None))
         monkeypatch.setattr(probe, "_read_shodan_balance",
-                            lambda key, timeout=15, cooldown=None: probe.ShodanBalance(
+                            lambda key, timeout=15, cooldown=None, **_kwargs: probe.ShodanBalance(
                                 remaining=100, allowance=100, reserve=0, spendable=100,
                                 may_spend=True, reason="ok"))
-        monkeypatch.setattr(probe, "_shodan_count", lambda k, f, v: (250, b'{"total": 250}', None))
+        monkeypatch.setattr(
+            probe,
+            "_shodan_count",
+            lambda k, f, v, **_kwargs: (250, b'{"total": 250}', None),
+        )
 
         ctx, _added = self._ctx(tmp_path)
         probe._shodan_pivot(ctx, "KEY", ["hA"], "http.favicon.hash", "favicon-shodan",
