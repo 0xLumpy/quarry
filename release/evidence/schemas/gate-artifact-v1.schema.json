@@ -23,7 +23,8 @@
     {"$ref": "#/$defs/docs_policy_parity_report"},
     {"$ref": "#/$defs/manifest_invariant_report"},
     {"$ref": "#/$defs/manifest_corrupt_fixture_matrix"},
-    {"$ref": "#/$defs/quality_report"}
+    {"$ref": "#/$defs/quality_report"},
+    {"$ref": "#/$defs/coverage_report"}
   ],
   "properties": {
     "artifact_type": {"$ref": "#/$defs/token"},
@@ -37,6 +38,11 @@
     "checkout_root": {"$ref": "#/$defs/absolute_path"},
     "clean_tree": {"type": "boolean"},
     "combined_output": {"$ref": "#/$defs/build_output"},
+    "coverage_policy_digest": {"$ref": "#/$defs/digest"},
+    "coverage_data": {"items": {"$ref": "#/$defs/coverage_data"}, "type": "array"},
+    "coverage_files": {"items": {"$ref": "#/$defs/coverage_file"}, "type": "array"},
+    "coverage_baseline": {"$ref": "#/$defs/coverage_baseline"},
+    "critical_modules": {"items": {"$ref": "#/$defs/coverage_critical"}, "type": "array"},
     "command": {"items": {"$ref": "#/$defs/text"}, "type": "array"},
     "cases": {"type": "array"},
     "components": {"items": {"$ref": "#/$defs/component"}, "type": "array"},
@@ -65,7 +71,7 @@
     "instances": {"items": {"type": "object"}, "type": "array"},
     "legacy_migration": {"$ref": "#/$defs/schema_validation_legacy_migration"},
     "materials": {"items": {"$ref": "#/$defs/named_digest"}, "type": "array"},
-    "measurements": {"items": {"$ref": "#/$defs/measurement"}, "type": "array"},
+    "measurements": {"items": {"oneOf": [{"$ref": "#/$defs/measurement"}, {"$ref": "#/$defs/coverage_measurement"}]}, "type": "array"},
     "manifest_digest": {"$ref": "#/$defs/digest"},
     "manifest_materials": {"items": {"$ref": "#/$defs/manifest_material"}, "type": "array"},
     "metrics": {"items": {"$ref": "#/$defs/baseline_metric"}, "type": "array"},
@@ -88,6 +94,7 @@
     "outcomes": {"items": {"$ref": "#/$defs/schema_validation_outcome"}, "type": "array"},
     "subjects": {"items": {"type": "object"}, "type": "array"},
     "source_wheel": {"$ref": "#/$defs/package_install_wheel"},
+    "source_tree_digest": {"$ref": "#/$defs/digest"},
     "started_at": {"$ref": "#/$defs/text"},
     "synthetic_value_inventory_digest": {"$ref": "#/$defs/digest"},
     "trial_invalidations_digest": {"$ref": "#/$defs/digest"},
@@ -455,6 +462,41 @@
       "properties": {"artifact_type": {"const": "quality-report"}, "bindings": {"items": {"$ref": "#/$defs/quality_binding"}, "minItems": 5, "maxItems": 5, "type": "array"}, "candidate_identity_digest": {"$ref": "#/$defs/digest"}, "environment": {"$ref": "#/$defs/environment"}, "evidence_finished_at": {"$ref": "#/$defs/text"}, "evidence_instance_id": {"$ref": "#/$defs/token"}, "evidence_started_at": {"$ref": "#/$defs/text"}, "gate_id": {"const": "B-QUALITY"}, "name": {"const": "quality-report"}, "observations": {"items": false, "prefixItems": [{"$ref": "#/$defs/quality_observation_formatting"}, {"$ref": "#/$defs/quality_observation_lint"}, {"$ref": "#/$defs/quality_observation_type"}, {"$ref": "#/$defs/quality_observation_docs"}, {"$ref": "#/$defs/quality_observation_dead_code"}, {"$ref": "#/$defs/quality_observation_complexity"}], "minItems": 6, "maxItems": 6, "type": "array"}, "quality_policy_digest": {"$ref": "#/$defs/digest"}, "quality_violations": {"$ref": "#/$defs/count"}, "release": {"const": "0.3.10"}, "schema_version": {"const": "quarry.gate-artifact.v1"}, "selection": {"$ref": "#/$defs/docs_policy_selection"}, "threshold_manifest_digest": {"$ref": "#/$defs/digest"}, "toolchain": {"items": {"$ref": "#/$defs/tool"}, "minItems": 3, "type": "array", "uniqueItems": true}},
       "required": ["artifact_type", "bindings", "candidate_identity_digest", "environment", "evidence_finished_at", "evidence_instance_id", "evidence_started_at", "gate_id", "name", "observations", "quality_policy_digest", "quality_violations", "release", "schema_version", "selection", "threshold_manifest_digest", "toolchain"],
       "type": "object"
+    },
+    "coverage_counts": {
+      "additionalProperties": false,
+      "properties": {"covered": {"$ref": "#/$defs/count"}, "total": {"$ref": "#/$defs/count"}},
+      "required": ["covered", "total"], "type": "object"
+    },
+    "coverage_file": {
+      "additionalProperties": false,
+      "properties": {"branches": {"$ref": "#/$defs/coverage_counts"}, "lines": {"$ref": "#/$defs/coverage_counts"}, "path": {"$ref": "#/$defs/text"}},
+      "required": ["branches", "lines", "path"], "type": "object"
+    },
+    "coverage_baseline": {
+      "additionalProperties": false,
+      "properties": {"files": {"items": {"$ref": "#/$defs/coverage_file"}, "minItems": 1, "type": "array"}},
+      "required": ["files"], "type": "object"
+    },
+    "coverage_data": {
+      "additionalProperties": false,
+      "properties": {"digest": {"$ref": "#/$defs/digest"}, "h0_fragment_digest": {"$ref": "#/$defs/digest"}, "job_instance_id": {"$ref": "#/$defs/text"}},
+      "required": ["digest", "h0_fragment_digest", "job_instance_id"], "type": "object"
+    },
+    "coverage_critical": {
+      "additionalProperties": false,
+      "properties": {"branch_coverage": {"$ref": "#/$defs/count"}, "line_coverage": {"$ref": "#/$defs/count"}, "path": {"$ref": "#/$defs/text"}},
+      "required": ["branch_coverage", "line_coverage", "path"], "type": "object"
+    },
+    "coverage_measurement": {
+      "additionalProperties": false,
+      "properties": {"breached": {"type": "boolean"}, "metric": {"$ref": "#/$defs/token"}, "value": {"$ref": "#/$defs/count"}},
+      "required": ["breached", "metric", "value"], "type": "object"
+    },
+    "coverage_report": {
+      "additionalProperties": false,
+      "properties": {"artifact_type": {"const": "coverage-report"}, "bindings": {"items": {"$ref": "#/$defs/quality_binding"}, "minItems": 6, "maxItems": 6, "type": "array"}, "candidate_identity_digest": {"$ref": "#/$defs/digest"}, "coverage_baseline": {"$ref": "#/$defs/coverage_baseline"}, "coverage_data": {"items": {"$ref": "#/$defs/coverage_data"}, "minItems": 6, "maxItems": 6, "type": "array"}, "coverage_files": {"items": {"$ref": "#/$defs/coverage_file"}, "minItems": 1, "type": "array"}, "coverage_policy_digest": {"$ref": "#/$defs/digest"}, "critical_modules": {"items": {"$ref": "#/$defs/coverage_critical"}, "minItems": 14, "maxItems": 14, "type": "array"}, "environment": {"$ref": "#/$defs/environment"}, "evidence_finished_at": {"$ref": "#/$defs/text"}, "evidence_instance_id": {"$ref": "#/$defs/token"}, "evidence_started_at": {"$ref": "#/$defs/text"}, "gate_id": {"const": "B-COVERAGE"}, "measurements": {"items": {"$ref": "#/$defs/coverage_measurement"}, "minItems": 8, "maxItems": 8, "type": "array"}, "name": {"const": "coverage-report"}, "release": {"const": "0.3.10"}, "schema_version": {"const": "quarry.gate-artifact.v1"}, "source_tree_digest": {"$ref": "#/$defs/digest"}, "threshold_manifest_digest": {"$ref": "#/$defs/digest"}, "toolchain": {"items": {"$ref": "#/$defs/tool"}, "minItems": 1, "type": "array", "uniqueItems": true}},
+      "required": ["artifact_type", "bindings", "candidate_identity_digest", "coverage_baseline", "coverage_data", "coverage_files", "coverage_policy_digest", "critical_modules", "environment", "evidence_finished_at", "evidence_instance_id", "evidence_started_at", "gate_id", "measurements", "name", "release", "schema_version", "source_tree_digest", "threshold_manifest_digest", "toolchain"], "type": "object"
     },
     "resources": {
       "additionalProperties": false,

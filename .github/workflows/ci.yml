@@ -52,11 +52,30 @@ jobs:
       - name: H0 tests (deny guard)
         env:
           QUARRY_OFFLINE_CI: "1"
-        run: >-
-          pytest -m offline
-          --quarry-shard-count 6 --quarry-shard-index "${{ matrix.shard }}"
-          --quarry-taxonomy-manifest "$RUNNER_TEMP/quarry-taxonomy.json"
-          --quarry-h0-shard-report "$RUNNER_TEMP/h0-shard-${{ matrix.python-version }}-${{ matrix.shard }}.json"
+        run: |
+          if [[ '${{ matrix.python-version }}' == '3.12' ]]; then
+            COVERAGE_FILE="$RUNNER_TEMP/quarry-coverage-3.12-${{ matrix.shard }}" \
+              coverage run --context=".github/workflows/ci.yml#jobs.offline[python-version=3.12,shard=${{ matrix.shard }}]" \
+              -m pytest -m offline \
+              --quarry-shard-count 6 --quarry-shard-index "${{ matrix.shard }}" \
+              --quarry-taxonomy-manifest "$RUNNER_TEMP/quarry-taxonomy.json" \
+              --quarry-h0-shard-report "$RUNNER_TEMP/h0-shard-${{ matrix.python-version }}-${{ matrix.shard }}.json"
+            coverage json --data-file "$RUNNER_TEMP/quarry-coverage-3.12-${{ matrix.shard }}" \
+              --show-contexts -o "$RUNNER_TEMP/quarry-coverage-3.12-${{ matrix.shard }}.json"
+            python scripts/emit_coverage_shard.py \
+              --coverage-json "$RUNNER_TEMP/quarry-coverage-3.12-${{ matrix.shard }}.json" \
+              --coverage-data "$RUNNER_TEMP/quarry-coverage-3.12-${{ matrix.shard }}" \
+              --config .coveragerc \
+              --h0-fragment "$RUNNER_TEMP/h0-shard-3.12-${{ matrix.shard }}.json" \
+              --job-instance-id ".github/workflows/ci.yml#jobs.offline[python-version=3.12,shard=${{ matrix.shard }}]" \
+              --policy release/evidence/coverage-policy-v1.json \
+              --output "$RUNNER_TEMP/coverage-shard-${{ matrix.shard }}.json"
+          else
+            pytest -m offline \
+              --quarry-shard-count 6 --quarry-shard-index "${{ matrix.shard }}" \
+              --quarry-taxonomy-manifest "$RUNNER_TEMP/quarry-taxonomy.json" \
+              --quarry-h0-shard-report "$RUNNER_TEMP/h0-shard-${{ matrix.python-version }}-${{ matrix.shard }}.json"
+          fi
       - name: Upload H0 shard outcome
         if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -65,6 +84,8 @@ jobs:
           path: |
             ${{ runner.temp }}/h0-shard-${{ matrix.python-version }}-${{ matrix.shard }}.json
             ${{ runner.temp }}/quarry-taxonomy.json
+            ${{ runner.temp }}/quarry-coverage-3.12-${{ matrix.shard }}*
+            ${{ runner.temp }}/coverage-shard-${{ matrix.shard }}.json
           if-no-files-found: error
 
   integration:

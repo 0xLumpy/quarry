@@ -1,0 +1,25 @@
+{
+  "$id": "urn:quarry:schema:coverage-policy:v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Quarry B-COVERAGE frozen policy v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["config", "critical_modules", "h0_job_ids", "python", "release", "schema_version", "source_roster", "tool", "version"],
+  "properties": {
+    "schema_version": {"const": "quarry.coverage-policy.v1"},
+    "release": {"const": "0.3.10"},
+    "tool": {"const": "coverage"},
+    "version": {"const": "7.15.4"},
+    "python": {"const": "3.12"},
+    "config": {"$ref": "#/$defs/binding"},
+    "source_roster": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/path"}, "uniqueItems": true},
+    "critical_modules": {"type": "array", "minItems": 14, "maxItems": 14, "items": {"$ref": "#/$defs/path"}, "uniqueItems": true},
+    "h0_job_ids": {"type": "array", "minItems": 6, "maxItems": 6, "items": {"$ref": "#/$defs/text"}, "uniqueItems": true}
+  },
+  "$defs": {
+    "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "path": {"type": "string", "pattern": "^src/quarry_recon(?:/[A-Za-z0-9_.-]+)*\\.py$"},
+    "text": {"type": "string", "minLength": 1},
+    "binding": {"type": "object", "additionalProperties": false, "required": ["digest", "path"], "properties": {"digest": {"$ref": "#/$defs/digest"}, "path": {"const": ".coveragerc"}}}
+  }
+}

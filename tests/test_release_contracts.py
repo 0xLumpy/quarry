@@ -13,6 +13,7 @@ import zipfile
 from pathlib import Path
 
 import pytest
+from jsonschema import Draft202012Validator
 
 from quarry_recon import release_contracts as contracts
 from quarry_recon import release_evidence as evidence
@@ -366,6 +367,14 @@ def _h0_collection_taxonomy_body(environment: dict, toolchain: list[dict]) -> by
     return evidence.canonical_json_bytes(document)
 
 
+def _coverage_baseline() -> dict:
+    policy = contracts.read_coverage_policy((ROOT / contracts.COVERAGE_POLICY_PATH).read_bytes())
+    return {"files": [{
+        "path": path, "lines": {"covered": 10, "total": 10},
+        "branches": {"covered": 5, "total": 5},
+    } for path in policy["source_roster"]]}
+
+
 def _corpus_disclosure_body(fixture_digest: str) -> bytes:
     return contracts.canonical_json_line({
         "artifact_type": "synthetic-corpus-disclosure-attestation",
@@ -388,7 +397,7 @@ def _supporting_bodies(
     gate_id: str, *, identity: dict, scope: dict, support: dict, thresholds: dict, corpus: dict,
     benchmark: dict | None, measurements: list[dict], environment: dict,
     evidence_instance_id: str, evidence_instances: list[dict], toolchain: list[dict],
-    indexed: list[dict], policy: dict,
+    indexed: list[dict], emitted: dict[tuple[str, str], bytes], policy: dict,
 ) -> dict[str, bytes]:
     names = [name for name, _media_type in contracts.required_artifact_contract(gate_id)]
     bodies: dict[str, bytes] = {}
@@ -424,7 +433,7 @@ def _supporting_bodies(
             ),
         })
     elif gate_id == "A-TAXONOMY":
-        bodies["classification-manifest"] = _taxonomy_body(environment, toolchain)
+        bodies["classification-manifest"] = _h0_collection_taxonomy_body(environment, toolchain)
     elif gate_id == "A-CORPUS":
         selected = next(row for row in corpus["sources"] if row["selected"])
         bodies["corpus-disclosure-report"] = _corpus_disclosure_body(selected["fixture_digest"])
@@ -568,6 +577,60 @@ def _supporting_bodies(
             ),
             "toolchain": toolchain,
         })
+    elif gate_id == "B-COVERAGE":
+        policy_body = (ROOT / contracts.COVERAGE_POLICY_PATH).read_bytes()
+        coverage_policy = contracts.read_coverage_policy(policy_body)
+        baseline = _coverage_baseline()
+        bindings = {row["name"]: row for row in scope["input_bindings"]}
+        h0 = evidence.load_json_bytes(emitted[("B-HERMETIC-ALL", "test-report")][:-1])
+        fragments = next(run["fragments"] for run in h0["runs"] if run["environment"]["python"].startswith("3.12."))
+        h0_digests = {row["job_instance_id"]: row["digest"] for row in fragments}
+        values = {row["metric"]: (0 if row["class"] == "regression" else 10000)
+                  for row in thresholds["thresholds"] if row["gate_id"] == gate_id}
+        binding_names = (
+            "coverage-config", "coverage-policy", "coverage-shard-producer",
+            "coverage-shard-schema", "verification-job-map", "verification-workflow-ci",
+        )
+        coverage_data = []
+        shard_files = [{
+            "executed_branches": [[1, 2], [2, 3], [3, -1], [4, 5], [5, -1]],
+            "executed_lines": list(range(1, 11)), "path": path,
+            "possible_branches": [[1, 2], [2, 3], [3, -1], [4, 5], [5, -1]],
+            "statements": list(range(1, 11)),
+        } for path in coverage_policy["source_roster"]]
+        for index, job_id in enumerate(coverage_policy["h0_job_ids"]):
+            raw_data_digest = contracts.raw_sha256(f"synthetic-coverage-db-{index}".encode())
+            coverage_data.append({
+                "digest": raw_data_digest, "h0_fragment_digest": h0_digests[job_id],
+                "job_instance_id": job_id,
+            })
+            bodies[f"coverage-shard-{index}"] = contracts.canonical_json_line({
+                "config_digest": contracts.raw_sha256((ROOT / ".coveragerc").read_bytes()),
+                "coverage_policy_digest": contracts.raw_sha256(policy_body),
+                "coverage_version": "7.15.4", "files": shard_files,
+                "h0_fragment_digest": h0_digests[job_id], "job_instance_id": job_id,
+                "raw_coverage_data_digest": raw_data_digest,
+                "schema_version": contracts.COVERAGE_SHARD_SCHEMA,
+                "source_roster": coverage_policy["source_roster"],
+            })
+        bodies["coverage-report"] = contracts.canonical_json_line({
+            "artifact_type": "coverage-report",
+            "bindings": [{"digest": bindings[name]["digest"], "name": name, "path": bindings[name]["path"]} for name in binding_names],
+            "candidate_identity_digest": evidence.canonical_digest(identity),
+            "coverage_baseline": baseline,
+            "coverage_data": coverage_data,
+            "coverage_files": copy.deepcopy(baseline["files"]),
+            "coverage_policy_digest": contracts.raw_sha256(policy_body),
+            "critical_modules": [{"path": path, "line_coverage": 10000, "branch_coverage": 10000} for path in coverage_policy["critical_modules"]],
+            "environment": environment, "evidence_finished_at": "2026-08-14T10:10:01Z",
+            "evidence_instance_id": evidence_instance_id, "evidence_started_at": "2026-08-14T10:10:00Z",
+            "gate_id": gate_id,
+            "measurements": [{"metric": metric, "value": value, "breached": False} for metric, value in values.items()],
+            "name": "coverage-report", "release": "0.3.10", "schema_version": contracts.GATE_ARTIFACT_SCHEMA,
+            "source_tree_digest": identity["source_tree_digest"],
+            "threshold_manifest_digest": contracts.raw_sha256(contracts.canonical_json_line(thresholds)),
+            "toolchain": toolchain,
+        })
     elif gate_id == "B-MANIFEST":
         instance = evidence_instances[0]
         cases_body = (ROOT / contracts.MANIFEST_PATHS["manifest-evidence-cases"]).read_bytes()
@@ -644,7 +707,7 @@ def _supporting_bodies(
             "release": "0.3.10",
             "schema_version": contracts.GATE_ARTIFACT_SCHEMA,
         }
-        collection_body = _h0_collection_taxonomy_body(h0_environments[0], toolchain)
+        collection_body = emitted[("A-TAXONOMY", "classification-manifest")]
         taxonomy = evidence.read_pytest_taxonomy(collection_body)
         h0_nodes = taxonomy["lanes"][0]["nodes"]
         runs = []
@@ -1137,6 +1200,7 @@ def _ready_contracts(
     corpus = _read("release/evidence/corpus-selection-v1.json", contracts.read_corpus_manifest)
     no_live = _read("release/evidence/no-live-rule-v1.json", contracts.read_no_live_rule)
     support["tools"] = [
+        {"digest": _digest("d"), "name": "coverage", "version": "7.15.4"},
         {"digest": _digest("b"), "name": "mypy", "version": "2.3.1"},
         {"digest": _digest("a"), "name": "pytest", "version": "9.1.1"},
         {"digest": _digest("c"), "name": "ruff", "version": "0.16.3"},
@@ -1159,6 +1223,10 @@ def _ready_contracts(
         ) else 1
         if row["class"] == "regression":
             row["baseline_digest"] = _digest("c")
+    coverage_baseline_digest = contracts.raw_sha256(contracts.canonical_json_line(_coverage_baseline()))
+    for row in thresholds["thresholds"]:
+        if row["gate_id"] == "B-COVERAGE" and row["class"] == "regression":
+            row["baseline_digest"] = coverage_baseline_digest
     corpus["sources"][-1]["fixture_digest"] = _digest("f")
     corpus["sources"][-1]["attestation_digest"] = contracts.raw_sha256(
         _corpus_disclosure_body(corpus["sources"][-1]["fixture_digest"])
@@ -1290,6 +1358,7 @@ def _scenario(tmp_path: Path, *, approved_at: str = "2026-08-01T00:00:00Z"):
     }
     records = []
     indexed = []
+    emitted: dict[tuple[str, str], bytes] = {}
     artifact_root = tmp_path / "evidence"
     artifact_root.mkdir(parents=True)
     supported_environments = support["environments"]
@@ -1321,8 +1390,10 @@ def _scenario(tmp_path: Path, *, approved_at: str = "2026-08-01T00:00:00Z"):
         artifacts = []
         instances = []
         gate_toolchain = (
-            supported_toolchain if gate_id in {"B-QUALITY", "C-TOOLS"}
-            else [tool for tool in supported_toolchain if tool["name"] == "pytest"]
+            [tool for tool in supported_toolchain if tool["name"] in {"mypy", "pytest", "ruff"}]
+            if gate_id == "B-QUALITY" else supported_toolchain if gate_id == "C-TOOLS" else
+            [tool for tool in supported_toolchain if tool["name"] in {"coverage", "pytest"}]
+            if gate_id == "B-COVERAGE" else [tool for tool in supported_toolchain if tool["name"] == "pytest"]
         )
         if not is_live:
             if gate_id == "B-HERMETIC-ALL":
@@ -1335,6 +1406,9 @@ def _scenario(tmp_path: Path, *, approved_at: str = "2026-08-01T00:00:00Z"):
                     environment for environment in supported_environments
                     if environment["lane"] in lanes
                 ]
+            elif gate_id == "B-COVERAGE":
+                instance_specs = [next(environment for environment in supported_environments
+                                       if environment["lane"] == "H0-hermetic" and environment["python"].startswith("3.12."))]
             else:
                 instance_specs = [
                     next(environment for environment in supported_environments
@@ -1354,8 +1428,8 @@ def _scenario(tmp_path: Path, *, approved_at: str = "2026-08-01T00:00:00Z"):
                 }
                 if gate_id == "A-TAXONOMY":
                     selection = {
-                        "collected": 5, "deselected": 4, "failed": 0, "passed": 1,
-                        "selected": 1, "skipped": 0, "xfailed": 0, "xpassed": 0,
+                        "collected": 10, "deselected": 4, "failed": 0, "passed": 6,
+                        "selected": 6, "skipped": 0, "xfailed": 0, "xpassed": 0,
                     }
                 if gate_id == "B-HERMETIC-ALL":
                     selection = {
@@ -1386,12 +1460,15 @@ def _scenario(tmp_path: Path, *, approved_at: str = "2026-08-01T00:00:00Z"):
                         "collected": 6, "deselected": 0, "failed": 0, "passed": 6,
                         "selected": 6, "skipped": 0, "xfailed": 0, "xpassed": 0,
                     }
+                if gate_id == "B-COVERAGE":
+                    selection = {"collected": 10, "deselected": 4, "failed": 0, "passed": 6,
+                                 "selected": 6, "skipped": 0, "xfailed": 0, "xpassed": 0}
                 instances.append({
                     "artifacts": [],
                     "assertions": [assertion],
                     "environment": instance_environment,
                     "finished_at": instance_finished_at,
-                    "id": f"instance-{instance_index:02d}",
+                    "id": "instance-01" if gate_id == "B-COVERAGE" else f"instance-{instance_index:02d}",
                     "lane": environment["lane"],
                     "selection": selection,
                     "started_at": gate_started_at,
@@ -1405,7 +1482,9 @@ def _scenario(tmp_path: Path, *, approved_at: str = "2026-08-01T00:00:00Z"):
             measurements = []
             for threshold in thresholds["thresholds"]:
                 if threshold["gate_id"] == gate_id:
-                    if threshold["class"] == "regression":
+                    if gate_id == "B-COVERAGE":
+                        observed_value = 0 if threshold["class"] == "regression" else 10000
+                    elif threshold["class"] == "regression":
                         observed_value = 0
                     elif threshold["operator"] == "at_least":
                         observed_value = threshold["limit"]
@@ -1457,7 +1536,7 @@ def _scenario(tmp_path: Path, *, approved_at: str = "2026-08-01T00:00:00Z"):
                 evidence_instance_id=instances[0]["id"],
                 evidence_instances=instances,
                 toolchain=gate_toolchain,
-                indexed=indexed,
+                indexed=indexed, emitted=emitted,
                 policy=policy,
             )
             for artifact_name, media_type in contracts.required_artifact_contract(gate_id):
@@ -1475,6 +1554,7 @@ def _scenario(tmp_path: Path, *, approved_at: str = "2026-08-01T00:00:00Z"):
                     "size": len(artifact_body),
                 }
                 indexed.append(artifact)
+                emitted[(gate_id, artifact_name)] = artifact_body
                 artifacts.append({
                     key: artifact[key] for key in ("digest", "media_type", "name")
                 })
@@ -1526,7 +1606,7 @@ def _scenario(tmp_path: Path, *, approved_at: str = "2026-08-01T00:00:00Z"):
                 name: sum(instance["selection"][name] for instance in instances)
                 for name in selection
             }
-        if gate_id in {"B-DOCS-POLICY", "B-QUALITY"}:
+        if gate_id in {"B-DOCS-POLICY", "B-QUALITY", "B-COVERAGE"}:
             selection = copy.deepcopy(instances[0]["selection"])
         if gate_id == "B-MANIFEST":
             selection = copy.deepcopy(instances[0]["selection"])
@@ -1698,6 +1778,10 @@ def _rebind_scenario(arguments: dict) -> None:
         (row["gate_id"], row["name"]): row
         for row in arguments["artifact_index"]["artifacts"]
     }
+    emitted = {
+        key: (arguments["artifact_root"] / row["path"]).read_bytes()
+        for key, row in index_by_key.items() if key[1] != "gate-evidence"
+    }
     for gate in arguments["records"]:
         gate_id = gate["gate_id"]
         if gate_id not in contracts.LIVE_GATES:
@@ -1718,7 +1802,7 @@ def _rebind_scenario(arguments: dict) -> None:
                 evidence_instance_id=report["instances"][0]["id"],
                 evidence_instances=report["instances"],
                 toolchain=gate["toolchain"],
-                indexed=arguments["artifact_index"]["artifacts"],
+                indexed=arguments["artifact_index"]["artifacts"], emitted=emitted,
                 policy=arguments["trust_policy"],
             )
             for artifact_name, artifact_body in supporting_bodies.items():
@@ -1727,6 +1811,7 @@ def _rebind_scenario(arguments: dict) -> None:
                 artifact_path.write_bytes(artifact_body)
                 indexed_artifact["digest"] = contracts.raw_sha256(artifact_body)
                 indexed_artifact["size"] = len(artifact_body)
+                emitted[(gate_id, artifact_name)] = artifact_body
                 next(
                     row for row in gate["artifacts"] if row["name"] == artifact_name
                 )["digest"] = indexed_artifact["digest"]
@@ -1848,7 +1933,7 @@ class TestCommittedContracts:
             "synthetic_corpus_disclosure_attestation", "aggregator_conformance_report",
             "h0_test_report", "h0_isolation_self_test", "schema_validation_report",
             "docs_policy_parity_report",
-            "manifest_invariant_report", "manifest_corrupt_fixture_matrix", "quality_report",
+            "manifest_invariant_report", "manifest_corrupt_fixture_matrix", "quality_report", "coverage_report",
         ]
         discriminators = []
         for name in variant_names:
@@ -1942,7 +2027,7 @@ class TestCommittedContracts:
         thresholds = _read(
             "release/evidence/threshold-benchmark-v1.json", contracts.read_threshold_manifest,
         )
-        assert len(thresholds["thresholds"]) == len(contracts.THRESHOLD_CONTRACTS) == 56
+        assert len(thresholds["thresholds"]) == len(contracts.THRESHOLD_CONTRACTS) == 62
         for gate_id in contracts.PERFORMANCE_OPERATIONS:
             classes = {
                 row["class"] for row in thresholds["thresholds"] if row["gate_id"] == gate_id
@@ -2088,7 +2173,7 @@ class TestIncompleteSemanticRegistry:
             set(contracts.RESOURCE_SEMANTIC_GATES)
             | {
                 "A-IDENTITY", "A-EVIDENCE-SCHEMA", "A-TAXONOMY", "A-CORPUS", "A-THRESHOLDS", "A-SUPPORT",
-                "B-HERMETIC-ALL", "B-SCHEMA", "B-DOCS-POLICY", "B-MANIFEST", "B-QUALITY",
+                "B-HERMETIC-ALL", "B-SCHEMA", "B-DOCS-POLICY", "B-MANIFEST", "B-QUALITY", "B-COVERAGE",
                 "C-PACKAGE-BUILD", "C-PACKAGE-INSTALL", "C-NETWORK-BOUNDARY", "C-NET-DENY",
                 *contracts.V310_05_SEMANTIC_GATES,
             }
@@ -2097,7 +2182,7 @@ class TestIncompleteSemanticRegistry:
         arguments = _scenario(tmp_path)
         with pytest.raises(
             evidence.EvidenceError,
-            match="B-COVERAGE has no registered obligation-specific semantic verifier",
+            match="B-STATIC-SECURITY has no registered obligation-specific semantic verifier",
         ):
             contracts.aggregate_records(**arguments)
 
@@ -3086,7 +3171,7 @@ class TestArtifactsAndAggregation:
                 row for row in arguments["threshold_manifest"]["thresholds"]
                 if row["gate_id"] == "B-COVERAGE" and row["class"] == "absolute"
             )
-            benchmark["limit"] = 2
+            benchmark["limit"] = 10001
             expected = "numeric threshold"
             changed_document = arguments["threshold_manifest"]
         else:
@@ -3616,3 +3701,77 @@ class TestArtifactsAndAggregation:
         _resign_gate(gate, arguments["identity"], arguments["trust_policy"])
         with pytest.raises(evidence.EvidenceError, match="zero execution, tools"):
             contracts.aggregate_records(**arguments)
+
+
+class TestCoverageSemanticEvidence:
+    @staticmethod
+    def _report(arguments: dict) -> dict:
+        artifact = next(item for item in arguments["artifact_index"]["artifacts"]
+                        if item["gate_id"] == "B-COVERAGE" and item["name"] == "coverage-report")
+        return json.loads((arguments["artifact_root"] / artifact["path"]).read_bytes())
+
+    @staticmethod
+    def _verify(arguments: dict, document: dict) -> None:
+        gate = copy.deepcopy(_gate(arguments, "B-COVERAGE"))
+        body = contracts.canonical_json_line(document)
+        next(item for item in gate["artifacts"] if item["name"] == "coverage-report")["digest"] = contracts.raw_sha256(body)
+        report_artifact = next(item for item in arguments["artifact_index"]["artifacts"]
+                               if item["gate_id"] == "B-COVERAGE" and item["name"] == "gate-evidence")
+        report = contracts.read_evidence_report(
+            (arguments["artifact_root"] / report_artifact["path"]).read_bytes(),
+            identity=arguments["identity"], gate_id="B-COVERAGE",
+        )
+        bodies = {"coverage-report": body}
+        for artifact in arguments["artifact_index"]["artifacts"]:
+            if artifact["gate_id"] == "B-COVERAGE" and artifact["name"].startswith("coverage-shard-"):
+                bodies[artifact["name"]] = (arguments["artifact_root"] / artifact["path"]).read_bytes()
+        with contracts.ArtifactResolver(arguments["artifact_root"], arguments["artifact_index"], identity=arguments["identity"]) as resolver:
+            contracts._semantic_coverage(
+                gate, bodies, identity=arguments["identity"], report=report,
+                scope=arguments["scope"], thresholds=arguments["threshold_manifest"],
+                input_bodies=arguments["input_bodies"], resolver=resolver,
+            )
+
+    def test_coverage_schema_and_compact_evidence_refuse_forgery(self, tmp_path):
+        arguments = _scenario(tmp_path)
+        original = self._report(arguments)
+        schema = json.loads((ROOT / contracts.SCHEMA_PATHS["gate-artifact-schema"]).read_text())
+        coverage_schema = {"$defs": schema["$defs"], **schema["$defs"]["coverage_report"]}
+        assert list(Draft202012Validator(coverage_schema).iter_errors(original)) == []
+        self._verify(arguments, original)
+        mutations = (
+            lambda doc: doc.update(candidate_identity_digest=_digest("9")),
+            lambda doc: doc["coverage_files"].pop(),
+            lambda doc: doc["coverage_files"].append(copy.deepcopy(doc["coverage_files"][0])),
+            lambda doc: doc["coverage_files"][0]["lines"].update(covered=11),
+            lambda doc: [row["branches"].update(covered=0, total=0) for row in doc["coverage_files"]],
+            lambda doc: doc["critical_modules"].pop(),
+            lambda doc: doc["coverage_data"][1].update(digest=doc["coverage_data"][0]["digest"]),
+            lambda doc: doc["coverage_data"][0].update(h0_fragment_digest=_digest("7")),
+            lambda doc: doc["measurements"][0].update(breached=True),
+        )
+        for mutate in mutations:
+            forged = copy.deepcopy(original)
+            mutate(forged)
+            with pytest.raises(evidence.EvidenceError):
+                self._verify(arguments, forged)
+        malformed = copy.deepcopy(original)
+        malformed["unexpected"] = True
+        assert list(Draft202012Validator(coverage_schema).iter_errors(malformed))
+
+    def test_coverage_shard_union_is_read_from_signed_indexed_artifacts(self, tmp_path):
+        arguments = _scenario(tmp_path)
+        original = self._report(arguments)
+        for artifact in arguments["artifact_index"]["artifacts"]:
+            if artifact["gate_id"] != "B-COVERAGE" or not artifact["name"].startswith("coverage-shard-"):
+                continue
+            path = arguments["artifact_root"] / artifact["path"]
+            shard = json.loads(path.read_bytes())
+            shard["files"][0]["executed_lines"].pop()
+            body = contracts.canonical_json_line(shard)
+            path.write_bytes(body)
+            artifact.update(digest=contracts.raw_sha256(body), size=len(body))
+            next(item for item in _gate(arguments, "B-COVERAGE")["artifacts"]
+                 if item["name"] == artifact["name"])["digest"] = artifact["digest"]
+        with pytest.raises(evidence.EvidenceError, match="totals do not recompute"):
+            self._verify(arguments, original)

@@ -58,7 +58,16 @@ def test_package_metadata_uses_spdx_and_pinned_ci_tools():
     assert project["project"]["license-files"] == ["LICENSE"]
     assert project["build-system"]["requires"] == ["setuptools==80.9.0"]
     ci = project["project"]["optional-dependencies"]["ci"]
-    expected = {"bandit", "build", "detect-secrets", "mypy", "pip-audit", "ruff", "twine"}
+    expected = {
+        "bandit",
+        "build",
+        "coverage",
+        "detect-secrets",
+        "mypy",
+        "pip-audit",
+        "ruff",
+        "twine",
+    }
     assert {item.split("==", 1)[0] for item in ci} == expected
     assert all(re.fullmatch(r"[a-z-]+==[0-9]+(?:\.[0-9]+)+", item) for item in ci)
 

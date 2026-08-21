@@ -57,6 +57,8 @@ AGGREGATE_SCHEMA = "quarry.release-aggregate.v1"
 APPROVAL_SCHEMA = "quarry.detached-release-approval.v1"
 MANIFEST_EVIDENCE_CASES_SCHEMA = "quarry.manifest-evidence-cases.v1"
 QUALITY_POLICY_SCHEMA = "quarry.quality-policy.v1"
+COVERAGE_POLICY_SCHEMA = "quarry.coverage-policy.v1"
+COVERAGE_SHARD_SCHEMA = "quarry.coverage-shard.v1"
 
 RELEASE = evidence.RELEASE_SCOPE
 LANE_ORDER = (
@@ -162,8 +164,14 @@ SELECTED_RECORD_SLOTS = tuple(
 QUALITY_THRESHOLD_CONTRACTS = (
     ("B-HERMETIC-ALL", "absolute", "unexpected_outcomes", "at_most", "maximum", "count"),
     ("B-QUALITY", "absolute", "quality_violations", "at_most", "maximum", "count"),
-    ("B-COVERAGE", "absolute", "line_coverage", "at_least", "minimum", "basis_points"),
-    ("B-COVERAGE", "regression", "line_coverage_loss", "at_most", "maximum", "basis_points"),
+    ("B-COVERAGE", "absolute", "repository_line_coverage", "at_least", "minimum", "basis_points"),
+    ("B-COVERAGE", "regression", "repository_line_coverage_loss", "at_most", "maximum", "basis_points"),
+    ("B-COVERAGE", "absolute", "repository_branch_coverage", "at_least", "minimum", "basis_points"),
+    ("B-COVERAGE", "regression", "repository_branch_coverage_loss", "at_most", "maximum", "basis_points"),
+    ("B-COVERAGE", "absolute", "critical_module_line_coverage", "at_least", "minimum", "basis_points"),
+    ("B-COVERAGE", "regression", "critical_module_line_coverage_loss", "at_most", "maximum", "basis_points"),
+    ("B-COVERAGE", "absolute", "critical_module_branch_coverage", "at_least", "minimum", "basis_points"),
+    ("B-COVERAGE", "regression", "critical_module_branch_coverage_loss", "at_most", "maximum", "basis_points"),
     ("B-STATIC-SECURITY", "absolute", "unsuppressed_findings", "at_most", "maximum", "count"),
     ("B-DETERMINISM", "absolute", "artifact_differences", "at_most", "maximum", "count"),
     ("C-VULNERABILITY", "absolute", "unaccepted_findings", "at_most", "maximum", "count"),
@@ -299,7 +307,10 @@ REQUIRED_ARTIFACTS = {
         ("invariant-report", "application/json"),
     ),
     "B-QUALITY": (("quality-report", "application/json"),),
-    "B-COVERAGE": (("coverage-report", "application/json"),),
+    "B-COVERAGE": (
+        ("coverage-report", "application/json"),
+        *( (f"coverage-shard-{index}", "application/json") for index in range(6) ),
+    ),
     "B-STATIC-SECURITY": (("security-findings", "application/json"),),
     "B-DETERMINISM": (("artifact-tree-diff", "application/json"),),
     "B-DOCS-POLICY": (("parity-report", "application/json"),),
@@ -404,6 +415,8 @@ SCHEMA_PATHS = {
     "threshold-benchmark-schema": "release/evidence/schemas/threshold-benchmark-v1.schema.json",
     "trust-policy-schema": "release/evidence/schemas/trust-policy-v1.schema.json",
     "quality-policy-schema": "release/evidence/schemas/quality-policy-v1.schema.json",
+    "coverage-policy-schema": "release/evidence/schemas/coverage-policy-v1.schema.json",
+    "coverage-shard-schema": "release/evidence/schemas/coverage-shard-v1.schema.json",
 }
 SCHEMA_VERSIONS = {
     "aggregate-schema": AGGREGATE_SCHEMA,
@@ -424,6 +437,8 @@ SCHEMA_VERSIONS = {
     "threshold-benchmark-schema": THRESHOLD_MANIFEST_SCHEMA,
     "trust-policy-schema": TRUST_POLICY_SCHEMA,
     "quality-policy-schema": QUALITY_POLICY_SCHEMA,
+    "coverage-policy-schema": COVERAGE_POLICY_SCHEMA,
+    "coverage-shard-schema": COVERAGE_SHARD_SCHEMA,
 }
 MANIFEST_PATHS = {
     "aggregator-conformance-manifest": "release/evidence/aggregator-conformance-v1.json",
@@ -433,6 +448,7 @@ MANIFEST_PATHS = {
     "threshold-benchmark": "release/evidence/threshold-benchmark-v1.json",
     "manifest-evidence-cases": "release/evidence/manifest-evidence-cases-v1.json",
     "quality-policy": "release/evidence/quality-policy-v1.json",
+    "coverage-policy": "release/evidence/coverage-policy-v1.json",
 }
 SCHEMA_VALIDATION_FIXTURE_MANIFEST_PATH = "release/evidence/schema-validation-fixtures-v1.json"
 SCHEMA_VALIDATION_FIXTURE_PATHS = {
@@ -460,6 +476,9 @@ SCOPE_INPUT_PATHS = {
     **RUNNER_INPUT_PATHS,
     "release-contracts-tests": "tests/test_release_contracts.py",
     "quality-contract-tests": "tests/test_quality_contract.py",
+    "coverage-contract-tests": "tests/test_coverage_contract.py",
+    "coverage-config": ".coveragerc",
+    "coverage-shard-producer": "scripts/emit_coverage_shard.py",
     "package-metadata": "pyproject.toml",
     "docs-parity-tests": "tests/test_docs_parity.py",
     "docs-policy-readme": "README.md",
@@ -535,6 +554,23 @@ _DOCS_POLICY_MATERIALS = (
 )
 
 QUALITY_POLICY_PATH = "release/evidence/quality-policy-v1.json"
+COVERAGE_POLICY_PATH = "release/evidence/coverage-policy-v1.json"
+_COVERAGE_CONFIG_PATH = ".coveragerc"
+_COVERAGE_CONFIG_BYTES = b"[run]\nbranch = True\nparallel = False\nrelative_files = True\nsource = src/quarry_recon\n"
+_COVERAGE_SOURCE_ROOT = "src/quarry_recon"
+_COVERAGE_CRITICAL_MODULES = (
+    "src/quarry_recon/runner.py", "src/quarry_recon/runner_supervisor.py",
+    "src/quarry_recon/runner_worker.py", "src/quarry_recon/runner_repository.py",
+    "src/quarry_recon/runner_protocol.py", "src/quarry_recon/store.py",
+    "src/quarry_recon/repository_identity.py", "src/quarry_recon/privfs.py",
+    "src/quarry_recon/revision.py", "src/quarry_recon/run_manifest.py",
+    "src/quarry_recon/campaign.py", "src/quarry_recon/settle.py",
+    "src/quarry_recon/release_contracts.py", "src/quarry_recon/release_evidence.py",
+)
+_COVERAGE_H0_JOB_IDS = tuple(
+    ".github/workflows/ci.yml#jobs.offline[python-version=3.12,shard="
+    f"{shard}]" for shard in range(6)
+)
 _QUALITY_CHECK_IDS = ("formatting", "lint", "type", "docs", "dead-code", "complexity")
 _QUALITY_SOURCE_ROSTER = ("src", "tests", "scripts")
 _QUALITY_MYPY_SOURCES = (
@@ -585,6 +621,90 @@ def validate_quality_policy(document: object) -> dict:
 
 def read_quality_policy(data: bytes) -> dict:
     return validate_quality_policy(_canonical_reader(data, "quality policy"))
+
+
+def validate_coverage_policy(document: object) -> dict:
+    """Validate the deliberately small, exact B-COVERAGE collection policy."""
+    doc = _object(document, "coverage policy", {
+        "config", "critical_modules", "h0_job_ids", "python", "release",
+        "schema_version", "source_roster", "tool", "version",
+    })
+    _schema(doc, COVERAGE_POLICY_SCHEMA, "coverage policy")
+    if (doc["tool"], doc["version"], doc["python"]) != ("coverage", "7.15.4", "3.12"):
+        raise evidence.EvidenceError("coverage policy tool identity is not frozen")
+    config = _object(doc["config"], "coverage policy.config", {"digest", "path"})
+    if config["path"] != _COVERAGE_CONFIG_PATH:
+        raise evidence.EvidenceError("coverage policy config path is not frozen")
+    _digest(config["digest"], "coverage policy config digest")
+    roster = _array(doc["source_roster"], "coverage policy source roster")
+    if (not roster or roster != sorted(roster) or len(roster) != len(set(roster)) or
+            any(not isinstance(path, str) or not path.startswith(_COVERAGE_SOURCE_ROOT + "/") or not path.endswith(".py")
+                for path in roster)):
+        raise evidence.EvidenceError("coverage policy source roster must be sorted, unique Python modules")
+    critical = _array(doc["critical_modules"], "coverage policy critical modules")
+    if critical != list(_COVERAGE_CRITICAL_MODULES) or not set(critical).issubset(roster):
+        raise evidence.EvidenceError("coverage policy critical-module roster is not frozen")
+    if _array(doc["h0_job_ids"], "coverage policy H0 job ids") != list(_COVERAGE_H0_JOB_IDS):
+        raise evidence.EvidenceError("coverage policy H0 job topology is not frozen")
+    return doc
+
+
+def read_coverage_policy(data: bytes) -> dict:
+    return validate_coverage_policy(_canonical_reader(data, "coverage policy"))
+
+
+def read_coverage_shard(data: bytes) -> dict:
+    """Read one candidate-independent, canonical Coverage.py shard fragment."""
+    doc = _object(_canonical_reader(data, "coverage shard"), "coverage shard", {
+        "config_digest", "coverage_policy_digest", "coverage_version", "files",
+        "h0_fragment_digest", "job_instance_id", "raw_coverage_data_digest",
+        "schema_version", "source_roster",
+    })
+    _schema(doc, COVERAGE_SHARD_SCHEMA, "coverage shard")
+    if doc["schema_version"] != COVERAGE_SHARD_SCHEMA or doc["coverage_version"] != "7.15.4":
+        raise evidence.EvidenceError("coverage shard schema or coverage version is unsupported")
+    _digest(doc["config_digest"], "coverage shard config digest")
+    _digest(doc["coverage_policy_digest"], "coverage shard policy digest")
+    _digest(doc["h0_fragment_digest"], "coverage shard H0 fragment digest")
+    _digest(doc["raw_coverage_data_digest"], "coverage shard raw data digest")
+    _string(doc["job_instance_id"], "coverage shard job instance id")
+    roster = _array(doc["source_roster"], "coverage shard source roster")
+    if not roster or roster != sorted(roster) or len(roster) != len(set(roster)):
+        raise evidence.EvidenceError("coverage shard source roster must be sorted and unique")
+    for path in roster:
+        if not isinstance(path, str) or not path.startswith(_COVERAGE_SOURCE_ROOT + "/") or not path.endswith(".py"):
+            raise evidence.EvidenceError("coverage shard source roster has an invalid path")
+    files = _array(doc["files"], "coverage shard files")
+    if len(files) != len(roster):
+        raise evidence.EvidenceError("coverage shard files do not cover the frozen roster")
+    for index, row in enumerate(files):
+        item = _object(row, f"coverage shard files[{index}]", {
+            "executed_branches", "executed_lines", "path", "possible_branches", "statements",
+        })
+        if item["path"] != roster[index]:
+            raise evidence.EvidenceError("coverage shard files are not in frozen roster order")
+        statements = _array(item["statements"], "coverage shard statements")
+        executed_lines = _array(item["executed_lines"], "coverage shard executed lines")
+        for values, label in ((statements, "statements"), (executed_lines, "executed lines")):
+            if any(_integer(value, f"coverage shard {label}") == 0 for value in values) or values != sorted(set(values)):
+                raise evidence.EvidenceError(f"coverage shard {label} must be sorted unique positive lines")
+        if not set(executed_lines).issubset(statements):
+            raise evidence.EvidenceError("coverage shard executed lines exceed statements")
+        arcs = []
+        for values, label in ((item["possible_branches"], "possible branches"), (item["executed_branches"], "executed branches")):
+            parsed = []
+            for arc in _array(values, f"coverage shard {label}"):
+                if type(arc) is not list or len(arc) != 2 or any(type(value) is not int or abs(value) > evidence.MAX_JSON_INTEGER for value in arc):
+                    raise evidence.EvidenceError(f"coverage shard {label} has an invalid arc")
+                parsed.append(tuple(arc))
+            if parsed != sorted(set(parsed)):
+                raise evidence.EvidenceError(f"coverage shard {label} must be sorted and unique")
+            arcs.append(parsed)
+        if not set(arcs[1]).issubset(arcs[0]):
+            raise evidence.EvidenceError("coverage shard executed branches exceed possible branches")
+    if len(data) > 1024 * 1024:
+        raise evidence.EvidenceError("coverage shard exceeds the one MiB artifact bound")
+    return doc
 
 _MANIFEST_TEST_SOURCES = (
     "manifest-run-contract-tests",
@@ -983,6 +1103,8 @@ def read_aggregator_conformance_manifest(data: bytes) -> dict:
 def _schema(document: dict, expected: str, name: str) -> None:
     if document["schema_version"] != expected:
         raise evidence.EvidenceError(f"unsupported {name} schema {document['schema_version']!r}")
+    if expected == COVERAGE_SHARD_SCHEMA:
+        return
     if document["release"] != RELEASE:
         raise evidence.EvidenceError(f"{name}.release must be exactly {RELEASE!r}")
 
@@ -4532,6 +4654,235 @@ def _semantic_quality(
         raise evidence.EvidenceError("quality signed selection must contain exactly the six passing checks")
 
 
+def _coverage_basis_points(counts: dict) -> int:
+    total = _integer(counts["total"], "coverage total")
+    covered = _integer(counts["covered"], "coverage covered")
+    if covered > total:
+        raise evidence.EvidenceError("coverage covered count exceeds its total")
+    return 10000 if total == 0 else covered * 10000 // total
+
+
+def _coverage_file_rows(value: object, roster: list[str], name: str) -> dict[str, dict]:
+    rows = _array(value, name)
+    parsed: dict[str, dict] = {}
+    for index, row in enumerate(rows):
+        item = _object(row, f"{name}[{index}]", {"branches", "lines", "path"})
+        _path(item["path"], f"{name}[{index}].path")
+        for kind in ("lines", "branches"):
+            counts = _object(item[kind], f"{name}[{index}].{kind}", {"covered", "total"})
+            _coverage_basis_points(counts)
+        if item["path"] in parsed:
+            raise evidence.EvidenceError("coverage report has a duplicate source file")
+        parsed[item["path"]] = item
+    if list(parsed) != roster:
+        raise evidence.EvidenceError("coverage report source roster is omitted, reordered or drifted")
+    return parsed
+
+
+def _semantic_coverage(
+    gate: dict, bodies: Mapping[str, bytes], **context: object,
+) -> None:
+    """Recompute B-COVERAGE from compact per-file line/branch totals."""
+    identity, report, scope, thresholds = (
+        context["identity"], context["report"], context["scope"], context["thresholds"]
+    )
+    inputs, resolver = context["input_bodies"], context["resolver"]
+    if (not all(isinstance(value, dict) for value in (identity, report, scope, thresholds)) or
+            not isinstance(inputs, Mapping) or not isinstance(resolver, ArtifactResolver)):
+        raise evidence.EvidenceError("coverage verifier requires accepted release context")
+    signed = next((item for item in gate["artifacts"] if item["name"] == "coverage-report"), None)
+    if (signed is None or signed["media_type"] != "application/json" or
+            signed["digest"] != raw_sha256(bodies["coverage-report"])):
+        raise evidence.EvidenceError("coverage report does not match its exact signed artifact digest")
+    doc = _object(_artifact_document(bodies["coverage-report"], "B-COVERAGE", "coverage-report"),
+        "coverage report", {
+            "artifact_type", "bindings", "candidate_identity_digest", "coverage_baseline",
+            "coverage_data", "coverage_files", "coverage_policy_digest", "critical_modules",
+            "environment", "evidence_finished_at", "evidence_instance_id", "evidence_started_at",
+            "gate_id", "measurements", "name", "release", "schema_version", "source_tree_digest",
+            "threshold_manifest_digest", "toolchain",
+        })
+    expected_identity = {
+        "artifact_type": "coverage-report", "candidate_identity_digest": evidence.canonical_digest(identity),
+        "gate_id": "B-COVERAGE", "name": "coverage-report", "release": RELEASE,
+        "schema_version": GATE_ARTIFACT_SCHEMA, "source_tree_digest": identity["source_tree_digest"],
+    }
+    if any(doc[key] != value for key, value in expected_identity.items()):
+        raise evidence.EvidenceError("coverage report has the wrong candidate, source tree, gate or release")
+    instances = report["instances"]
+    if len(instances) != 1 or instances[0]["lane"] != "H0-hermetic" or instances[0]["environment"]["python"].rsplit(".", 1)[0] != "3.12":
+        raise evidence.EvidenceError("coverage report requires one exact Python 3.12 signed H0 instance")
+    instance = instances[0]
+    if any(doc[field] != instance[key] for field, key in (
+        ("evidence_instance_id", "id"), ("environment", "environment"),
+        ("evidence_started_at", "started_at"), ("evidence_finished_at", "finished_at"),
+    )) or doc["toolchain"] != instance["toolchain"]:
+        raise evidence.EvidenceError("coverage report does not bind its signed H0 instance/toolchain")
+    tools = {row["name"]: row for row in instance["toolchain"]}
+    if len(instance["toolchain"]) != 2 or set(tools) != {"coverage", "pytest"} or \
+            tools["coverage"]["version"] != "7.15.4":
+        raise evidence.EvidenceError("coverage report toolchain must be exactly coverage and pytest")
+    bindings = {row["name"]: row for row in scope["input_bindings"]}
+    binding_names = (
+        "coverage-config", "coverage-policy", "coverage-shard-producer",
+        "coverage-shard-schema", "verification-job-map", "verification-workflow-ci",
+    )
+    expected_bindings = []
+    for name in binding_names:
+        row, body = bindings.get(name), inputs.get(name)
+        if row is None or type(body) is not bytes or raw_sha256(body) != row["digest"]:
+            raise evidence.EvidenceError("coverage report input is absent or drifted from scope")
+        expected_bindings.append({"digest": row["digest"], "name": name, "path": row["path"]})
+    if doc["bindings"] != expected_bindings:
+        raise evidence.EvidenceError("coverage report bindings are not the frozen policy/config/topology set")
+    policy_body = inputs["coverage-policy"]
+    policy = read_coverage_policy(policy_body)
+    if (doc["coverage_policy_digest"] != raw_sha256(policy_body) or
+            inputs["coverage-config"] != _COVERAGE_CONFIG_BYTES or
+            policy["config"]["digest"] != raw_sha256(inputs["coverage-config"])):
+        raise evidence.EvidenceError("coverage report does not bind frozen policy/config bytes")
+    job_map = evidence.read_verification_job_map(inputs["verification-job-map"], workflow_bodies={
+        ".github/workflows/ci.yml": inputs["verification-workflow-ci"],
+    })
+    mapped_ids = [row["id"] for job in job_map["jobs"] if job["lane"] == "H0-hermetic"
+                  for row in job["instances"] if {item["name"]: item["value"] for item in row["matrix"]}.get("python-version") == "3.12"]
+    if mapped_ids != policy["h0_job_ids"]:
+        raise evidence.EvidenceError("coverage policy H0 jobs do not match verification topology")
+    baseline = _object(doc["coverage_baseline"], "coverage baseline", {"files"})
+    before = _coverage_file_rows(baseline["files"], policy["source_roster"], "coverage baseline.files")
+    baseline_digest = raw_sha256(canonical_json_line(baseline))
+    rows = [row for row in thresholds["thresholds"] if row["gate_id"] == "B-COVERAGE"]
+    contracts = [row for row in QUALITY_THRESHOLD_CONTRACTS if row[0] == "B-COVERAGE"]
+    if [tuple(row[key] for key in ("gate_id", "class", "metric", "operator", "statistic", "unit")) for row in rows] != contracts:
+        raise evidence.EvidenceError("coverage threshold rows do not match the frozen metric contract")
+    regression = [row for row in rows if row["class"] == "regression"]
+    if any(row["baseline_digest"] not in {None, baseline_digest} for row in regression) or \
+            len({row["baseline_digest"] for row in regression}) > 1:
+        raise evidence.EvidenceError("coverage regression thresholds do not share the embedded baseline digest")
+    if doc["threshold_manifest_digest"] != raw_sha256(canonical_json_line(thresholds)):
+        raise evidence.EvidenceError("coverage report does not bind its exact threshold manifest")
+    h0_body = resolver.read("B-HERMETIC-ALL", "test-report")
+    h0 = _artifact_document(h0_body, "B-HERMETIC-ALL", "test-report")
+    taxonomy_body = resolver.read("A-TAXONOMY", "classification-manifest")
+    taxonomy = evidence.read_pytest_taxonomy(taxonomy_body)
+    if h0["collection_manifest_digest"] != raw_sha256(taxonomy_body):
+        raise evidence.EvidenceError("coverage H0 report does not bind the exact taxonomy collection")
+    expected_selection = {
+        "collected": taxonomy["selection"]["collected"],
+        "deselected": taxonomy["selection"]["deselected"],
+        "failed": 0, "passed": taxonomy["selection"]["selected"],
+        "selected": taxonomy["selection"]["selected"], "skipped": 0,
+        "xfailed": 0, "xpassed": 0,
+    }
+    if instance["selection"] != expected_selection or gate["selection"] != expected_selection:
+        raise evidence.EvidenceError("coverage signed selection does not match the bound H0 taxonomy")
+    h0_runs = [run for run in _array(h0["runs"], "H0 coverage test runs")
+               if run["environment"]["python"].rsplit(".", 1)[0] == "3.12"]
+    if len(h0_runs) != 1 or h0_runs[0]["evidence_instance_id"] != instance["id"] or \
+            h0_runs[0]["environment"] != instance["environment"]:
+        raise evidence.EvidenceError("coverage report does not bind the exact Python 3.12 H0 execution")
+    expected_fragments = {}
+    for fragment in h0_runs[0]["fragments"]:
+        expected_fragments[fragment["job_instance_id"]] = fragment["digest"]
+        if fragment["report"]["collector"]["version"] != tools["pytest"]["version"]:
+            raise evidence.EvidenceError("coverage report pytest identity does not match its H0 fragments")
+    data = _array(doc["coverage_data"], "coverage report data")
+    if [row.get("job_instance_id") if type(row) is dict else None for row in data] != policy["h0_job_ids"]:
+        raise evidence.EvidenceError("coverage data does not contain exactly the six frozen H0 jobs")
+    for row in data:
+        item = _object(row, "coverage data entry", {"digest", "h0_fragment_digest", "job_instance_id"})
+        _digest(item["digest"], "coverage raw data digest")
+        if item["h0_fragment_digest"] != expected_fragments.get(item["job_instance_id"]):
+            raise evidence.EvidenceError("coverage data does not bind its exact H0 shard fragment")
+    if len({row["digest"] for row in data}) != len(data):
+        raise evidence.EvidenceError("coverage data digests must be unique across the six H0 shards")
+    shard_universe = None
+    executed_lines = {path: set() for path in policy["source_roster"]}
+    executed_branches = {path: set() for path in policy["source_roster"]}
+    for index, job_id in enumerate(policy["h0_job_ids"]):
+        name = f"coverage-shard-{index}"
+        if name not in bodies:
+            raise evidence.EvidenceError("coverage report is missing a signed shard fragment")
+        shard_body = resolver.read("B-COVERAGE", name)
+        signed_shard = next((item for item in gate["artifacts"] if item["name"] == name), None)
+        if (shard_body != bodies[name] or signed_shard is None or
+                signed_shard["media_type"] != "application/json" or
+                signed_shard["digest"] != raw_sha256(shard_body)):
+            raise evidence.EvidenceError("coverage shard does not match its signed indexed artifact")
+        shard = read_coverage_shard(shard_body)
+        expected_data = data[index]
+        if (shard["job_instance_id"] != job_id or shard["config_digest"] != raw_sha256(inputs["coverage-config"]) or
+                shard["coverage_policy_digest"] != raw_sha256(policy_body) or
+                shard["h0_fragment_digest"] != expected_fragments[job_id] or
+                shard["raw_coverage_data_digest"] != expected_data["digest"] or
+                shard["source_roster"] != policy["source_roster"]):
+            raise evidence.EvidenceError("coverage shard does not bind the frozen job, H0 fragment, config, policy or raw data")
+        universe = [(row["path"], row["statements"], row["possible_branches"]) for row in shard["files"]]
+        if shard_universe is None:
+            shard_universe = universe
+        elif universe != shard_universe:
+            raise evidence.EvidenceError("coverage shards do not share one statement/branch universe")
+        for file_row in shard["files"]:
+            executed_lines[file_row["path"]].update(file_row["executed_lines"])
+            executed_branches[file_row["path"]].update(map(tuple, file_row["executed_branches"]))
+    if shard_universe is None:  # pragma: no cover - fixed six-shard policy
+        raise evidence.EvidenceError("coverage report has no shard universe")
+    current_rows = [{
+        "path": path,
+        "lines": {"covered": len(executed_lines[path]), "total": len(statements)},
+        "branches": {"covered": len(executed_branches[path]), "total": len(branches)},
+    } for path, statements, branches in shard_universe]
+    current = _coverage_file_rows(current_rows, policy["source_roster"], "coverage shard union")
+    if doc["coverage_files"] != current_rows:
+        raise evidence.EvidenceError("coverage report totals do not recompute from signed shard fragments")
+    repo_line_counts = {"covered": sum(row["lines"]["covered"] for row in current.values()), "total": sum(row["lines"]["total"] for row in current.values())}
+    repo_branch_counts = {"covered": sum(row["branches"]["covered"] for row in current.values()), "total": sum(row["branches"]["total"] for row in current.values())}
+    base_repo_line_counts = {"covered": sum(row["lines"]["covered"] for row in before.values()), "total": sum(row["lines"]["total"] for row in before.values())}
+    base_repo_branch_counts = {"covered": sum(row["branches"]["covered"] for row in before.values()), "total": sum(row["branches"]["total"] for row in before.values())}
+    if any(counts["total"] == 0 for counts in (repo_line_counts, repo_branch_counts, base_repo_line_counts, base_repo_branch_counts)):
+        raise evidence.EvidenceError("coverage repository line and branch totals must be positive")
+    repo_line = _coverage_basis_points(repo_line_counts)
+    repo_branch = _coverage_basis_points(repo_branch_counts)
+    base_repo_line = _coverage_basis_points(base_repo_line_counts)
+    base_repo_branch = _coverage_basis_points(base_repo_branch_counts)
+    critical = _array(doc["critical_modules"], "coverage critical modules")
+    expected_critical = []
+    for path in policy["critical_modules"]:
+        line, branch = _coverage_basis_points(current[path]["lines"]), _coverage_basis_points(current[path]["branches"])
+        expected_critical.append({"path": path, "line_coverage": line, "branch_coverage": branch})
+    if critical != expected_critical:
+        raise evidence.EvidenceError("coverage critical module values do not recompute from current files")
+    critical_line_losses = [max(0, _coverage_basis_points(before[path]["lines"]) - _coverage_basis_points(current[path]["lines"])) for path in policy["critical_modules"]]
+    critical_branch_losses = [max(0, _coverage_basis_points(before[path]["branches"]) - _coverage_basis_points(current[path]["branches"])) for path in policy["critical_modules"]]
+    values = {
+        "repository_line_coverage": repo_line,
+        "repository_line_coverage_loss": max(0, base_repo_line - repo_line),
+        "repository_branch_coverage": repo_branch,
+        "repository_branch_coverage_loss": max(0, base_repo_branch - repo_branch),
+        "critical_module_line_coverage": min(row["line_coverage"] for row in expected_critical),
+        "critical_module_line_coverage_loss": max(critical_line_losses),
+        "critical_module_branch_coverage": min(row["branch_coverage"] for row in expected_critical),
+        "critical_module_branch_coverage_loss": max(critical_branch_losses),
+    }
+    expected_measurements = []
+    for row in rows:
+        value = values[row["metric"]]
+        breached = row["limit"] is not None and ((row["operator"] == "at_least" and value < row["limit"]) or (row["operator"] == "at_most" and value > row["limit"]))
+        expected_measurements.append({"metric": row["metric"], "value": value, "breached": breached})
+    if doc["measurements"] != expected_measurements:
+        raise evidence.EvidenceError("coverage measurements, threshold arithmetic or breach outcomes do not reconcile")
+    if any(row["breached"] for row in expected_measurements):
+        raise evidence.EvidenceError("coverage report contains a threshold breach")
+    expected_gate_measurements = [{
+        "baseline_digest": threshold["baseline_digest"], "class": threshold["class"],
+        "invalidated_trials": 0, "metric": threshold["metric"], "observed_trials": 1,
+        "statistic": threshold["statistic"], "unit": threshold["unit"],
+        "value": values[threshold["metric"]],
+    } for threshold in rows]
+    if report["measurements"] != expected_gate_measurements:
+        raise evidence.EvidenceError("coverage gate-evidence measurements do not match the recomputed report")
+
+
 def _semantic_manifest(
     gate: dict, bodies: Mapping[str, bytes], **context: object,
 ) -> None:
@@ -5162,6 +5513,7 @@ SEMANTIC_VERIFIERS = MappingProxyType({
     "B-DOCS-POLICY": _semantic_docs_policy,
     "B-MANIFEST": _semantic_manifest,
     "B-QUALITY": _semantic_quality,
+    "B-COVERAGE": _semantic_coverage,
     "C-PACKAGE-BUILD": _semantic_package_build,
     "C-NETWORK-BOUNDARY": _semantic_network_boundary,
     "C-NET-DENY": _semantic_network_denial,

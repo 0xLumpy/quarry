@@ -1,0 +1,5 @@
+[run]
+branch = True
+parallel = False
+relative_files = True
+source = src/quarry_recon
