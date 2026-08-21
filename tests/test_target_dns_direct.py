@@ -121,6 +121,8 @@ def test_target_dns_authentication_is_runtime_only_and_never_reaches_child_env(
     ).worker
     launcher = SimpleNamespace(_release_callback=None)
     monkeypatch.setattr(runner_worker.os, "urandom", lambda _size: secret)
+    monkeypatch.setattr(runner_worker, "acquire_worker_subreaper", lambda: None)
+    monkeypatch.setattr(runner_worker, "seal_worker_identity", lambda: None)
     child_request = runner_worker._configure_network_broker(
         request, launcher, settlement_deadline=time.monotonic() + 5,
     )
