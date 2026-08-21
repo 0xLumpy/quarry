@@ -25,6 +25,7 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from types import MappingProxyType
 
+from . import path_identity_evidence
 from . import release_evidence as evidence
 from . import report_truth
 from . import release_v310_05
@@ -71,6 +72,9 @@ DETERMINISM_FRAGMENT_SCHEMA = "quarry.determinism-tree-diff-fragment.v1"
 ARTIFACT_TREE_DIFF_SCHEMA = "quarry.artifact-tree-diff.v1"
 PYTHON_MATRIX_REPORT_SCHEMA = "quarry.python-matrix-report.v1"
 SOURCE_REGISTRY_RECONCILIATION_SCHEMA = source_registry_evidence.SCHEMA_VERSION
+PATH_IDENTITY_PROPERTY_CORPUS_SCHEMA = path_identity_evidence.PROPERTY_CORPUS_SCHEMA_VERSION
+PATH_IDENTITY_CONTAINMENT_DECISIONS_SCHEMA = \
+    path_identity_evidence.CONTAINMENT_DECISIONS_SCHEMA_VERSION
 
 RELEASE = evidence.RELEASE_SCOPE
 LANE_ORDER = (
@@ -455,6 +459,10 @@ SCHEMA_PATHS = {
     "artifact-tree-diff-schema": "release/evidence/schemas/artifact-tree-diff-v1.schema.json",
     "python-matrix-report-schema": "release/evidence/schemas/python-matrix-report-v1.schema.json",
     "source-registry-reconciliation-schema": "release/evidence/schemas/source-registry-reconciliation-v1.schema.json",
+    "path-identity-corpus-schema":
+        "release/evidence/schemas/path-identity-property-corpus-v1.schema.json",
+    "path-identity-decisions-schema":
+        "release/evidence/schemas/path-identity-containment-decisions-v1.schema.json",
 }
 SCHEMA_VERSIONS = {
     "aggregate-schema": AGGREGATE_SCHEMA,
@@ -487,6 +495,8 @@ SCHEMA_VERSIONS = {
     "artifact-tree-diff-schema": ARTIFACT_TREE_DIFF_SCHEMA,
     "python-matrix-report-schema": PYTHON_MATRIX_REPORT_SCHEMA,
     "source-registry-reconciliation-schema": SOURCE_REGISTRY_RECONCILIATION_SCHEMA,
+    "path-identity-corpus-schema": PATH_IDENTITY_PROPERTY_CORPUS_SCHEMA,
+    "path-identity-decisions-schema": PATH_IDENTITY_CONTAINMENT_DECISIONS_SCHEMA,
 }
 MANIFEST_PATHS = {
     "aggregator-conformance-manifest": "release/evidence/aggregator-conformance-v1.json",
@@ -572,6 +582,7 @@ SCOPE_INPUT_PATHS = {
     "source-registry-reconciliation-runtime": "src/quarry_recon/source_registry_evidence.py",
     "source-registry-reconciliation-h1-tests": "tests/test_source_registry_h1_contract.py",
     "source-registry-reconciliation-tests": "tests/test_source_registry_contract.py",
+    **path_identity_evidence.INPUT_PATHS,
     "release-contracts-validator": "src/quarry_recon/release_contracts.py",
     "resource-gate-report-validator": "src/quarry_recon/resource_contract.py",
     "schema-validation-registry": evidence.REGISTRY_PATH,

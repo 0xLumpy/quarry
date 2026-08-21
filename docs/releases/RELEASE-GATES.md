@@ -290,6 +290,14 @@ or relationship tests.
 | `C-NET-DENY` | `H0`/`C0`/`P0` | Each supposedly network-free lane proves that socket, resolver, subprocess, proxy, and native-tool escape attempts are denied | OS-boundary self-test report for every runner image |
 | `C-POLICY-TRACE` | `H0`/`H1` | Every executed, omitted, refused, or bounded work unit has a typed policy/coverage record; accepted aggressive defaults are reproducible | Obligation-to-decision reconciliation report |
 
+The committed `C-PATH-IDENTITY` property corpus and local containment-decision
+producer are source substrate only. They exercise production identity and
+descriptor boundaries and record observed tree, inode-identity, cache,
+exception and errno facts, but the local producer authenticates neither the
+candidate owner nor an H0 collection interval/toolchain. The gate therefore
+remains `OPEN`, and no semantic verifier is registered until accepted signed H0
+evidence can reconcile the exact corpus and observations.
+
 #### Fault and recovery matrix
 
 Every fault gate injects failures before, during, and after the relevant commit
