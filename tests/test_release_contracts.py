@@ -11,6 +11,7 @@ import re
 import tarfile
 import zipfile
 from pathlib import Path, PurePosixPath
+from types import MappingProxyType
 
 import pytest
 from jsonschema import Draft202012Validator, FormatChecker
@@ -19,6 +20,7 @@ from quarry_recon import release_contracts as contracts
 from quarry_recon import release_evidence as evidence
 from quarry_recon import release_v310_05
 from quarry_recon import resource_contract
+from quarry_recon import source_registry_evidence
 
 pytestmark = pytest.mark.offline
 
@@ -442,6 +444,17 @@ def _supporting_bodies(
         bodies["threshold-reconciliation"] = contracts.canonical_json_line(thresholds)
     elif gate_id == "A-SUPPORT":
         bodies["support-reconciliation"] = contracts.canonical_json_line(support)
+    elif gate_id == "C-SOURCE-REGISTRY":
+        source_inputs = {
+            name: (ROOT / next(row["path"] for row in scope["input_bindings"]
+                               if row["name"] == name)).read_bytes()
+            for name in contracts._SOURCE_REGISTRY_BINDINGS
+        }
+        bodies["registry-reconciliation"] = source_registry_evidence.canonical_json_bytes(
+            source_registry_evidence.build(
+                candidate_identity_digest=evidence.canonical_digest(identity), input_bodies=source_inputs,
+            )
+        )
     elif gate_id == "B-SCHEMA":
         registry_body = (ROOT / evidence.REGISTRY_PATH).read_bytes()
         fixture_manifest_body = (ROOT / contracts.SCHEMA_VALIDATION_FIXTURE_MANIFEST_PATH).read_bytes()
@@ -2608,13 +2621,51 @@ class TestIncompleteSemanticRegistry:
             | {
                 "A-IDENTITY", "A-EVIDENCE-SCHEMA", "A-TAXONOMY", "A-CORPUS", "A-THRESHOLDS", "A-SUPPORT",
                 "B-HERMETIC-ALL", "B-SCHEMA", "B-DOCS-POLICY", "B-MANIFEST", "B-QUALITY", "B-COVERAGE", "B-STATIC-SECURITY", "B-DETERMINISM",
-                "C-PACKAGE-BUILD", "C-PACKAGE-INSTALL", "C-PYTHON-MATRIX", "C-SBOM", "C-VULNERABILITY", "C-PROVENANCE", "C-NETWORK-BOUNDARY", "C-NET-DENY",
+                "C-PACKAGE-BUILD", "C-PACKAGE-INSTALL", "C-PYTHON-MATRIX", "C-SBOM", "C-VULNERABILITY", "C-PROVENANCE", "C-SOURCE-REGISTRY", "C-NETWORK-BOUNDARY", "C-NET-DENY",
                 *contracts.V310_05_SEMANTIC_GATES,
             }
         )
         assert "C-PERF-PHASE-FAIRNESS" not in contracts.SEMANTIC_VERIFIERS
         arguments = _scenario(tmp_path)
         with pytest.raises(evidence.EvidenceError, match="gate C-TOOLS"):
+            contracts.aggregate_records(**arguments)
+
+
+class TestSourceRegistryAggregateEvidence:
+    @staticmethod
+    def _promote_tools(monkeypatch):
+        """Let the aggregate reach C-SOURCE-REGISTRY without claiming C-TOOLS promotion."""
+        monkeypatch.setattr(contracts, "SEMANTIC_VERIFIERS", MappingProxyType({
+            **contracts.SEMANTIC_VERIFIERS, "C-TOOLS": lambda *_args, **_kwargs: None,
+        }))
+
+    def test_aggregate_reaches_next_unimplemented_gate_after_source_registry(self, tmp_path, monkeypatch):
+        arguments = _scenario(tmp_path)
+        self._promote_tools(monkeypatch)
+        with pytest.raises(evidence.EvidenceError, match="gate C-OUTPUT-CONTRACT"):
+            contracts.aggregate_records(**arguments)
+
+    @pytest.mark.parametrize(("mutate", "match"), [
+        (lambda doc: doc["h0_static_emitter"]["receipt"].update(evidence_instance_id="other-instance"),
+         "exact H0/H1 evidence instance"),
+        (lambda doc: doc["h1_synthetic_admission"]["receipt"].update(
+            nodeid="tests/other.py::test_substituted"), "test receipt"),
+        (lambda doc: doc["h1_synthetic_admission"]["receipt"]["selection"].update(selected=2),
+         "test receipt"),
+    ])
+    def test_receipt_substitutions_fail_during_aggregate(self, tmp_path, monkeypatch, mutate, match):
+        arguments = _scenario(tmp_path)
+        self._promote_tools(monkeypatch)
+        artifact = next(row for row in arguments["artifact_index"]["artifacts"]
+                        if row["gate_id"] == "C-SOURCE-REGISTRY" and
+                        row["name"] == "registry-reconciliation")
+        document = json.loads((arguments["artifact_root"] / artifact["path"]).read_bytes())
+        mutate(document)
+        _rewrite_supporting_artifact(
+            arguments, "C-SOURCE-REGISTRY", "registry-reconciliation",
+            contracts.canonical_json_line(document),
+        )
+        with pytest.raises(evidence.EvidenceError, match=match):
             contracts.aggregate_records(**arguments)
 
 

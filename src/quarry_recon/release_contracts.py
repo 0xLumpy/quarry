@@ -30,6 +30,7 @@ from . import report_truth
 from . import release_v310_05
 from . import resource_contract
 from . import run_manifest
+from . import source_registry_evidence
 
 
 RELEASE_SCOPE_SCHEMA = "quarry.release-scope.v1"
@@ -69,6 +70,7 @@ DETERMINISM_FIXTURE_SCHEMA = "quarry.determinism-fixture.v1"
 DETERMINISM_FRAGMENT_SCHEMA = "quarry.determinism-tree-diff-fragment.v1"
 ARTIFACT_TREE_DIFF_SCHEMA = "quarry.artifact-tree-diff.v1"
 PYTHON_MATRIX_REPORT_SCHEMA = "quarry.python-matrix-report.v1"
+SOURCE_REGISTRY_RECONCILIATION_SCHEMA = source_registry_evidence.SCHEMA_VERSION
 
 RELEASE = evidence.RELEASE_SCOPE
 LANE_ORDER = (
@@ -452,6 +454,7 @@ SCHEMA_PATHS = {
     "determinism-fragment-schema": "release/evidence/schemas/determinism-tree-diff-fragment-v1.schema.json",
     "artifact-tree-diff-schema": "release/evidence/schemas/artifact-tree-diff-v1.schema.json",
     "python-matrix-report-schema": "release/evidence/schemas/python-matrix-report-v1.schema.json",
+    "source-registry-reconciliation-schema": "release/evidence/schemas/source-registry-reconciliation-v1.schema.json",
 }
 SCHEMA_VERSIONS = {
     "aggregate-schema": AGGREGATE_SCHEMA,
@@ -483,6 +486,7 @@ SCHEMA_VERSIONS = {
     "determinism-fragment-schema": DETERMINISM_FRAGMENT_SCHEMA,
     "artifact-tree-diff-schema": ARTIFACT_TREE_DIFF_SCHEMA,
     "python-matrix-report-schema": PYTHON_MATRIX_REPORT_SCHEMA,
+    "source-registry-reconciliation-schema": SOURCE_REGISTRY_RECONCILIATION_SCHEMA,
 }
 MANIFEST_PATHS = {
     "aggregator-conformance-manifest": "release/evidence/aggregator-conformance-v1.json",
@@ -564,6 +568,10 @@ SCOPE_INPUT_PATHS = {
     "docs-policy-target-profile": "src/quarry_recon/config.py",
     "docs-policy-nuclei-runtime": "src/quarry_recon/nuclei_policy.py",
     "docs-policy-private-reach-runtime": "src/quarry_recon/netguard.py",
+    "source-registry-reconciliation-producer": "scripts/emit_source_registry_reconciliation.py",
+    "source-registry-reconciliation-runtime": "src/quarry_recon/source_registry_evidence.py",
+    "source-registry-reconciliation-h1-tests": "tests/test_source_registry_h1_contract.py",
+    "source-registry-reconciliation-tests": "tests/test_source_registry_contract.py",
     "release-contracts-validator": "src/quarry_recon/release_contracts.py",
     "resource-gate-report-validator": "src/quarry_recon/resource_contract.py",
     "schema-validation-registry": evidence.REGISTRY_PATH,
@@ -638,6 +646,13 @@ _DETERMINISM_BINDINGS = (
     "determinism-fragment-schema", "artifact-tree-diff-schema",
     "determinism-producer", "determinism-release-evidence",
     "determinism-run-manifest", "determinism-report-truth",
+)
+_SOURCE_REGISTRY_BINDINGS = (
+    "docs-policy-sources-registry", "docs-policy-sources-module",
+    "docs-policy-ownership-policy", "docs-policy-transport-doors",
+    "source-registry-reconciliation-schema", "source-registry-reconciliation-producer",
+    "source-registry-reconciliation-runtime", "source-registry-reconciliation-tests",
+    "source-registry-reconciliation-h1-tests",
 )
 _COVERAGE_CONFIG_PATH = ".coveragerc"
 _COVERAGE_CONFIG_BYTES = b"[run]\nbranch = True\nparallel = False\nrelative_files = True\nsource = src/quarry_recon\n"
@@ -6150,6 +6165,66 @@ def _semantic_determinism(
         raise evidence.EvidenceError("determinism gate-evidence measurements do not match recomputed diff")
 
 
+def _semantic_source_registry(
+    gate: dict, bodies: Mapping[str, bytes], **context: object,
+) -> None:
+    """Reconcile the bounded registry artifact without treating it as acceptance."""
+    identity, report, scope, inputs = (
+        context["identity"], context["report"], context["scope"], context["input_bodies"],
+    )
+    if (not isinstance(identity, dict) or not isinstance(report, dict) or
+            not isinstance(scope, dict) or not isinstance(inputs, Mapping)):
+        raise evidence.EvidenceError("source registry verifier requires accepted release context")
+    body = bodies.get("registry-reconciliation")
+    signed = {item["name"]: item for item in gate["artifacts"]}
+    if (type(body) is not bytes or
+            signed.get("registry-reconciliation", {}).get("digest") != raw_sha256(body)):
+        raise evidence.EvidenceError("source registry reconciliation does not match its signed artifact")
+    bound_inputs = {}
+    scope_bindings = {row["name"]: row for row in scope["input_bindings"]}
+    for name in _SOURCE_REGISTRY_BINDINGS:
+        row, input_body = scope_bindings.get(name), inputs.get(name)
+        if row is None or type(input_body) is not bytes or raw_sha256(input_body) != row["digest"]:
+            raise evidence.EvidenceError("source registry reconciliation source input is absent or drifted")
+        bound_inputs[name] = input_body
+    try:
+        artifact = source_registry_evidence.read(
+            body, candidate_identity_digest=evidence.canonical_digest(identity), input_bodies=bound_inputs,
+        )
+    except source_registry_evidence.SourceRegistryEvidenceError as exc:
+        raise evidence.EvidenceError(str(exc)) from exc
+    expected_bindings = [
+        {"digest": scope_bindings[name]["digest"], "name": name,
+         "path": scope_bindings[name]["path"]}
+        for name in sorted(_SOURCE_REGISTRY_BINDINGS)
+    ]
+    if artifact["input_bindings"] != expected_bindings:
+        raise evidence.EvidenceError("source registry artifact does not bind the exact release scope inputs")
+    lanes = [instance["lane"] for instance in report["instances"]]
+    if lanes != ["H0-hermetic", "H1-tool-integration"]:
+        raise evidence.EvidenceError("source registry evidence requires one nonzero H0 and one nonzero H1 instance")
+    exact_selection = {"collected": 1, "deselected": 0, "failed": 0, "passed": 1, "selected": 1,
+                       "skipped": 0, "xfailed": 0, "xpassed": 0}
+    if (gate["selection"] != {key: value * 2 for key, value in exact_selection.items()} or
+            any(instance["selection"] != exact_selection for instance in report["instances"])):
+        raise evidence.EvidenceError("source registry evidence requires the exact two-case H0/H1 selection")
+    receipts = [artifact["h0_static_emitter"]["receipt"], artifact["h1_synthetic_admission"]["receipt"]]
+    for receipt, instance in zip(receipts, report["instances"], strict=True):
+        if (receipt["lane"] != instance["lane"] or
+                receipt["evidence_instance_id"] != instance["id"] or
+                receipt["selection"] != instance["selection"] or receipt["result"] != "pass"):
+            raise evidence.EvidenceError("source registry receipt does not bind its exact H0/H1 evidence instance")
+    if report["instances"][0]["artifacts"] != [{
+            "digest": raw_sha256(body), "name": "registry-reconciliation"
+    }] or report["instances"][1]["artifacts"]:
+        raise evidence.EvidenceError("source registry artifact must bind the H0 receipt and no unrelated H1 artifact")
+    # The retained artifact itself never purports to execute an adapter.  Its
+    # external H0/H1 instances only witness the static/synthetic collection.
+    if (artifact["h0_static_emitter"]["executed_lane_count"] != 0 or
+            artifact["h1_synthetic_admission"]["executed_lane_count"] != 0):
+        raise evidence.EvidenceError("source registry artifact makes an impermissible execution claim")
+
+
 def _semantic_manifest(
     gate: dict, bodies: Mapping[str, bytes], **context: object,
 ) -> None:
@@ -6948,6 +7023,7 @@ SEMANTIC_VERIFIERS = MappingProxyType({
     "B-COVERAGE": _semantic_coverage,
     "B-STATIC-SECURITY": _semantic_static_security,
     "B-DETERMINISM": _semantic_determinism,
+    "C-SOURCE-REGISTRY": _semantic_source_registry,
     "C-PACKAGE-BUILD": _semantic_package_build,
     "C-PYTHON-MATRIX": _semantic_python_matrix,
     "C-NETWORK-BOUNDARY": _semantic_network_boundary,
