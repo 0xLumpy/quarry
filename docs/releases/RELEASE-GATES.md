@@ -335,6 +335,13 @@ in that exact passing roster and one signed H0 `C-FAULT-STORE` record owning
 the unchanged source plan.  This avoids a second pytest pass.  The gate remains
 `OPEN` until those accepted signed records exist.
 
+`C-FAULT-REVISION` uses the same retained-H0 rule.  Its matrix freezes all 42
+cases in `test_v310_revision_transaction.py`, including staged publication
+faults, corruption, rollback/settlement ambiguity, durability ordering and
+path-substitution refusals.  The verifier binds that exact source and roster to
+one complete passing `B-HERMETIC-ALL` run; it never launches a duplicate suite.
+The gate remains `OPEN` until the signed H0 record is accepted.
+
 #### Performance and scale matrix
 
 Performance claims require a versioned benchmark manifest. It identifies the

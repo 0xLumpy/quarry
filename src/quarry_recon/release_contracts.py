@@ -1087,6 +1087,50 @@ _MANIFEST_TEST_SOURCES = (
     "manifest-revision-tests",
     "manifest-campaign-tests",
 )
+_FAULT_REVISION_NODEIDS = (
+    "tests/test_v310_revision_transaction.py::test_disjoint_revisions_republish_the_full_effective_overlay",
+    "tests/test_v310_revision_transaction.py::test_revision_binds_pointer_entities_segments_raw_and_views",
+    "tests/test_v310_revision_transaction.py::test_evidence_corruption_matrix_fails_closed[pointer]",
+    "tests/test_v310_revision_transaction.py::test_evidence_corruption_matrix_fails_closed[entity]",
+    "tests/test_v310_revision_transaction.py::test_evidence_corruption_matrix_fails_closed[segment]",
+    "tests/test_v310_revision_transaction.py::test_evidence_corruption_matrix_fails_closed[raw]",
+    "tests/test_v310_revision_transaction.py::test_staged_faults_leave_the_prior_pointer_byte_identical[segment]",
+    "tests/test_v310_revision_transaction.py::test_staged_faults_leave_the_prior_pointer_byte_identical[render]",
+    "tests/test_v310_revision_transaction.py::test_staged_faults_leave_the_prior_pointer_byte_identical[certify]",
+    "tests/test_v310_revision_transaction.py::test_staged_faults_leave_the_prior_pointer_byte_identical[fsync]",
+    "tests/test_v310_revision_transaction.py::test_staged_faults_leave_the_prior_pointer_byte_identical[pointer]",
+    "tests/test_v310_revision_transaction.py::test_durability_barriers_precede_pointer_publication",
+    "tests/test_v310_revision_transaction.py::test_post_swap_directory_fsync_fault_restores_the_prior_pointer",
+    "tests/test_v310_revision_transaction.py::test_close_after_effect_is_reconciled_as_a_landed_revision",
+    "tests/test_v310_revision_transaction.py::test_close_after_effect_preserves_control_flow_and_marks_landed[sentinel0]",
+    "tests/test_v310_revision_transaction.py::test_close_after_effect_preserves_control_flow_and_marks_landed[sentinel1]",
+    "tests/test_v310_revision_transaction.py::test_failed_rollback_is_reconciled_to_the_landed_pointer",
+    "tests/test_v310_revision_transaction.py::test_rollback_file_is_fsynced_before_it_replaces_the_pointer",
+    "tests/test_v310_revision_transaction.py::test_restored_pointer_settlement_preserves_control_flow[sentinel0]",
+    "tests/test_v310_revision_transaction.py::test_restored_pointer_settlement_preserves_control_flow[sentinel1]",
+    "tests/test_v310_revision_transaction.py::test_canonical_revision_directory_substitution_never_returns_success",
+    "tests/test_v310_revision_transaction.py::test_pointer_settlement_requires_the_original_run_directory_even_after_durability",
+    "tests/test_v310_revision_transaction.py::test_prepublication_control_flow_is_preserved_exactly[sentinel0]",
+    "tests/test_v310_revision_transaction.py::test_prepublication_control_flow_is_preserved_exactly[sentinel1]",
+    "tests/test_v310_revision_transaction.py::test_pointer_temp_close_control_flow_is_not_masked[sentinel0]",
+    "tests/test_v310_revision_transaction.py::test_pointer_temp_close_control_flow_is_not_masked[sentinel1]",
+    "tests/test_v310_revision_transaction.py::test_segment_mutation_during_barrier_is_refused_before_pointer",
+    "tests/test_v310_revision_transaction.py::test_raw_mutation_during_barrier_is_refused_and_never_published",
+    "tests/test_v310_revision_transaction.py::test_tree_durability_never_follows_a_swapped_ancestor",
+    "tests/test_v310_revision_transaction.py::test_durability_rejects_a_swapped_and_restored_root_name[tree]",
+    "tests/test_v310_revision_transaction.py::test_durability_rejects_a_swapped_and_restored_root_name[directory]",
+    "tests/test_v310_revision_transaction.py::test_raw_durability_rejects_descendant_aba_substitution[directory]",
+    "tests/test_v310_revision_transaction.py::test_raw_durability_rejects_descendant_aba_substitution[file]",
+    "tests/test_v310_revision_transaction.py::test_tree_durability_rewalks_canonical_names_after_fsync",
+    "tests/test_v310_revision_transaction.py::test_raw_durability_rewalks_descendant_names_after_fsync",
+    "tests/test_v310_revision_transaction.py::test_raw_durability_closes_an_unsafe_descendant_on_every_refusal",
+    "tests/test_v310_revision_transaction.py::test_oob_close_after_effect_keeps_the_landed_raw_proof",
+    "tests/test_v310_revision_transaction.py::test_settlement_fsyncs_an_identical_pointer_substituted_during_publication",
+    "tests/test_v310_revision_transaction.py::test_pointer_substitution_during_final_run_fsync_is_ambiguous",
+    "tests/test_v310_revision_transaction.py::test_pointer_substitution_during_semantic_settlement_is_ambiguous",
+    "tests/test_v310_revision_transaction.py::test_post_durability_segment_substitution_never_settles_landed[False]",
+    "tests/test_v310_revision_transaction.py::test_post_durability_segment_substitution_never_settles_landed[True]",
+)
 # This is the owner subset for B-MANIFEST's semantic authority.  Candidate
 # identity still binds the full source closure; projections and durability have
 # different gate owners and are intentionally not duplicated here.
@@ -3019,6 +3063,48 @@ def _validate_generic_supporting_artifact(
             raise evidence.EvidenceError("supporting artifact result digest is unresolved or substituted")
     _unique(records, "id", f"supporting artifact {gate_id}/{name}.records")
     return doc
+
+
+def _h0_fault_matrix_document(
+    *, gate_id: str, identity: dict, nodeids: Sequence[str],
+) -> dict:
+    """Build the compact exact-node projection for an already retained H0 run."""
+    return {
+        "artifact_type": "machine-report",
+        "assertion": {
+            "id": f"{required_assertion_id(gate_id)}.fault-matrix",
+            "reason": None,
+            "status": "pass",
+        },
+        "candidate_identity_digest": evidence.canonical_digest(identity),
+        "gate_id": gate_id,
+        "name": "fault-matrix",
+        "records": [
+            {
+                "id": f"case-{index:03d}",
+                "result": {"outcome": "pass", "subject": nodeid},
+                "result_digest": evidence.canonical_digest({
+                    "outcome": "pass", "subject": nodeid,
+                }),
+                "status": "pass",
+            }
+            for index, nodeid in enumerate(nodeids)
+        ],
+        "release": RELEASE,
+        "schema_version": GATE_ARTIFACT_SCHEMA,
+    }
+
+
+def _validate_h0_fault_matrix(
+    body: bytes, *, gate_id: str, identity: dict, nodeids: Sequence[str],
+) -> dict:
+    expected = _h0_fault_matrix_document(
+        gate_id=gate_id, identity=identity, nodeids=nodeids,
+    )
+    document = _artifact_document(body, gate_id, "fault-matrix")
+    if document != expected:
+        raise evidence.EvidenceError(f"{gate_id} fault matrix is not the exact frozen H0 roster")
+    return document
 
 
 _NETWORK_DENIAL_LANES = (
@@ -6343,6 +6429,57 @@ def _semantic_path_identity(
         raise evidence.EvidenceError("path identity collection environment does not match signed H0")
 
 
+def _reconcile_h0_node_subset(
+    *, resolver: ArtifactResolver, identity: dict, instance: dict,
+    nodeids: Sequence[str], label: str,
+) -> None:
+    """Bind an exact obligation subset to the prior validated H0 test report."""
+    source_report = _matrix_source_report(
+        resolver, gate_id="B-HERMETIC-ALL", identity=identity,
+    )
+    collection_record = resolver.record("B-HERMETIC-ALL", "collection-manifest")
+    collection_body = resolver.read("B-HERMETIC-ALL", "collection-manifest")
+    test_record = resolver.record("B-HERMETIC-ALL", "test-report")
+    test_body = resolver.read("B-HERMETIC-ALL", "test-report")
+    if (collection_record["digest"] != raw_sha256(collection_body) or
+            collection_record["size"] != len(collection_body) or
+            test_record["digest"] != raw_sha256(test_body) or
+            test_record["size"] != len(test_body)):
+        raise evidence.EvidenceError(f"{label} source H0 artifacts do not match their index")
+    taxonomy = evidence.read_pytest_taxonomy(collection_body)
+    test_report = _h0_artifact(
+        test_body, name="test-report", artifact_type="h0-test-report", identity=identity,
+        members={"collection_manifest_digest", "runs"},
+    )
+    if test_report["collection_manifest_digest"] != collection_record["digest"]:
+        raise evidence.EvidenceError(f"{label} source H0 report binds another collection manifest")
+    full_nodes = taxonomy["lanes"][0]["nodes"]
+    missing = sorted(set(nodeids) - set(full_nodes), key=lambda value: value.encode("utf-8"))
+    if missing or len(set(nodeids)) != len(nodeids):
+        raise evidence.EvidenceError(f"{label} source H0 roster omits a frozen fault node")
+
+    matching_source_instances = [
+        row for row in source_report["instances"]
+        if row["lane"] == "H0-hermetic" and row["environment"] == instance["environment"]
+    ]
+    matching_runs = [
+        row for row in test_report["runs"]
+        if row.get("environment") == instance["environment"]
+    ]
+    if len(matching_source_instances) != 1 or len(matching_runs) != 1:
+        raise evidence.EvidenceError(f"{label} reconciliation does not resolve one validated H0 run")
+    source_instance = matching_source_instances[0]
+    source_selection = source_instance["selection"]
+    if (matching_runs[0].get("evidence_instance_id") != source_instance["id"] or
+            source_instance["toolchain"] != instance["toolchain"] or
+            source_selection["passed"] != len(full_nodes) or
+            source_selection["selected"] != len(full_nodes) or
+            any(source_selection[name] for name in (
+                "failed", "skipped", "xfailed", "xpassed",
+            ))):
+        raise evidence.EvidenceError(f"{label} roster does not reconcile a complete passing H0 run")
+
+
 def _semantic_fault_store(
     gate: dict, bodies: Mapping[str, bytes], **context: object,
 ) -> None:
@@ -6411,56 +6548,78 @@ def _semantic_fault_store(
             "fault-store signed H0 record does not own and select the exact frozen roster"
         )
 
-    # B-HERMETIC-ALL is ordered and semantically verified before this gate.  Reopen
-    # its retained artifacts here only to bind this obligation's exact subset to
-    # that already-validated execution, without running pytest a second time.
-    source_report = _matrix_source_report(
-        resolver, gate_id="B-HERMETIC-ALL", identity=identity,
-    )
-    collection_record = resolver.record("B-HERMETIC-ALL", "collection-manifest")
-    collection_body = resolver.read("B-HERMETIC-ALL", "collection-manifest")
-    test_record = resolver.record("B-HERMETIC-ALL", "test-report")
-    test_body = resolver.read("B-HERMETIC-ALL", "test-report")
-    if (collection_record["digest"] != raw_sha256(collection_body) or
-            collection_record["size"] != len(collection_body) or
-            test_record["digest"] != raw_sha256(test_body) or
-            test_record["size"] != len(test_body)):
-        raise evidence.EvidenceError("fault-store source H0 artifacts do not match their index")
-    taxonomy = evidence.read_pytest_taxonomy(collection_body)
-    test_report = _h0_artifact(
-        test_body, name="test-report", artifact_type="h0-test-report", identity=identity,
-        members={"collection_manifest_digest", "runs"},
-    )
-    if test_report["collection_manifest_digest"] != collection_record["digest"]:
-        raise evidence.EvidenceError("fault-store source H0 report binds another collection manifest")
     expected_nodes = [
         nodeid for case in fault_store_evidence.CASES for nodeid in case["nodeids"]
     ]
-    full_nodes = taxonomy["lanes"][0]["nodes"]
-    missing = sorted(set(expected_nodes) - set(full_nodes), key=lambda value: value.encode("utf-8"))
-    if missing or len(expected_nodes) != fault_store_evidence.NODE_COUNT:
-        raise evidence.EvidenceError("fault-store source H0 roster omits a frozen fault node")
+    if len(expected_nodes) != fault_store_evidence.NODE_COUNT:  # pragma: no cover - frozen module
+        raise evidence.EvidenceError("fault-store frozen node count is inconsistent")
+    _reconcile_h0_node_subset(
+        resolver=resolver,
+        identity=identity,
+        instance=instance,
+        nodeids=expected_nodes,
+        label="fault-store",
+    )
 
-    matching_source_instances = [
-        row for row in source_report["instances"]
-        if row["lane"] == "H0-hermetic" and row["environment"] == instance["environment"]
-    ]
-    matching_runs = [
-        row for row in test_report["runs"]
-        if row.get("environment") == instance["environment"]
-    ]
-    if len(matching_source_instances) != 1 or len(matching_runs) != 1:
-        raise evidence.EvidenceError("fault-store reconciliation does not resolve one validated H0 run")
-    source_instance = matching_source_instances[0]
-    source_selection = source_instance["selection"]
-    if (matching_runs[0].get("evidence_instance_id") != source_instance["id"] or
-            source_instance["toolchain"] != instance["toolchain"] or
-            source_selection["passed"] != len(full_nodes) or
-            source_selection["selected"] != len(full_nodes) or
-            any(source_selection[name] for name in (
-                "failed", "skipped", "xfailed", "xpassed",
-            ))):
-        raise evidence.EvidenceError("fault-store roster does not reconcile a complete passing H0 run")
+
+def _semantic_fault_revision(
+    gate: dict, bodies: Mapping[str, bytes], **context: object,
+) -> None:
+    """Bind the complete revision transaction matrix to the retained H0 run."""
+    identity = context["identity"]
+    report = context["report"]
+    resolver = context["resolver"]
+    scope = context["scope"]
+    inputs = context["input_bodies"]
+    if (gate["gate_id"] != "C-FAULT-REVISION" or not isinstance(identity, dict) or
+            not isinstance(report, dict) or not isinstance(resolver, ArtifactResolver) or
+            not isinstance(scope, dict) or not isinstance(inputs, Mapping)):
+        raise evidence.EvidenceError("fault-revision verifier requires accepted aggregate context")
+    binding = next(
+        (row for row in scope["input_bindings"] if row["name"] == "manifest-revision-tests"),
+        None,
+    )
+    test_body = inputs.get("manifest-revision-tests")
+    if (binding is None or binding["path"] != "tests/test_v310_revision_transaction.py" or
+            type(test_body) is not bytes or raw_sha256(test_body) != binding["digest"]):
+        raise evidence.EvidenceError("fault-revision test source is absent, redirected or drifted")
+
+    matrix_body = bodies.get("fault-matrix")
+    matrix_record = next(
+        (row for row in gate["artifacts"] if row["name"] == "fault-matrix"), None,
+    )
+    if (type(matrix_body) is not bytes or matrix_record is None or
+            matrix_record["media_type"] != "application/json" or
+            matrix_record["digest"] != raw_sha256(matrix_body)):
+        raise evidence.EvidenceError("fault-revision matrix does not match its signed gate record")
+    _validate_h0_fault_matrix(
+        matrix_body,
+        gate_id="C-FAULT-REVISION",
+        identity=identity,
+        nodeids=_FAULT_REVISION_NODEIDS,
+    )
+
+    instances = report["instances"]
+    count = len(_FAULT_REVISION_NODEIDS)
+    selection = {
+        "collected": count, "deselected": 0, "failed": 0, "passed": count,
+        "selected": count, "skipped": 0, "xfailed": 0, "xpassed": 0,
+    }
+    if len(instances) != 1 or instances[0]["lane"] != "H0-hermetic":
+        raise evidence.EvidenceError("fault-revision evidence requires one exact signed H0 instance")
+    instance = instances[0]
+    if (instance["selection"] != selection or gate["selection"] != selection or
+            instance["artifacts"] != [{"digest": raw_sha256(matrix_body), "name": "fault-matrix"}]):
+        raise evidence.EvidenceError(
+            "fault-revision signed H0 record does not own and select the exact frozen roster"
+        )
+    _reconcile_h0_node_subset(
+        resolver=resolver,
+        identity=identity,
+        instance=instance,
+        nodeids=_FAULT_REVISION_NODEIDS,
+        label="fault-revision",
+    )
 
 
 def _semantic_manifest(
@@ -7264,6 +7423,7 @@ SEMANTIC_VERIFIERS = MappingProxyType({
     "C-SOURCE-REGISTRY": _semantic_source_registry,
     "C-PATH-IDENTITY": _semantic_path_identity,
     "C-FAULT-STORE": _semantic_fault_store,
+    "C-FAULT-REVISION": _semantic_fault_revision,
     "C-PACKAGE-BUILD": _semantic_package_build,
     "C-PYTHON-MATRIX": _semantic_python_matrix,
     "C-NETWORK-BOUNDARY": _semantic_network_boundary,
