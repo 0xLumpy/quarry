@@ -587,6 +587,12 @@ SCOPE_INPUT_PATHS = {
     "vulnerability-contract-tests": "tests/test_vulnerability_contract.py",
     "release-v310-10-tests": "tests/test_release_v310_10.py",
     "package-metadata": "pyproject.toml",
+    "release-documentation-ledger": "docs/releases/v0.3.10.md",
+    "project-license": "LICENSE",
+    "project-notice": "NOTICE",
+    "project-security-policy": "SECURITY.md",
+    "project-contribution-guide": "CONTRIBUTING.md",
+    "project-changelog": "CHANGELOG.md",
     "docs-parity-tests": "tests/test_docs_parity.py",
     "docs-policy-readme": "README.md",
     "docs-policy-oob": "docs/oob.md",
@@ -670,6 +676,24 @@ _DOCS_POLICY_MATERIALS = (
     "docs-policy-target-profile",
     "docs-policy-nuclei-runtime",
     "docs-policy-private-reach-runtime",
+)
+
+_RELEASE_DOCUMENTATION_SECTIONS = (
+    "behavioral-changes",
+    "accepted-risks",
+    "known-limitations",
+    "migrations",
+    "exit-result-contract",
+    "supported-matrix",
+)
+_PROJECT_HYGIENE_CHECKS = (
+    "license",
+    "notice",
+    "security-policy",
+    "contribution-guide",
+    "changelog",
+    "vulnerability-reporting-route",
+    "package-metadata-consistency",
 )
 
 QUALITY_POLICY_PATH = "release/evidence/quality-policy-v1.json"
@@ -5109,6 +5133,128 @@ def _publication_subjects(scope: dict, resolver: ArtifactResolver) -> list[dict]
     return sorted(subjects, key=lambda row: row["name"])
 
 
+def _scope_material(
+    name: str, *, scope: dict, input_bodies: Mapping[str, bytes],
+) -> bytes:
+    matches = [row for row in scope["input_bindings"] if row["name"] == name]
+    body = input_bodies.get(name)
+    if (len(matches) != 1 or matches[0]["path"] != SCOPE_INPUT_PATHS.get(name) or
+            type(body) is not bytes or raw_sha256(body) != matches[0]["digest"]):
+        raise evidence.EvidenceError(f"release material {name} is absent or drifted from scope")
+    return body
+
+
+def _exact_h0_projection(
+    gate: dict, body: bytes, *, name: str, subjects: Sequence[str],
+    identity: dict, report: dict,
+) -> None:
+    expected = _machine_report_document(
+        gate_id=gate["gate_id"], name=name, identity=identity, subjects=subjects,
+    )
+    if _artifact_document(body, gate["gate_id"], name) != expected:
+        raise evidence.EvidenceError(
+            f"{gate['gate_id']} does not contain its exact material reconciliation"
+        )
+    digest = raw_sha256(body)
+    signed = [row for row in gate["artifacts"] if row["name"] == name]
+    owners = [
+        instance for instance in report["instances"]
+        if {"digest": digest, "name": name} in instance["artifacts"]
+    ]
+    if (len(signed) != 1 or signed[0]["media_type"] != "application/json" or
+            signed[0]["digest"] != digest or len(owners) != 1 or
+            owners[0]["lane"] != "H0-hermetic"):
+        raise evidence.EvidenceError(
+            f"{gate['gate_id']} material reconciliation has no exact signed H0 owner"
+        )
+
+
+def _semantic_release_documentation(
+    gate: dict, bodies: Mapping[str, bytes], **context: object,
+) -> None:
+    _exact_h0_projection(
+        gate, bodies["release-documentation-report"],
+        name="release-documentation-report",
+        subjects=_RELEASE_DOCUMENTATION_SECTIONS,
+        identity=context["identity"], report=context["report"],
+    )
+    body = _scope_material(
+        "release-documentation-ledger", scope=context["scope"],
+        input_bodies=context["input_bodies"],
+    )
+    try:
+        text = body.decode("utf-8", "strict")
+    except UnicodeDecodeError as exc:
+        raise evidence.EvidenceError("release documentation is not UTF-8") from exc
+    marker = "## User-facing release summary\n"
+    if text.count(marker) != 1:
+        raise evidence.EvidenceError("release documentation has no unique user-facing summary")
+    summary = text.split(marker, 1)[1].split("\n## ", 1)[0]
+    headings = (
+        "### Behavioral changes", "### Accepted risks", "### Known limitations",
+        "### Migrations", "### Exit and result contract", "### Supported matrix",
+    )
+    positions = [summary.find(heading + "\n") for heading in headings]
+    if any(position < 0 for position in positions) or positions != sorted(positions) or \
+            any(summary.count(heading + "\n") != 1 for heading in headings):
+        raise evidence.EvidenceError(
+            "release documentation does not enumerate the exact required summary sections"
+        )
+    for index, position in enumerate(positions):
+        start = position + len(headings[index]) + 1
+        end = positions[index + 1] if index + 1 < len(positions) else len(summary)
+        if not summary[start:end].strip():
+            raise evidence.EvidenceError("release documentation contains an empty required section")
+
+
+def _semantic_project_hygiene(
+    gate: dict, bodies: Mapping[str, bytes], **context: object,
+) -> None:
+    _exact_h0_projection(
+        gate, bodies["project-hygiene-report"], name="project-hygiene-report",
+        subjects=_PROJECT_HYGIENE_CHECKS, identity=context["identity"],
+        report=context["report"],
+    )
+    names = (
+        "project-license", "project-notice", "project-security-policy",
+        "project-contribution-guide", "project-changelog", "package-metadata",
+    )
+    raw = {
+        name: _scope_material(
+            name, scope=context["scope"], input_bodies=context["input_bodies"],
+        )
+        for name in names
+    }
+    try:
+        text = {name: body.decode("utf-8", "strict") for name, body in raw.items()}
+    except UnicodeDecodeError as exc:
+        raise evidence.EvidenceError("project hygiene material is not UTF-8") from exc
+    if not text["project-license"].startswith("MIT License\n") or \
+            "MIT license in LICENSE" not in text["project-notice"]:
+        raise evidence.EvidenceError("project license and notice are absent or inconsistent")
+    security = text["project-security-policy"]
+    if ("## Report a vulnerability privately" not in security or
+            "https://github.com/0xLumpy/quarry/security/advisories/new" not in security or
+            "Do not include credentials" not in security):
+        raise evidence.EvidenceError("project security policy has no private vulnerability route")
+    contributing = text["project-contribution-guide"]
+    if "## Development setup" not in contributing or \
+            "## Review and release integrity" not in contributing:
+        raise evidence.EvidenceError("project contribution guidance is incomplete")
+    changelog = text["project-changelog"]
+    if "## [Unreleased]" not in changelog or "## [0.3.9]" not in changelog or \
+            "`0.3.10` remains unreleased" not in changelog:
+        raise evidence.EvidenceError("project changelog does not preserve release state")
+    metadata = text["package-metadata"]
+    required_metadata = (
+        'name = "quarry-recon"', 'readme = "README.md"',
+        'license = "MIT"', 'license-files = ["LICENSE", "NOTICE"]',
+        'Security = "https://github.com/0xLumpy/quarry/security/policy"',
+    )
+    if any(value not in metadata for value in required_metadata):
+        raise evidence.EvidenceError("project files do not reconcile the nominated package metadata")
+
+
 def _validate_publication_subjects(
     body: bytes, *, identity: dict, scope: dict, resolver: ArtifactResolver,
 ) -> None:
@@ -7669,6 +7815,8 @@ SEMANTIC_VERIFIERS = MappingProxyType({
     "C-PERF-INGEST": _semantic_resource_benchmark,
     "C-PERF-DISK": _semantic_resource_benchmark,
     "C-PERF-RESOLVER": _semantic_resource_benchmark,
+    "E-DOCS": _semantic_release_documentation,
+    "E-PROJECT-HYGIENE": _semantic_project_hygiene,
     "E-ARTIFACTS": _semantic_publication_subjects,
     **{gate_id: _semantic_v310_05 for gate_id in V310_05_SEMANTIC_GATES},
 })

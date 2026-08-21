@@ -400,13 +400,18 @@ The publication decision is a separate, reproducible aggregation step:
 | `E-DOCS` | Release notes enumerate behavioral changes, accepted risks, known limitations, migrations, exit/result contract, and supported matrix |
 | `E-PROJECT-HYGIENE` | License file, security policy, contribution guidance, changelog, and vulnerability-reporting route are present and package-consistent |
 | `E-ARTIFACTS` | Candidate-built package, SBOM, provenance, schemas and checksums are accepted publication subjects; the later publication receipt proves those exact bytes, and no substitutes, were promoted |
+| `E-APPROVAL` | Named release approver reviews the aggregate and signs a detached approval bound to its digest; approver cannot overwrite underlying gate results |
 
 The pre-publication `E-ARTIFACTS` verifier recomputes the exact subject set from
 the indexed candidate sdist, wheel, SBOM, provenance and every scope-bound
 schema.  This closes the local reconciliation machinery only; the gate remains
 `OPEN` until that canonical subject list is carried by an accepted signed H0
 record, and publication still requires the later receipt for those exact bytes.
-| `E-APPROVAL` | Named release approver reviews the aggregate and signs a detached approval bound to its digest; approver cannot overwrite underlying gate results |
+`E-DOCS` likewise requires the scope-bound release ledger to contain the six
+explicit user-facing summary sections, while `E-PROJECT-HYGIENE` rehashes the
+license, notice, security policy, contribution guide, changelog and package
+metadata and checks their fixed release/package relationships. Both remain
+`OPEN` until their exact projections are accepted as signed H0 records.
 
 `E-AGGREGATE` is the operation that creates the aggregate payload, so neither an
 `E-AGGREGATE` result nor `E-APPROVAL` is an input to that payload. Successful

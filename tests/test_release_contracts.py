@@ -1530,6 +1530,20 @@ def _supporting_bodies(
             ).decode("ascii"),
             "trust_policy_digest": evidence.canonical_digest(policy),
         })
+    elif gate_id == "E-DOCS":
+        bodies["release-documentation-report"] = contracts.canonical_json_line(
+            contracts._machine_report_document(
+                gate_id=gate_id, name="release-documentation-report",
+                identity=identity, subjects=contracts._RELEASE_DOCUMENTATION_SECTIONS,
+            )
+        )
+    elif gate_id == "E-PROJECT-HYGIENE":
+        bodies["project-hygiene-report"] = contracts.canonical_json_line(
+            contracts._machine_report_document(
+                gate_id=gate_id, name="project-hygiene-report",
+                identity=identity, subjects=contracts._PROJECT_HYGIENE_CHECKS,
+            )
+        )
     elif gate_id == "E-ARTIFACTS":
         by_key = {(row["gate_id"], row["name"]): row for row in indexed}
         subjects = [{
@@ -2748,7 +2762,7 @@ class TestIncompleteSemanticRegistry:
                 "A-IDENTITY", "A-EVIDENCE-SCHEMA", "A-TAXONOMY", "A-CORPUS", "A-THRESHOLDS", "A-SUPPORT",
                 "B-HERMETIC-ALL", "B-SCHEMA", "B-DOCS-POLICY", "B-MANIFEST", "B-QUALITY", "B-COVERAGE", "B-STATIC-SECURITY", "B-DETERMINISM",
                 "C-PACKAGE-BUILD", "C-PACKAGE-INSTALL", "C-PYTHON-MATRIX", "C-SBOM", "C-VULNERABILITY", "C-PROVENANCE", "C-SOURCE-REGISTRY", "C-CORPUS-SYNTHETIC", "C-PATH-IDENTITY", "C-FAULT-STORE", "C-FAULT-REVISION", "C-FAULT-FINALIZE", "C-FAULT-CAMPAIGN", "C-NETWORK-BOUNDARY", "C-NET-DENY",
-                "E-ARTIFACTS",
+                "E-DOCS", "E-PROJECT-HYGIENE", "E-ARTIFACTS",
                 *contracts.V310_05_SEMANTIC_GATES,
             }
         )
@@ -4512,6 +4526,18 @@ class TestArtifactsAndAggregation:
                 "absolute trial metric",
             ),
             (
+                "E-DOCS",
+                "release-documentation-report",
+                "missing-material-check",
+                "exact material reconciliation",
+            ),
+            (
+                "E-PROJECT-HYGIENE",
+                "project-hygiene-report",
+                "reordered-material-checks",
+                "exact material reconciliation",
+            ),
+            (
                 "E-ARTIFACTS",
                 "publication-subjects",
                 "missing-publication-subject",
@@ -4563,6 +4589,10 @@ class TestArtifactsAndAggregation:
                 document["metrics"][0]["value"] += 1
             elif mutation == "invented-trial":
                 document["trials"][0]["metrics"][0]["current_value"] += 1
+            elif mutation == "missing-material-check":
+                document["records"].pop()
+            elif mutation == "reordered-material-checks":
+                document["records"].reverse()
             elif mutation == "missing-publication-subject":
                 document["subjects"].pop()
             elif mutation == "wrong-build-command":
