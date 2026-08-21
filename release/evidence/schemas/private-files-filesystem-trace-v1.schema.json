@@ -1,0 +1,158 @@
+{
+  "$id": "urn:quarry:schema:quarry.private-files-filesystem-trace.v1:v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "directory_0700_stat": {
+      "allOf": [
+        {"$ref": "#/$defs/stat"},
+        {"properties": {"kind": {"const": "directory"}, "mode": {"const": 448}}, "required": ["kind", "mode"], "type": "object"}
+      ]
+    },
+    "directory_receipt": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {"const": "directory"},
+        "mode": {"const": 448},
+        "uid": {"maximum": 9223372036854775807, "minimum": 0, "type": "integer"}
+      },
+      "required": ["kind", "mode", "uid"],
+      "type": "object"
+    },
+    "file_0600_stat": {
+      "allOf": [
+        {"$ref": "#/$defs/stat"},
+        {"properties": {"kind": {"const": "file"}, "mode": {"const": 384}}, "required": ["kind", "mode"], "type": "object"}
+      ]
+    },
+    "file_0644_stat": {
+      "allOf": [
+        {"$ref": "#/$defs/stat"},
+        {"properties": {"kind": {"const": "file"}, "mode": {"const": 420}}, "required": ["kind", "mode"], "type": "object"}
+      ]
+    },
+    "file_receipt": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {"const": "file"},
+        "mode": {"const": 384},
+        "uid": {"maximum": 9223372036854775807, "minimum": 0, "type": "integer"}
+      },
+      "required": ["kind", "mode", "uid"],
+      "type": "object"
+    },
+    "stat": {
+      "additionalProperties": false,
+      "properties": {
+        "device": {"maximum": 9223372036854775807, "minimum": 0, "type": "integer"},
+        "gid": {"maximum": 9223372036854775807, "minimum": 0, "type": "integer"},
+        "inode": {"maximum": 9223372036854775807, "minimum": 0, "type": "integer"},
+        "kind": {"enum": ["directory", "file", "symlink", "other"]},
+        "mode": {"maximum": 4095, "minimum": 0, "type": "integer"},
+        "nlink": {"maximum": 9223372036854775807, "minimum": 0, "type": "integer"},
+        "uid": {"maximum": 9223372036854775807, "minimum": 0, "type": "integer"}
+      },
+      "required": ["device", "gid", "inode", "kind", "mode", "nlink", "uid"],
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "artifact_kind": {"const": "filesystem-trace"},
+    "candidate_identity_digest": {"pattern": "^sha256:[0-9a-f]{64}$", "type": "string"},
+    "case_roster_digest": {"pattern": "^sha256:[0-9a-f]{64}$", "type": "string"},
+    "collector_uid": {"maximum": 9223372036854775807, "minimum": 0, "type": "integer"},
+    "disposition": {"const": "source_substrate"},
+    "evidence_instance_id": {"pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$", "type": "string"},
+    "finished_at": {"format": "date-time", "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$", "type": "string"},
+    "gate_id": {"const": "C-PRIVATE-FILES"},
+    "lane": {"const": "H0-hermetic"},
+    "observations": {
+      "items": false,
+      "maxItems": 3,
+      "minItems": 3,
+      "prefixItems": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "case_id": {"const": "h0-create-directory-umask"},
+            "descriptor_stats": {
+              "items": false,
+              "maxItems": 4,
+              "minItems": 4,
+              "prefixItems": [
+                {"$ref": "#/$defs/directory_receipt"},
+                {"$ref": "#/$defs/directory_receipt"},
+                {"$ref": "#/$defs/directory_receipt"},
+                {"$ref": "#/$defs/directory_receipt"}
+              ],
+              "type": "array"
+            },
+            "error": {"type": "null"},
+            "error_detail": {"type": "null"},
+            "expected": {"const": "created"},
+            "mutation": {"const": "created"},
+            "operation": {"const": "create_directory"},
+            "post": {"$ref": "#/$defs/directory_0700_stat"},
+            "pre": {"type": "null"},
+            "tested_umasks": {"const": [0, 2, 18, 63]}
+          },
+          "required": ["case_id", "descriptor_stats", "error", "error_detail", "expected", "mutation", "operation", "post", "pre", "tested_umasks"],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "case_id": {"const": "h0-create-file-umask"},
+            "descriptor_stats": {
+              "items": false,
+              "maxItems": 4,
+              "minItems": 4,
+              "prefixItems": [
+                {"$ref": "#/$defs/file_receipt"},
+                {"$ref": "#/$defs/file_receipt"},
+                {"$ref": "#/$defs/file_receipt"},
+                {"$ref": "#/$defs/file_receipt"}
+              ],
+              "type": "array"
+            },
+            "error": {"type": "null"},
+            "error_detail": {"type": "null"},
+            "expected": {"const": "created"},
+            "mutation": {"const": "created"},
+            "operation": {"const": "create_file"},
+            "post": {"$ref": "#/$defs/file_0600_stat"},
+            "pre": {"type": "null"},
+            "tested_umasks": {"const": [0, 2, 18, 63]}
+          },
+          "required": ["case_id", "descriptor_stats", "error", "error_detail", "expected", "mutation", "operation", "post", "pre", "tested_umasks"],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "case_id": {"const": "h0-existing-mode-refusal"},
+            "descriptor_stats": {"const": []},
+            "error": {"maximum": 9223372036854775807, "minimum": 1, "type": "integer"},
+            "error_detail": {"const": {"class": "LegacyModeMismatch", "components": ["h0-existing-mode-refusal"]}},
+            "expected": {"const": "refused"},
+            "mutation": {"const": "none"},
+            "operation": {"const": "existing_unsafe_mode"},
+            "post": {"$ref": "#/$defs/file_0644_stat"},
+            "pre": {"$ref": "#/$defs/file_0644_stat"},
+            "tested_umasks": {"const": []}
+          },
+          "required": ["case_id", "descriptor_stats", "error", "error_detail", "expected", "mutation", "operation", "post", "pre", "tested_umasks"],
+          "type": "object"
+        }
+      ],
+      "type": "array"
+    },
+    "open_reasons": {"const": ["unsigned_evidence_instance", "unaccepted_release_evidence"]},
+    "release": {"const": "0.3.10"},
+    "schema_version": {"const": "quarry.private-files-filesystem-trace.v1"},
+    "started_at": {"format": "date-time", "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$", "type": "string"}
+  },
+  "required": ["artifact_kind", "candidate_identity_digest", "case_roster_digest", "collector_uid", "disposition", "evidence_instance_id", "finished_at", "gate_id", "lane", "observations", "open_reasons", "release", "schema_version", "started_at"],
+  "title": "Quarry C-PRIVATE-FILES filesystem-trace v1",
+  "type": "object"
+}

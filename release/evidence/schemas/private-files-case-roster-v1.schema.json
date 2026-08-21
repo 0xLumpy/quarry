@@ -1,0 +1,93 @@
+{
+  "$id": "urn:quarry:schema:private-files-case-roster:v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "cases": {
+      "items": false,
+      "maxItems": 6,
+      "minItems": 6,
+      "prefixItems": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "artifact_kind": {"const": "filesystem-trace"},
+            "expected": {"const": "created"},
+            "id": {"const": "h0-create-directory-umask"},
+            "lane": {"const": "H0-hermetic"},
+            "operation": {"const": "create_directory"}
+          },
+          "required": ["artifact_kind", "expected", "id", "lane", "operation"],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "artifact_kind": {"const": "filesystem-trace"},
+            "expected": {"const": "created"},
+            "id": {"const": "h0-create-file-umask"},
+            "lane": {"const": "H0-hermetic"},
+            "operation": {"const": "create_file"}
+          },
+          "required": ["artifact_kind", "expected", "id", "lane", "operation"],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "artifact_kind": {"const": "filesystem-trace"},
+            "expected": {"const": "refused"},
+            "id": {"const": "h0-existing-mode-refusal"},
+            "lane": {"const": "H0-hermetic"},
+            "operation": {"const": "existing_unsafe_mode"}
+          },
+          "required": ["artifact_kind", "expected", "id", "lane", "operation"],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "artifact_kind": {"const": "mode-owner-symlink-matrix"},
+            "expected": {"const": "refused"},
+            "id": {"const": "h1-directory-symlink-refusal"},
+            "lane": {"const": "H1-tool-integration"},
+            "operation": {"const": "directory_symlink"}
+          },
+          "required": ["artifact_kind", "expected", "id", "lane", "operation"],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "artifact_kind": {"const": "mode-owner-symlink-matrix"},
+            "expected": {"const": "refused"},
+            "id": {"const": "h1-file-symlink-refusal"},
+            "lane": {"const": "H1-tool-integration"},
+            "operation": {"const": "file_symlink"}
+          },
+          "required": ["artifact_kind", "expected", "id", "lane", "operation"],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "artifact_kind": {"const": "mode-owner-symlink-matrix"},
+            "expected": {"const": "refused"},
+            "id": {"const": "h1-foreign-owner-refusal"},
+            "lane": {"const": "H1-tool-integration"},
+            "operation": {"const": "foreign_owner"}
+          },
+          "required": ["artifact_kind", "expected", "id", "lane", "operation"],
+          "type": "object"
+        }
+      ],
+      "type": "array"
+    },
+    "gate_id": {"const": "C-PRIVATE-FILES"},
+    "release": {"const": "0.3.10"},
+    "schema_version": {"const": "quarry.private-files-case-roster.v1"}
+  },
+  "required": ["cases", "gate_id", "release", "schema_version"],
+  "title": "Quarry C-PRIVATE-FILES frozen operation roster v1",
+  "type": "object"
+}

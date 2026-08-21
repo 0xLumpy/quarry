@@ -206,6 +206,318 @@ def write_json_private(path, obj, *, indent=None) -> None:
     write_private(path, json.dumps(obj, ensure_ascii=False, indent=indent))
 
 
+@dataclass(frozen=True, slots=True)
+class _CreationReceipt:
+    """An immutable first-created-descriptor fact for the isolated evidence collector."""
+
+    stat: os.stat_result
+
+
+def _evidence_leaf_identity(value: os.stat_result) -> tuple[int, int, int, int]:
+    """Descriptor identity used to quarantine, never unlink, a new evidence leaf."""
+    return value.st_dev, value.st_ino, value.st_uid, stat.S_IFMT(value.st_mode)
+
+
+def _evidence_identity_from_fd(fd: int, *, components: tuple[str, ...]) -> tuple[int, int, int, int]:
+    """Use a descriptor operation only when an injected receipt fstat has already failed."""
+    try:
+        # ``os.stat`` accepts an fd and is therefore not a path re-resolution.
+        return _evidence_leaf_identity(os.stat(fd))
+    except BaseException as exc:
+        raise PrivatePathMutationUnresolved(
+            "private evidence created leaf identity is unresolved", components=components,
+        ) from exc
+
+
+def _evidence_close_once(fd: int | None) -> BaseException | None:
+    """Attempt a numeric close once; an exception never authorizes retrying that number."""
+    if fd is None:
+        return None
+    try:
+        os.close(fd)
+    except BaseException as exc:
+        return exc
+    return None
+
+
+def _evidence_quarantine_created_leaf(
+    parent_fd: int,
+    name: str,
+    identity: tuple[int, int, int, int],
+    *,
+    components: tuple[str, ...],
+) -> None:
+    """Move only an identity-matching created name aside beneath its no-follow parent fd.
+
+    POSIX cannot make a descriptor-bound unlink.  A private random quarantine name
+    is claimed by Linux ``RENAME_NOREPLACE`` rather than a check-then-rename: a
+    collision remains untouched and another candidate is tried.  The isolated
+    collector parent removes its disposable root after the child exits.  A source
+    substitution is retained, never deleted, and prevents a usable report.
+    """
+    for _ in range(32):
+        candidate = f".quarry-evidence-quarantine-{os.urandom(16).hex()}"
+        try:
+            _renameat2_noreplace(parent_fd, name, parent_fd, candidate)
+        except OSError as exc:
+            if exc.errno == errno.EEXIST:
+                continue
+            raise PrivatePathMutationUnresolved(
+                "private evidence created leaf could not be quarantined", components=components,
+            ) from exc
+        except BaseException as exc:
+            raise PrivatePathMutationUnresolved(
+                "could not reserve a private evidence quarantine name", components=components,
+            ) from exc
+        try:
+            quarantined = os.stat(candidate, dir_fd=parent_fd, follow_symlinks=False)
+        except BaseException as exc:
+            raise PrivatePathMutationUnresolved(
+                "private evidence created leaf could not be inspected after quarantine", components=components,
+            ) from exc
+        if _evidence_leaf_identity(quarantined) != identity:
+            raise PrivatePathMutationUnresolved(
+                "private evidence quarantine retained a substituted leaf", components=components,
+            )
+        return
+    raise PrivatePathMutationUnresolved(
+        "could not reserve a private evidence quarantine name", components=components,
+    )
+
+
+def _evidence_rethrow_after_close(
+    original: BaseException,
+    *,
+    leaf_fd: int | None,
+    parent_fd: int | None,
+    components: tuple[str, ...],
+) -> None:
+    """Close each local descriptor exactly once before preserving a non-mutation failure."""
+    leaf_error = _evidence_close_once(leaf_fd)
+    parent_error = _evidence_close_once(parent_fd)
+    if leaf_error is not None or parent_error is not None:
+        raise PrivatePathMutationUnresolved(
+            "private evidence descriptor close is unresolved", components=components,
+        ) from (leaf_error or parent_error)
+    raise original
+
+
+def _evidence_abort_created_leaf(
+    original: BaseException,
+    *,
+    parent_fd: int,
+    name: str,
+    leaf_fd: int | None,
+    identity: tuple[int, int, int, int] | None,
+    components: tuple[str, ...],
+) -> None:
+    """Quarantine a newly-created leaf or report typed uncertainty without deleting it."""
+    cleanup_error: BaseException | None = None
+    if identity is None:
+        if leaf_fd is None:
+            cleanup_error = PrivatePathMutationUnresolved(
+                "private evidence created leaf has no descriptor identity", components=components,
+            )
+        else:
+            try:
+                identity = _evidence_identity_from_fd(leaf_fd, components=components)
+            except BaseException as exc:
+                cleanup_error = exc
+    if cleanup_error is None:
+        assert identity is not None
+        try:
+            _evidence_quarantine_created_leaf(parent_fd, name, identity, components=components)
+        except BaseException as exc:
+            cleanup_error = exc
+    leaf_error = _evidence_close_once(leaf_fd)
+    parent_error = _evidence_close_once(parent_fd)
+    if cleanup_error is not None or leaf_error is not None or parent_error is not None:
+        raise PrivatePathMutationUnresolved(
+            "private evidence created leaf mutation is unresolved", components=components,
+        ) from (cleanup_error or leaf_error or parent_error)
+    raise original
+
+
+def _evidence_finish_created_leaf(
+    *,
+    parent_fd: int,
+    name: str,
+    leaf_fd: int,
+    identity: tuple[int, int, int, int],
+    components: tuple[str, ...],
+) -> None:
+    """Settle a successful receipt capture without treating a close exception as settled."""
+    leaf_error = _evidence_close_once(leaf_fd)
+    quarantine_error: BaseException | None = None
+    if leaf_error is not None:
+        try:
+            _evidence_quarantine_created_leaf(parent_fd, name, identity, components=components)
+        except BaseException as exc:
+            quarantine_error = exc
+    parent_error = _evidence_close_once(parent_fd)
+    if leaf_error is not None or quarantine_error is not None or parent_error is not None:
+        raise PrivatePathMutationUnresolved(
+            "private evidence created descriptor close is unresolved", components=components,
+        ) from (leaf_error or quarantine_error or parent_error)
+
+
+def _evidence_open_parent_dir(directory, *, components: tuple[str, ...]) -> int:
+    """The compatibility no-follow directory walk with one-shot close settlement.
+
+    This is intentionally evidence-only: the public compatibility helper above
+    remains byte-for-byte stable.  Before a receipt can exist, a close ambiguity
+    is still fatal to the bounded child and therefore cannot produce a substrate.
+    """
+    directory = Path(directory)
+    parts = directory.parts
+    if directory.is_absolute():
+        dfd = os.open(parts[0], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        rest = parts[1:]
+    else:
+        dfd = os.open(os.getcwd(), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        rest = parts
+    try:
+        created = True
+        for comp in rest:
+            try:
+                nfd = os.open(comp, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dfd)
+                created = False
+            except FileNotFoundError:
+                try:
+                    os.mkdir(comp, DIR_MODE, dir_fd=dfd)
+                    created = True
+                except FileExistsError:
+                    created = False
+                nfd = os.open(comp, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dfd)
+            old_dfd = dfd
+            dfd = nfd
+            close_error = _evidence_close_once(old_dfd)
+            if close_error is not None:
+                current_error = _evidence_close_once(dfd)
+                dfd = None
+                raise PrivatePathMutationUnresolved(
+                    "private evidence parent descriptor close is unresolved", components=components,
+                ) from (close_error or current_error)
+        if not created and not _harden_fd(dfd, is_dir=True):
+            raise OSError(f"cannot make {directory} private (foreign owner or fchmod failed)")
+        return dfd
+    except BaseException as exc:
+        close_error = _evidence_close_once(dfd)
+        if close_error is not None:
+            raise PrivatePathMutationUnresolved(
+                "private evidence parent descriptor close is unresolved", components=components,
+            ) from close_error
+        raise exc
+
+
+def _private_dir_with_creation_receipt(path) -> _CreationReceipt | None:
+    """Evidence-only equivalent of the compatibility directory primitive.
+
+    It captures the just-created leaf through its first opened descriptor before
+    any hardening.  This helper is used only in the bounded evidence child.
+    """
+    path = Path(path)
+    components = (path.name,)
+    parent_fd = _evidence_open_parent_dir(path.parent, components=components)
+    leaf_fd: int | None = None
+    receipt: _CreationReceipt | None = None
+    identity: tuple[int, int, int, int] | None = None
+    created = False
+    try:
+        try:
+            leaf_fd = os.open(path.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                              dir_fd=parent_fd)
+        except FileNotFoundError:
+            os.mkdir(path.name, DIR_MODE, dir_fd=parent_fd)
+            created = True
+            leaf_fd = os.open(path.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                              dir_fd=parent_fd)
+        if created:
+            first_stat = os.fstat(leaf_fd)
+            receipt = _CreationReceipt(first_stat)
+            identity = _evidence_leaf_identity(first_stat)
+        # Match the production descriptor hardening primitive after the receipt.
+        if not _harden_fd(leaf_fd, is_dir=True):
+            raise OSError(f"cannot make {path} private (foreign owner or fchmod failed)")
+    except BaseException as exc:
+        if created:
+            _evidence_abort_created_leaf(
+                exc, parent_fd=parent_fd, name=path.name, leaf_fd=leaf_fd,
+                identity=identity, components=components,
+            )
+        _evidence_rethrow_after_close(
+            exc, leaf_fd=leaf_fd, parent_fd=parent_fd, components=components,
+        )
+    assert leaf_fd is not None
+    if created:
+        assert identity is not None
+        _evidence_finish_created_leaf(
+            parent_fd=parent_fd, name=path.name, leaf_fd=leaf_fd,
+            identity=identity, components=components,
+        )
+    else:
+        _evidence_rethrow_after_close(
+            RuntimeError("evidence-only creation wrapper cannot return an existing leaf"),
+            leaf_fd=leaf_fd, parent_fd=parent_fd, components=components,
+        )
+    return receipt
+
+
+def _open_private_with_creation_receipt(path, *, append: bool = False) -> _CreationReceipt | None:
+    """Evidence-only equivalent of the compatibility file primitive.
+
+    The first O_CREAT|O_EXCL descriptor is sampled before hardening or truncation,
+    then closed inside this helper so close uncertainty remains contained by the
+    bounded evidence child.
+    """
+    path = Path(path)
+    components = (path.name,)
+    parent_fd = _evidence_open_parent_dir(path.parent, components=components)
+    fd: int | None = None
+    receipt: _CreationReceipt | None = None
+    identity: tuple[int, int, int, int] | None = None
+    created = False
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | (
+            os.O_APPEND if append else 0
+        )
+        try:
+            fd = os.open(path.name, flags | os.O_EXCL, FILE_MODE, dir_fd=parent_fd)
+            created = True
+        except FileExistsError:
+            fd = os.open(path.name, flags, FILE_MODE, dir_fd=parent_fd)
+        if created:
+            first_stat = os.fstat(fd)
+            receipt = _CreationReceipt(first_stat)
+            identity = _evidence_leaf_identity(first_stat)
+        if not stat.S_ISREG(os.fstat(fd).st_mode) or not _harden_fd(fd, is_dir=False):
+            raise OSError(f"refusing a non-regular or non-private target: {path}")
+        if not append:
+            os.ftruncate(fd, 0)
+    except BaseException as exc:
+        if created:
+            _evidence_abort_created_leaf(
+                exc, parent_fd=parent_fd, name=path.name, leaf_fd=fd,
+                identity=identity, components=components,
+            )
+        _evidence_rethrow_after_close(
+            exc, leaf_fd=fd, parent_fd=parent_fd, components=components,
+        )
+    assert fd is not None
+    if created:
+        assert identity is not None
+        _evidence_finish_created_leaf(
+            parent_fd=parent_fd, name=path.name, leaf_fd=fd,
+            identity=identity, components=components,
+        )
+    else:
+        _evidence_rethrow_after_close(
+            RuntimeError("evidence-only creation wrapper cannot return an existing leaf"),
+            leaf_fd=fd, parent_fd=parent_fd, components=components,
+        )
+    return receipt
+
+
 # The helpers above are the v0.3.9 compatibility surface.  They intentionally retain
 # their historical create-and-tighten behaviour until callers move behind the Phase 1
 # repository authority.  The descriptor-relative core below is strict by default: it
@@ -257,6 +569,10 @@ class PrivatePathMissing(PrivatePathError):
 
 class PrivatePathUnsafe(PrivatePathError):
     """A managed path exists, but its structure or identity is unsafe."""
+
+
+class PrivatePathMutationUnresolved(PrivatePathUnsafe):
+    """A created evidence leaf could not be proved quarantined and settled."""
 
 
 class PrivatePathUnsupported(PrivatePathError):

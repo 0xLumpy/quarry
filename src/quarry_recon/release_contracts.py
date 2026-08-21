@@ -28,8 +28,9 @@ from types import MappingProxyType
 from . import fault_store_evidence
 from . import path_identity_evidence
 from . import release_evidence as evidence
-from . import report_truth
+from . import private_files_evidence
 from . import release_v310_05
+from . import report_truth
 from . import resource_contract
 from . import run_manifest
 from . import source_registry_evidence
@@ -443,6 +444,9 @@ SCHEMA_PATHS = {
     "no-live-rule-schema": "release/evidence/schemas/no-live-rule-v1.schema.json",
     "network-boundary-trace-schema": "release/evidence/schemas/network-boundary-trace-v1.schema.json",
     "network-denial-report-schema": "release/evidence/schemas/network-denial-report-v1.schema.json",
+    "private-files-case-roster-schema": "release/evidence/schemas/private-files-case-roster-v1.schema.json",
+    "private-files-filesystem-trace-schema": "release/evidence/schemas/private-files-filesystem-trace-v1.schema.json",
+    "private-files-mode-owner-symlink-matrix-schema": "release/evidence/schemas/private-files-mode-owner-symlink-matrix-v1.schema.json",
     "release-scope-schema": "release/evidence/schemas/release-scope-v1.schema.json",
     "resource-gate-report-schema": "release/evidence/schemas/resource-gate-report-v1.schema.json",
     "signature-envelope-schema": "release/evidence/schemas/signature-envelope-v1.schema.json",
@@ -483,6 +487,9 @@ SCHEMA_VERSIONS = {
     "no-live-rule-schema": NO_LIVE_RULE_SCHEMA,
     "network-boundary-trace-schema": NETWORK_BOUNDARY_TRACE_SCHEMA,
     "network-denial-report-schema": NETWORK_DENIAL_REPORT_SCHEMA,
+    "private-files-case-roster-schema": private_files_evidence.ROSTER_SCHEMA,
+    "private-files-filesystem-trace-schema": private_files_evidence.TRACE_SCHEMA,
+    "private-files-mode-owner-symlink-matrix-schema": private_files_evidence.MATRIX_SCHEMA,
     "release-scope-schema": RELEASE_SCOPE_SCHEMA,
     "resource-gate-report-schema": RESOURCE_GATE_REPORT_SCHEMA,
     "signature-envelope-schema": SIGNATURE_ENVELOPE_SCHEMA,
@@ -594,6 +601,11 @@ SCOPE_INPUT_PATHS = {
     "source-registry-reconciliation-tests": "tests/test_source_registry_contract.py",
     **fault_store_evidence.INPUT_PATHS,
     **path_identity_evidence.INPUT_PATHS,
+    "private-files-case-roster": "release/evidence/private-files-case-roster-v1.json",
+    "private-files-evidence-producer": "scripts/emit_private_files_evidence.py",
+    "private-files-evidence-runtime": "src/quarry_recon/private_files_evidence.py",
+    "private-files-evidence-tests": "tests/test_private_files_evidence.py",
+    "private-files-privfs-runtime": "src/quarry_recon/privfs.py",
     "release-contracts-validator": "src/quarry_recon/release_contracts.py",
     "resource-gate-report-validator": "src/quarry_recon/resource_contract.py",
     "schema-validation-registry": evidence.REGISTRY_PATH,
