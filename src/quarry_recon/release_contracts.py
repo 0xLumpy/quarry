@@ -1273,6 +1273,16 @@ _FAULT_RUNNER_H1_NODEIDS = tuple(
     nodeid for nodeid in _FAULT_RUNNER_NODEIDS
     if nodeid.split("::", 1)[0] in _FAULT_RUNNER_H1_PATHS
 )
+_PRIVATE_FILES_INPUT_NAMES = (
+    "private-files-case-roster",
+    "private-files-case-roster-schema",
+    "private-files-filesystem-trace-schema",
+    "private-files-mode-owner-symlink-matrix-schema",
+    "private-files-evidence-producer",
+    "private-files-evidence-runtime",
+    "private-files-evidence-tests",
+    "private-files-privfs-runtime",
+)
 # This is the owner subset for B-MANIFEST's semantic authority.  Candidate
 # identity still binds the full source closure; projections and durability have
 # different gate owners and are intentionally not duplicated here.
@@ -6699,6 +6709,107 @@ def _semantic_source_registry(
         raise evidence.EvidenceError("source registry artifact makes an impermissible execution claim")
 
 
+def _semantic_private_files(
+    gate: dict, bodies: Mapping[str, bytes], **context: object,
+) -> None:
+    """Bind measured private-file facts to their exact signed H0/H1 owners."""
+    identity = context["identity"]
+    report = context["report"]
+    scope = context["scope"]
+    inputs = context["input_bodies"]
+    if (gate["gate_id"] != "C-PRIVATE-FILES" or not isinstance(identity, dict) or
+            not isinstance(report, dict) or not isinstance(scope, dict) or
+            not isinstance(inputs, Mapping)):
+        raise evidence.EvidenceError(
+            "private-files verifier requires accepted release context"
+        )
+
+    bindings = {row["name"]: row for row in scope["input_bindings"]}
+    for name in _PRIVATE_FILES_INPUT_NAMES:
+        binding = bindings.get(name)
+        body = inputs.get(name)
+        if (binding is None or binding["path"] != SCOPE_INPUT_PATHS[name] or
+                type(body) is not bytes or raw_sha256(body) != binding["digest"]):
+            raise evidence.EvidenceError(
+                "private-files source input is absent, redirected or drifted"
+            )
+    try:
+        private_files_evidence.read_case_roster(
+            inputs["private-files-case-roster"]
+        )
+    except private_files_evidence.PrivateFilesEvidenceError as exc:
+        raise evidence.EvidenceError(str(exc)) from exc
+
+    candidate_digest = evidence.canonical_digest(identity)
+    parsed: dict[str, dict] = {}
+    signed = {row["name"]: row for row in gate["artifacts"]}
+    for name in ("filesystem-trace", "mode-owner-symlink-matrix"):
+        body = bodies.get(name)
+        record = signed.get(name)
+        if (type(body) is not bytes or record is None or
+                record["media_type"] != "application/json" or
+                record["digest"] != raw_sha256(body)):
+            raise evidence.EvidenceError(
+                "private-files artifact does not match its signed gate record"
+            )
+        try:
+            parsed[name] = private_files_evidence.read_artifact(
+                body,
+                artifact_kind=name,
+                candidate_identity_digest=candidate_digest,
+            )
+        except private_files_evidence.PrivateFilesEvidenceError as exc:
+            raise evidence.EvidenceError(str(exc)) from exc
+
+    instances = report["instances"]
+    if [row["lane"] for row in instances] != [
+        "H0-hermetic", "H1-tool-integration",
+    ]:
+        raise evidence.EvidenceError(
+            "private-files evidence requires one exact signed H0 and H1 instance"
+        )
+    expected_artifact = {
+        "H0-hermetic": "filesystem-trace",
+        "H1-tool-integration": "mode-owner-symlink-matrix",
+    }
+    expected_total = {key: 0 for key in gate["selection"]}
+    for instance in instances:
+        name = expected_artifact[instance["lane"]]
+        artifact = parsed[name]
+        count = len(artifact["observations"])
+        selection = {
+            "collected": count, "deselected": 0, "failed": 0, "passed": count,
+            "selected": count, "skipped": 0, "xfailed": 0, "xpassed": 0,
+        }
+        if (instance["selection"] != selection or
+                instance["artifacts"] != [{
+                    "digest": raw_sha256(bodies[name]), "name": name,
+                }] or artifact["evidence_instance_id"] != instance["id"]):
+            raise evidence.EvidenceError(
+                "private-files artifact does not bind its exact signed evidence instance"
+            )
+        if not (
+            _timestamp(instance["started_at"], "private-files instance started_at") <=
+            _timestamp(artifact["started_at"], "private-files artifact started_at") <=
+            _timestamp(artifact["finished_at"], "private-files artifact finished_at") <=
+            _timestamp(instance["finished_at"], "private-files instance finished_at")
+        ):
+            raise evidence.EvidenceError(
+                "private-files collection lies outside its signed evidence interval"
+            )
+        for key, value in selection.items():
+            expected_total[key] += value
+    if gate["selection"] != expected_total:
+        raise evidence.EvidenceError(
+            "private-files signed selection does not reconcile the frozen case roster"
+        )
+    foreign = parsed["mode-owner-symlink-matrix"]["observations"][-1]
+    if foreign["error_detail"] == {"class": "unsupported", "components": []}:
+        raise evidence.EvidenceError(
+            "private-files H1 evidence did not execute the foreign-owner refusal"
+        )
+
+
 def _semantic_path_identity(
     gate: dict, bodies: Mapping[str, bytes], **context: object,
 ) -> None:
@@ -7945,6 +8056,7 @@ SEMANTIC_VERIFIERS = MappingProxyType({
     "B-DETERMINISM": _semantic_determinism,
     "C-SOURCE-REGISTRY": _semantic_source_registry,
     "C-CORPUS-SYNTHETIC": _semantic_synthetic_corpus,
+    "C-PRIVATE-FILES": _semantic_private_files,
     "C-PATH-IDENTITY": _semantic_path_identity,
     "C-FAULT-STORE": _semantic_fault_store,
     "C-FAULT-REVISION": _semantic_fault_revision,

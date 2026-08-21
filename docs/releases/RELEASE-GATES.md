@@ -290,6 +290,14 @@ or relationship tests.
 | `C-NET-DENY` | `H0`/`C0`/`P0` | Each supposedly network-free lane proves that socket, resolver, subprocess, proxy, and native-tool escape attempts are denied | OS-boundary self-test report for every runner image |
 | `C-POLICY-TRACE` | `H0`/`H1` | Every executed, omitted, refused, or bounded work unit has a typed policy/coverage record; accepted aggressive defaults are reproducible | Obligation-to-decision reconciliation report |
 
+The `C-PRIVATE-FILES` collector remains a source-substrate producer: its raw
+artifacts retain the explicit unaccepted disposition.  The obligation verifier
+accepts those facts only when exact signed H0 and H1 instances separately own
+the filesystem trace and mode/owner/symlink matrix, enclose both collection
+intervals, and the H1 matrix contains a measured foreign-owner refusal rather
+than the local `unsupported` disposition.  The gate remains `OPEN` until those
+candidate-bound signed records are accepted.
+
 The committed `C-PATH-IDENTITY` property corpus and containment-decision
 producer exercise production identity and descriptor boundaries and record
 observed tree, inode-identity, cache, exception and errno facts. The raw

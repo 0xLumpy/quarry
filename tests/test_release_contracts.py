@@ -22,6 +22,7 @@ from quarry_recon import fault_store_evidence
 from quarry_recon import release_v310_05
 from quarry_recon import resource_contract
 from quarry_recon import path_identity_evidence
+from quarry_recon import private_files_evidence
 from quarry_recon import source_registry_evidence
 
 pytestmark = pytest.mark.offline
@@ -410,6 +411,93 @@ def _corpus_disclosure_body(fixture_digest: str) -> bytes:
     })
 
 
+def _private_files_bodies(identity: dict, instances: list[dict]) -> dict[str, bytes]:
+    """Build deterministic synthetic observations for release-contract tests only."""
+    collector_uid = 1000
+
+    def stat_fact(kind: str, mode: int, uid: int, inode: int) -> dict:
+        return {
+            "device": 1, "gid": collector_uid, "inode": inode, "kind": kind,
+            "mode": mode, "nlink": 1, "uid": uid,
+        }
+
+    umasks = [0, 2, 18, 63]
+    observations = [
+        {
+            "case_id": "h0-create-directory-umask",
+            "descriptor_stats": [
+                {"kind": "directory", "mode": 0o700, "uid": collector_uid}
+                for _ in umasks
+            ],
+            "error": None, "error_detail": None, "expected": "created",
+            "mutation": "created", "operation": "create_directory",
+            "post": stat_fact("directory", 0o700, collector_uid, 1), "pre": None,
+            "tested_umasks": umasks,
+        },
+        {
+            "case_id": "h0-create-file-umask",
+            "descriptor_stats": [
+                {"kind": "file", "mode": 0o600, "uid": collector_uid}
+                for _ in umasks
+            ],
+            "error": None, "error_detail": None, "expected": "created",
+            "mutation": "created", "operation": "create_file",
+            "post": stat_fact("file", 0o600, collector_uid, 2), "pre": None,
+            "tested_umasks": umasks,
+        },
+    ]
+    for index, (case_id, operation, kind, mode, uid, error_class) in enumerate((
+        ("h0-existing-mode-refusal", "existing_unsafe_mode", "file", 0o644,
+         collector_uid, "LegacyModeMismatch"),
+        ("h1-directory-symlink-refusal", "directory_symlink", "symlink", 0o777,
+         collector_uid, "PrivatePathUnsafe"),
+        ("h1-file-symlink-refusal", "file_symlink", "symlink", 0o777,
+         collector_uid, "PrivatePathUnsafe"),
+        ("h1-foreign-owner-refusal", "foreign_owner", "file", 0o600,
+         65534, "PrivatePathUnsafe"),
+    ), start=3):
+        value = stat_fact(kind, mode, uid, index)
+        observations.append({
+            "case_id": case_id, "descriptor_stats": [], "error": 1,
+            "error_detail": {"class": error_class, "components": [case_id]},
+            "expected": "refused", "mutation": "none", "operation": operation,
+            "post": value, "pre": copy.deepcopy(value), "tested_umasks": [],
+        })
+
+    by_lane = {row["lane"]: row for row in instances}
+    bodies = {}
+    for name, schema, lane, rows in (
+        ("filesystem-trace", private_files_evidence.TRACE_SCHEMA,
+         "H0-hermetic", observations[:3]),
+        ("mode-owner-symlink-matrix", private_files_evidence.MATRIX_SCHEMA,
+         "H1-tool-integration", observations[3:]),
+    ):
+        instance = by_lane[lane]
+        document = {
+            "artifact_kind": name,
+            "candidate_identity_digest": evidence.canonical_digest(identity),
+            "case_roster_digest": private_files_evidence.roster_digest(),
+            "collector_uid": collector_uid,
+            "disposition": "source_substrate",
+            "evidence_instance_id": instance["id"],
+            "finished_at": instance["finished_at"],
+            "gate_id": "C-PRIVATE-FILES",
+            "lane": lane,
+            "open_reasons": list(private_files_evidence._OPEN_REASONS),
+            "observations": rows,
+            "release": "0.3.10",
+            "schema_version": schema,
+            "started_at": instance["started_at"],
+        }
+        private_files_evidence.verify_artifact(
+            document,
+            artifact_kind=name,
+            candidate_identity_digest=evidence.canonical_digest(identity),
+        )
+        bodies[name] = private_files_evidence.canonical_json_bytes(document)
+    return bodies
+
+
 def _supporting_bodies(
     gate_id: str, *, identity: dict, scope: dict, support: dict, thresholds: dict, corpus: dict,
     benchmark: dict | None, measurements: list[dict], environment: dict,
@@ -510,6 +598,8 @@ def _supporting_bodies(
             input_bodies=path_inputs,
         )
         bodies["property-corpus"] = path_inputs["path-identity-corpus"]
+    elif gate_id == "C-PRIVATE-FILES":
+        bodies.update(_private_files_bodies(identity, evidence_instances))
     elif gate_id == "C-FAULT-STORE":
         fault_inputs = {
             name: (ROOT / path).read_bytes()
@@ -1955,6 +2045,12 @@ def _scenario(tmp_path: Path, *, approved_at: str = "2026-08-01T00:00:00Z"):
                         "passed": count, "selected": count, "skipped": 0,
                         "xfailed": 0, "xpassed": 0,
                     }
+                if gate_id == "C-PRIVATE-FILES":
+                    selection = {
+                        "collected": 3, "deselected": 0, "failed": 0,
+                        "passed": 3, "selected": 3, "skipped": 0,
+                        "xfailed": 0, "xpassed": 0,
+                    }
                 if gate_id == "B-DOCS-POLICY":
                     selection = {
                         "collected": len(contracts._DOCS_POLICY_TEST_ROSTER), "deselected": 0,
@@ -2098,6 +2194,15 @@ def _scenario(tmp_path: Path, *, approved_at: str = "2026-08-01T00:00:00Z"):
                         instance for instance in instances
                         if instance["lane"] == "H1-tool-integration"
                     )
+                if gate_id == "C-PRIVATE-FILES":
+                    target_lane = (
+                        "H0-hermetic" if artifact_name == "filesystem-trace"
+                        else "H1-tool-integration"
+                    )
+                    target_instance = next(
+                        instance for instance in instances
+                        if instance["lane"] == target_lane
+                    )
                 if gate_id in {"C-SBOM", "C-VULNERABILITY"} and (
                         artifact_name.startswith("sbom-observation-") or artifact_name.startswith("vulnerability-observation-")):
                     minor = artifact_name.rsplit("-", 1)[1]
@@ -2165,6 +2270,11 @@ def _scenario(tmp_path: Path, *, approved_at: str = "2026-08-01T00:00:00Z"):
         }:
             selection = copy.deepcopy(instances[0]["selection"])
         if gate_id == "C-FAULT-RUNNER":
+            selection = {
+                name: sum(instance["selection"][name] for instance in instances)
+                for name in selection
+            }
+        if gate_id == "C-PRIVATE-FILES":
             selection = {
                 name: sum(instance["selection"][name] for instance in instances)
                 for name in selection
@@ -2792,7 +2902,7 @@ class TestIncompleteSemanticRegistry:
             | {
                 "A-IDENTITY", "A-EVIDENCE-SCHEMA", "A-TAXONOMY", "A-CORPUS", "A-THRESHOLDS", "A-SUPPORT",
                 "B-HERMETIC-ALL", "B-SCHEMA", "B-DOCS-POLICY", "B-MANIFEST", "B-QUALITY", "B-COVERAGE", "B-STATIC-SECURITY", "B-DETERMINISM",
-                "C-PACKAGE-BUILD", "C-PACKAGE-INSTALL", "C-PYTHON-MATRIX", "C-SBOM", "C-VULNERABILITY", "C-PROVENANCE", "C-SOURCE-REGISTRY", "C-CORPUS-SYNTHETIC", "C-PATH-IDENTITY", "C-FAULT-STORE", "C-FAULT-REVISION", "C-FAULT-FINALIZE", "C-FAULT-CAMPAIGN", "C-FAULT-RUNNER", "C-NETWORK-BOUNDARY", "C-NET-DENY",
+                "C-PACKAGE-BUILD", "C-PACKAGE-INSTALL", "C-PYTHON-MATRIX", "C-SBOM", "C-VULNERABILITY", "C-PROVENANCE", "C-SOURCE-REGISTRY", "C-CORPUS-SYNTHETIC", "C-PRIVATE-FILES", "C-PATH-IDENTITY", "C-FAULT-STORE", "C-FAULT-REVISION", "C-FAULT-FINALIZE", "C-FAULT-CAMPAIGN", "C-FAULT-RUNNER", "C-NETWORK-BOUNDARY", "C-NET-DENY",
                 "E-DOCS", "E-PROJECT-HYGIENE", "E-ARTIFACTS",
                 *contracts.V310_05_SEMANTIC_GATES,
             }
@@ -2843,6 +2953,59 @@ class TestSourceRegistryAggregateEvidence:
         )
         with pytest.raises(evidence.EvidenceError, match=match):
             contracts.aggregate_records(**arguments)
+
+
+class TestPrivateFilesSemanticEvidence:
+    @staticmethod
+    def _case(tmp_path):
+        arguments = _scenario(tmp_path)
+        gate = _gate(arguments, "C-PRIVATE-FILES")
+        indexed = {
+            row["name"]: row for row in arguments["artifact_index"]["artifacts"]
+            if row["gate_id"] == "C-PRIVATE-FILES"
+        }
+        bodies = {
+            name: (arguments["artifact_root"] / indexed[name]["path"]).read_bytes()
+            for name in ("filesystem-trace", "mode-owner-symlink-matrix")
+        }
+        report = contracts.read_evidence_report(
+            (arguments["artifact_root"] / indexed["gate-evidence"]["path"]).read_bytes(),
+            identity=arguments["identity"],
+            gate_id="C-PRIVATE-FILES",
+        )
+        return arguments, gate, bodies, report
+
+    @staticmethod
+    def _verify(arguments, gate, bodies, report):
+        contracts._semantic_private_files(
+            gate,
+            bodies,
+            identity=arguments["identity"],
+            input_bodies=arguments["input_bodies"],
+            report=report,
+            scope=arguments["scope"],
+        )
+
+    def test_exact_private_file_artifacts_bind_the_signed_h0_h1_instances(self, tmp_path):
+        arguments, gate, bodies, report = self._case(tmp_path)
+        self._verify(arguments, gate, bodies, report)
+
+    def test_an_unsupported_foreign_owner_case_cannot_pass(self, tmp_path):
+        arguments, gate, bodies, report = self._case(tmp_path)
+        document = json.loads(bodies["mode-owner-symlink-matrix"])
+        foreign = document["observations"][-1]
+        foreign["error"] = None
+        foreign["error_detail"] = {"class": "unsupported", "components": []}
+        body = private_files_evidence.canonical_json_bytes(document)
+        bodies["mode-owner-symlink-matrix"] = body
+        digest = contracts.raw_sha256(body)
+        next(
+            row for row in gate["artifacts"]
+            if row["name"] == "mode-owner-symlink-matrix"
+        )["digest"] = digest
+        report["instances"][1]["artifacts"][0]["digest"] = digest
+        with pytest.raises(evidence.EvidenceError, match="did not execute"):
+            self._verify(arguments, gate, bodies, report)
 
 
 class TestPathIdentitySemanticEvidence:
