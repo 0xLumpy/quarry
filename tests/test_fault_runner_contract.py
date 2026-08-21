@@ -116,6 +116,19 @@ def test_source_plan_binds_exact_candidate_inputs_but_claims_no_execution(source
     )
 
 
+@pytest.mark.parametrize("name", tuple(fault_runner.INPUT_PATHS))
+def test_each_bound_input_substitution_refuses_the_source_plan(source_plan, name):
+    document, bodies = source_plan
+    changed = dict(bodies)
+    changed[name] = bodies[name] + b"substitution"
+    with pytest.raises(fault_runner.FaultRunnerEvidenceError):
+        fault_runner.verify_source_plan(
+            document,
+            candidate_identity_digest=_CANDIDATE,
+            input_bodies=changed,
+        )
+
+
 @pytest.mark.parametrize(
     "mutation",
     [
