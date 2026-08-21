@@ -11,7 +11,7 @@ import signal
 import stat
 import tempfile
 import time
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -285,7 +285,12 @@ def _owned_collection_root_name(root: _CollectionRootAuthority) -> str:
     """
     names = []
     for candidate in _PARENT_LISTDIR(root.parent_fd):
-        value = _PARENT_STAT(candidate, dir_fd=root.parent_fd, follow_symlinks=False)
+        try:
+            value = _PARENT_STAT(candidate, dir_fd=root.parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            # Concurrent collectors may remove unrelated sibling entries after
+            # this descriptor-relative directory snapshot.
+            continue
         if (stat.S_ISDIR(value.st_mode)
                 and _collection_directory_identity(value) == root.identity):
             names.append(candidate)
@@ -628,7 +633,7 @@ def _timestamp(value: object, where: str) -> str:
 
 def _utc_now() -> str:
     """Private clock seam used only to test the collection bracket."""
-    return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def build_source_substrate(*, candidate_identity_digest: str, h0_evidence_instance_id: str = "instance-00",

@@ -280,8 +280,10 @@ def test_quarantine_uses_atomic_no_replace_and_preserves_a_planted_collision(tmp
     finally:
         os.close(parent_fd)
 
-    first = root / f".quarry-evidence-quarantine-{(b'\x11' * 16).hex()}"
-    second = root / f".quarry-evidence-quarantine-{(b'\x22' * 16).hex()}"
+    first_nonce = (b"\x11" * 16).hex()
+    second_nonce = (b"\x22" * 16).hex()
+    first = root / f".quarry-evidence-quarantine-{first_nonce}"
+    second = root / f".quarry-evidence-quarantine-{second_nonce}"
     assert calls == 2
     assert planted == first
     assert first.read_bytes() == b"planted collision"

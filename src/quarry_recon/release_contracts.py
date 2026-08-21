@@ -1246,7 +1246,8 @@ def _timestamp(value: object, name: str) -> datetime:
 
 def _path(value: object, name: str) -> str:
     text = _string(value, name)
-    if "\\" in text or PureWindowsPath(text).is_absolute():
+    if ("\\" in text or PureWindowsPath(text).is_absolute() or
+            re.match(r"^[^\x00-\x1f]:/", text) is not None):
         raise evidence.EvidenceError(f"{name} must be a normalized relative POSIX path")
     pure = PurePosixPath(text)
     if (pure.is_absolute() or not pure.parts or text != pure.as_posix() or
