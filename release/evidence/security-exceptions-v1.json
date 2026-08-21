@@ -10,6 +10,15 @@
       "test_id": "B602"
     },
     {
+      "code_sha256": "6d3f45f632f713030719c881e3c6e6e9787dc55e1dcdf19b8580133f9b28745c",
+      "expires_before": "0.4.0",
+      "line": 287,
+      "owner": "release-engineering",
+      "path": "src/quarry_recon/network_cdp.py",
+      "rationale": "RFC 6455 requires SHA-1 only to derive the public WebSocket accept value; this use protects no credential, signature, or confidential data.",
+      "test_id": "B324"
+    },
+    {
       "code_sha256": "cddae1dc7ff49b1ef9e9c30a98de3fa8e5f1055c73b740ff2fd6afe0176b211a",
       "expires_before": "0.4.0",
       "line": 256,

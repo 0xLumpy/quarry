@@ -41,12 +41,6 @@ jobs:
           src/quarry_recon/release_v310_05.py
           src/quarry_recon/release_v310_08.py
           src/quarry_recon/repository_identity.py
-      - name: Reviewed high-severity static findings
-        run: python scripts/check_security_exceptions.py
-      - name: No new tracked secrets
-        run: |
-          set -o pipefail
-          git ls-files -z | xargs -0 detect-secrets-hook --baseline .secrets.baseline --no-verify
       - name: Repository whitespace hygiene
         run: git diff --check
       - name: H0 tests (deny guard)
@@ -76,6 +70,14 @@ jobs:
               --quarry-taxonomy-manifest "$RUNNER_TEMP/quarry-taxonomy.json" \
               --quarry-h0-shard-report "$RUNNER_TEMP/h0-shard-${{ matrix.python-version }}-${{ matrix.shard }}.json"
           fi
+      - name: Static-security scan fragment (existing Python 3.12 shard 0)
+        if: ${{ matrix.python-version == '3.12' && matrix.shard == '0' }}
+        run: >-
+          python scripts/emit_static_security.py
+          --h0-fragment "$RUNNER_TEMP/h0-shard-3.12-0.json"
+          --job-instance-id ".github/workflows/ci.yml#jobs.offline[python-version=3.12,shard=0]"
+          --policy release/evidence/static-security-policy-v1.json
+          --output "$RUNNER_TEMP/security-scan-fragment.json"
       - name: Upload H0 shard outcome
         if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -86,6 +88,7 @@ jobs:
             ${{ runner.temp }}/quarry-taxonomy.json
             ${{ runner.temp }}/quarry-coverage-3.12-${{ matrix.shard }}*
             ${{ runner.temp }}/coverage-shard-${{ matrix.shard }}.json
+            ${{ runner.temp }}/security-scan-fragment.json
           if-no-files-found: error
 
   integration:

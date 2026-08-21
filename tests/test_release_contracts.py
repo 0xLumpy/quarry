@@ -349,12 +349,12 @@ def _taxonomy_body(environment: dict, toolchain: list[dict]) -> bytes:
 def _h0_collection_taxonomy_body(environment: dict, toolchain: list[dict]) -> bytes:
     document = json.loads(_taxonomy_body(environment, toolchain))
     h0_nodes = [
+        "tests/test_config.py::TestProfileLoad::test_valid_profile_loads",
+        "tests/test_phase1_privfs_core.py::test_strict_walk_refuses_a_symlink_at_every_directory_depth[1]",
+        "tests/test_release_h0.py::test_tool_open_refuses_relative_or_non_normalized_paths[git]",
         "tests/taxonomy.py::test_offline_0",
         "tests/taxonomy.py::test_offline_3",
-        "tests/taxonomy.py::test_offline_4",
         "tests/taxonomy.py::test_offline_5",
-        "tests/taxonomy.py::test_offline_8",
-        "tests/taxonomy.py::test_offline_21",
     ]
     h0_nodes.sort(key=lambda value: value.encode("utf-8"))
     document["lanes"][0]["nodes"] = h0_nodes
@@ -629,6 +629,47 @@ def _supporting_bodies(
             "name": "coverage-report", "release": "0.3.10", "schema_version": contracts.GATE_ARTIFACT_SCHEMA,
             "source_tree_digest": identity["source_tree_digest"],
             "threshold_manifest_digest": contracts.raw_sha256(contracts.canonical_json_line(thresholds)),
+            "toolchain": toolchain,
+        })
+    elif gate_id == "B-STATIC-SECURITY":
+        policy_body = (ROOT / contracts.STATIC_SECURITY_POLICY_PATH).read_bytes()
+        security_policy = contracts.read_static_security_policy(policy_body)
+        bindings = {row["name"]: row for row in scope["input_bindings"]}
+        h0 = evidence.load_json_bytes(emitted[("B-HERMETIC-ALL", "test-report")][:-1])
+        run = next(row for row in h0["runs"] if row["environment"]["python"].startswith("3.12."))
+        job_id = ".github/workflows/ci.yml#jobs.offline[python-version=3.12,shard=0]"
+        fragment_digest = next(row["digest"] for row in run["fragments"] if row["job_instance_id"] == job_id)
+        exceptions = json.loads((ROOT / "release/evidence/security-exceptions-v1.json").read_bytes())
+        suppressions = []
+        for row in exceptions["exceptions"]:
+            stable = hashlib.sha256("\0".join(map(str, (row["path"], row["line"], row["test_id"]))).encode()).hexdigest()[:20]
+            suppressions.append({"expires_before": row["expires_before"], "finding_id": "bandit-" + stable, "id": "security-suppression-" + stable, "owner": row["owner"], "rationale": row["rationale"]})
+        suppressions.sort(key=lambda row: row["id"])
+        fragment = {
+            "artifact_type": "security-scan-fragment",
+            "ast_inventory": [{**row, "source": "ast"} for row in security_policy["ast_inventory"]["entries"]],
+            "dependency_manifest": {"digest": security_policy["dependency_manifest"]["digest"], "name": "package-metadata", "path": "pyproject.toml"},
+            "detect_secrets_baseline_digest": security_policy["detect_secrets"]["baseline"]["digest"],
+            "findings": [], "h0_fragment_digest": fragment_digest,
+            "h0_property_tests": security_policy["h0_property_tests"], "job_instance_id": job_id,
+            "policy_digest": contracts.raw_sha256(policy_body), "release": "0.3.10",
+            "schema_version": contracts.STATIC_SECURITY_FRAGMENT_SCHEMA, "suppressions": suppressions,
+            "scan_tools": [{"name": "bandit", "version": "1.9.4"}, {"name": "detect-secrets", "version": "1.5.0"}], "unsuppressed_findings": 0,
+        }
+        bodies["security-scan-fragment"] = contracts.canonical_json_line(fragment)
+        binding_names = contracts._STATIC_SECURITY_BINDINGS
+        bodies["security-findings"] = contracts.canonical_json_line({
+            **{key: value for key, value in fragment.items() if key not in {"artifact_type", "schema_version", "scan_tools"}},
+            "artifact_type": "security-findings",
+            "bindings": [{"digest": bindings[name]["digest"], "name": name, "path": bindings[name]["path"]} for name in binding_names],
+            "candidate_identity_digest": evidence.canonical_digest(identity),
+            "checks": contracts._static_security_checks(fragment),
+            "environment": environment, "evidence_finished_at": "2026-08-14T10:10:01Z",
+            "evidence_instance_id": evidence_instance_id, "evidence_started_at": "2026-08-14T10:10:00Z",
+            "gate_id": gate_id, "name": "security-findings",
+            "selection": {"collected": 5, "deselected": 0, "failed": 0, "passed": 5, "selected": 5, "skipped": 0, "xfailed": 0, "xpassed": 0},
+            "scan_fragment_digest": contracts.raw_sha256(bodies["security-scan-fragment"]),
+            "schema_version": contracts.SECURITY_FINDINGS_SCHEMA,
             "toolchain": toolchain,
         })
     elif gate_id == "B-MANIFEST":
@@ -1200,7 +1241,9 @@ def _ready_contracts(
     corpus = _read("release/evidence/corpus-selection-v1.json", contracts.read_corpus_manifest)
     no_live = _read("release/evidence/no-live-rule-v1.json", contracts.read_no_live_rule)
     support["tools"] = [
+        {"digest": _digest("e"), "name": "bandit", "version": "1.9.4"},
         {"digest": _digest("d"), "name": "coverage", "version": "7.15.4"},
+        {"digest": _digest("f"), "name": "detect-secrets", "version": "1.5.0"},
         {"digest": _digest("b"), "name": "mypy", "version": "2.3.1"},
         {"digest": _digest("a"), "name": "pytest", "version": "9.1.1"},
         {"digest": _digest("c"), "name": "ruff", "version": "0.16.3"},
@@ -1394,6 +1437,7 @@ def _scenario(tmp_path: Path, *, approved_at: str = "2026-08-01T00:00:00Z"):
             if gate_id == "B-QUALITY" else supported_toolchain if gate_id == "C-TOOLS" else
             [tool for tool in supported_toolchain if tool["name"] in {"coverage", "pytest"}]
             if gate_id == "B-COVERAGE" else [tool for tool in supported_toolchain if tool["name"] == "pytest"]
+            if gate_id != "B-STATIC-SECURITY" else [tool for tool in supported_toolchain if tool["name"] in {"bandit", "detect-secrets", "pytest"}]
         )
         if not is_live:
             if gate_id == "B-HERMETIC-ALL":
@@ -1406,7 +1450,7 @@ def _scenario(tmp_path: Path, *, approved_at: str = "2026-08-01T00:00:00Z"):
                     environment for environment in supported_environments
                     if environment["lane"] in lanes
                 ]
-            elif gate_id == "B-COVERAGE":
+            elif gate_id in {"B-COVERAGE", "B-STATIC-SECURITY"}:
                 instance_specs = [next(environment for environment in supported_environments
                                        if environment["lane"] == "H0-hermetic" and environment["python"].startswith("3.12."))]
             else:
@@ -1463,12 +1507,15 @@ def _scenario(tmp_path: Path, *, approved_at: str = "2026-08-01T00:00:00Z"):
                 if gate_id == "B-COVERAGE":
                     selection = {"collected": 10, "deselected": 4, "failed": 0, "passed": 6,
                                  "selected": 6, "skipped": 0, "xfailed": 0, "xpassed": 0}
+                if gate_id == "B-STATIC-SECURITY":
+                    selection = {"collected": 5, "deselected": 0, "failed": 0, "passed": 5,
+                                 "selected": 5, "skipped": 0, "xfailed": 0, "xpassed": 0}
                 instances.append({
                     "artifacts": [],
                     "assertions": [assertion],
                     "environment": instance_environment,
                     "finished_at": instance_finished_at,
-                    "id": "instance-01" if gate_id == "B-COVERAGE" else f"instance-{instance_index:02d}",
+                    "id": "instance-01" if gate_id in {"B-COVERAGE", "B-STATIC-SECURITY"} else f"instance-{instance_index:02d}",
                     "lane": environment["lane"],
                     "selection": selection,
                     "started_at": gate_started_at,
@@ -1606,7 +1653,7 @@ def _scenario(tmp_path: Path, *, approved_at: str = "2026-08-01T00:00:00Z"):
                 name: sum(instance["selection"][name] for instance in instances)
                 for name in selection
             }
-        if gate_id in {"B-DOCS-POLICY", "B-QUALITY", "B-COVERAGE"}:
+        if gate_id in {"B-DOCS-POLICY", "B-QUALITY", "B-COVERAGE", "B-STATIC-SECURITY"}:
             selection = copy.deepcopy(instances[0]["selection"])
         if gate_id == "B-MANIFEST":
             selection = copy.deepcopy(instances[0]["selection"])
@@ -2173,7 +2220,7 @@ class TestIncompleteSemanticRegistry:
             set(contracts.RESOURCE_SEMANTIC_GATES)
             | {
                 "A-IDENTITY", "A-EVIDENCE-SCHEMA", "A-TAXONOMY", "A-CORPUS", "A-THRESHOLDS", "A-SUPPORT",
-                "B-HERMETIC-ALL", "B-SCHEMA", "B-DOCS-POLICY", "B-MANIFEST", "B-QUALITY", "B-COVERAGE",
+                "B-HERMETIC-ALL", "B-SCHEMA", "B-DOCS-POLICY", "B-MANIFEST", "B-QUALITY", "B-COVERAGE", "B-STATIC-SECURITY",
                 "C-PACKAGE-BUILD", "C-PACKAGE-INSTALL", "C-NETWORK-BOUNDARY", "C-NET-DENY",
                 *contracts.V310_05_SEMANTIC_GATES,
             }
@@ -2182,7 +2229,7 @@ class TestIncompleteSemanticRegistry:
         arguments = _scenario(tmp_path)
         with pytest.raises(
             evidence.EvidenceError,
-            match="B-STATIC-SECURITY has no registered obligation-specific semantic verifier",
+            match="B-DETERMINISM has no registered obligation-specific semantic verifier",
         ):
             contracts.aggregate_records(**arguments)
 
@@ -3775,3 +3822,110 @@ class TestCoverageSemanticEvidence:
                  if item["name"] == artifact["name"])["digest"] = artifact["digest"]
         with pytest.raises(evidence.EvidenceError, match="totals do not recompute"):
             self._verify(arguments, original)
+
+
+class TestStaticSecuritySemanticEvidence:
+    @staticmethod
+    def _documents(arguments: dict) -> tuple[dict, dict]:
+        records = {
+            item["name"]: item for item in arguments["artifact_index"]["artifacts"]
+            if item["gate_id"] == "B-STATIC-SECURITY"
+        }
+        return tuple(
+            json.loads((arguments["artifact_root"] / records[name]["path"]).read_bytes())
+            for name in ("security-findings", "security-scan-fragment")
+        )
+
+    @staticmethod
+    def _verify(arguments: dict, findings: dict, fragment: dict) -> None:
+        gate = copy.deepcopy(_gate(arguments, "B-STATIC-SECURITY"))
+        fragment_body = contracts.canonical_json_line(fragment)
+        findings["scan_fragment_digest"] = contracts.raw_sha256(fragment_body)
+        findings_body = contracts.canonical_json_line(findings)
+        bodies = {
+            "security-findings": findings_body,
+            "security-scan-fragment": fragment_body,
+        }
+        for name, body in bodies.items():
+            next(item for item in gate["artifacts"] if item["name"] == name)["digest"] = \
+                contracts.raw_sha256(body)
+        report_artifact = next(
+            item for item in arguments["artifact_index"]["artifacts"]
+            if item["gate_id"] == "B-STATIC-SECURITY" and item["name"] == "gate-evidence"
+        )
+        report = contracts.read_evidence_report(
+            (arguments["artifact_root"] / report_artifact["path"]).read_bytes(),
+            identity=arguments["identity"], gate_id="B-STATIC-SECURITY",
+        )
+        with contracts.ArtifactResolver(
+            arguments["artifact_root"], arguments["artifact_index"],
+            identity=arguments["identity"],
+        ) as resolver:
+            contracts._semantic_static_security(
+                gate, bodies, identity=arguments["identity"], report=report,
+                scope=arguments["scope"], thresholds=arguments["threshold_manifest"],
+                input_bodies=arguments["input_bodies"], resolver=resolver,
+            )
+
+    def test_static_security_schemas_and_semantics_refuse_substitution(self, tmp_path):
+        arguments = _scenario(tmp_path)
+        findings, fragment = self._documents(arguments)
+        findings_schema = json.loads(
+            (ROOT / contracts.SCHEMA_PATHS["security-findings-schema"]).read_bytes()
+        )
+        fragment_schema = json.loads(
+            (ROOT / contracts.SCHEMA_PATHS["static-security-fragment-schema"]).read_bytes()
+        )
+        assert list(Draft202012Validator(findings_schema).iter_errors(findings)) == []
+        assert list(Draft202012Validator(fragment_schema).iter_errors(fragment)) == []
+        self._verify(arguments, copy.deepcopy(findings), copy.deepcopy(fragment))
+
+        finding_mutations = (
+            lambda doc: doc.update(candidate_identity_digest=_digest("9")),
+            lambda doc: doc["bindings"].pop(),
+            lambda doc: doc["checks"][0].update(result_digest=_digest("9")),
+            lambda doc: doc["suppressions"][0].update(owner="substituted"),
+            lambda doc: doc["selection"].update(selected=4),
+        )
+        for mutate in finding_mutations:
+            forged = copy.deepcopy(findings)
+            mutate(forged)
+            with pytest.raises(evidence.EvidenceError):
+                self._verify(arguments, forged, copy.deepcopy(fragment))
+
+        fragment_mutations = (
+            lambda doc: doc.update(job_instance_id="foreign-job"),
+            lambda doc: doc["ast_inventory"][0].update(source="bandit"),
+            lambda doc: doc["dependency_manifest"].update(digest=_digest("8")),
+            lambda doc: doc.update(unsuppressed_findings=1),
+        )
+        for mutate in fragment_mutations:
+            forged = copy.deepcopy(fragment)
+            mutate(forged)
+            with pytest.raises(evidence.EvidenceError):
+                self._verify(arguments, copy.deepcopy(findings), forged)
+
+        unknown = copy.deepcopy(fragment)
+        unknown["unexpected"] = True
+        assert list(Draft202012Validator(fragment_schema).iter_errors(unknown))
+
+    def test_static_security_applies_a_future_numeric_threshold(self, tmp_path):
+        arguments = _scenario(tmp_path)
+        findings, fragment = self._documents(arguments)
+        fragment["findings"] = [{
+            "api": "B999", "id": "bandit-unsuppressed", "line": 1,
+            "path": "src/quarry_recon/example.py", "source": "bandit",
+        }]
+        fragment["unsuppressed_findings"] = 1
+        findings.update({
+            "findings": copy.deepcopy(fragment["findings"]),
+            "unsuppressed_findings": 1,
+            "checks": contracts._static_security_checks(fragment),
+        })
+        threshold = next(
+            row for row in arguments["threshold_manifest"]["thresholds"]
+            if row["gate_id"] == "B-STATIC-SECURITY"
+        )
+        threshold["limit"] = 0
+        with pytest.raises(evidence.EvidenceError, match="threshold breach"):
+            self._verify(arguments, findings, fragment)

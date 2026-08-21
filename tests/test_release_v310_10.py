@@ -144,13 +144,15 @@ def test_security_gates_are_fail_closed_and_reviewable():
         "bandit_severity": "HIGH",
         "unexpected_findings": "fail",
     }
-    assert len(exceptions["exceptions"]) == 3
+    assert len(exceptions["exceptions"]) == 4
     assert all(row["expires_before"] == "0.4.0" for row in exceptions["exceptions"])
-    assert len({(row["path"], row["line"], row["test_id"]) for row in exceptions["exceptions"]}) == 3
+    assert len({(row["path"], row["line"], row["test_id"]) for row in exceptions["exceptions"]}) == 4
 
     baseline = json.loads(_text(".secrets.baseline"))
     findings = [row for rows in baseline["results"].values() for row in rows]
     assert findings
     assert all(row.get("is_secret") is False for row in findings)
-    assert "detect-secrets-hook --baseline .secrets.baseline --no-verify" in \
-        _text(".github/workflows/ci.yml")
+    assert "python scripts/emit_static_security.py" in _text(".github/workflows/ci.yml")
+    producer = _text("scripts/emit_static_security.py")
+    assert '"detect-secrets-hook"' in producer
+    assert '"--baseline"' in producer and '".secrets.baseline"' in producer

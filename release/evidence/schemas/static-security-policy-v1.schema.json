@@ -1,0 +1,27 @@
+{
+  "$id": "urn:quarry:schema:static-security-policy:v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Quarry B-STATIC-SECURITY frozen policy v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["ast_inventory", "bandit", "dependency_manifest", "detect_secrets", "h0_property_tests", "release", "schema_version", "unsafe_apis"],
+  "properties": {
+    "schema_version": {"const": "quarry.static-security-policy.v1"},
+    "release": {"const": "0.3.10"},
+    "bandit": {"$ref": "#/$defs/bandit"},
+    "detect_secrets": {"$ref": "#/$defs/detect_secrets"},
+    "ast_inventory": {"$ref": "#/$defs/ast_inventory"},
+    "h0_property_tests": {"$ref": "#/$defs/h0_property_tests"},
+    "dependency_manifest": {"$ref": "#/$defs/binding"},
+    "unsafe_apis": {"const": ["subprocess.Popen", "subprocess.run", "yaml.load"]}
+  },
+  "$defs": {
+    "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "binding": {"type": "object", "additionalProperties": false, "required": ["digest", "path"], "properties": {"digest": {"$ref": "#/$defs/digest"}, "path": {"type": "string", "minLength": 1}}},
+    "bandit": {"type": "object", "additionalProperties": false, "required": ["confidence", "exceptions", "severity", "source_roster", "tool", "version"], "properties": {"tool": {"const": "bandit"}, "version": {"const": "1.9.4"}, "severity": {"const": "HIGH"}, "confidence": {"const": "HIGH"}, "source_roster": {"const": ["src"]}, "exceptions": {"$ref": "#/$defs/binding"}}},
+    "detect_secrets": {"type": "object", "additionalProperties": false, "required": ["baseline", "mode", "tool", "version"], "properties": {"tool": {"const": "detect-secrets"}, "version": {"const": "1.5.0"}, "mode": {"const": "tracked-files"}, "baseline": {"$ref": "#/$defs/binding"}}},
+    "ast_entry": {"type": "object", "additionalProperties": false, "required": ["api", "id", "line", "path"], "properties": {"api": {"enum": ["subprocess.Popen", "subprocess.run", "yaml.load"]}, "id": {"pattern": "^unsafe-api-[a-z0-9-]+$", "type": "string"}, "line": {"minimum": 1, "type": "integer"}, "path": {"pattern": "^src/quarry_recon(?:/[A-Za-z0-9_.-]+)*\\.py$", "type": "string"}}},
+    "ast_inventory": {"type": "object", "additionalProperties": false, "required": ["entries", "source_roster"], "properties": {"source_roster": {"const": ["src/quarry_recon"]}, "entries": {"minItems": 1, "items": {"$ref": "#/$defs/ast_entry"}, "type": "array", "uniqueItems": true}}},
+    "h0_property_tests": {"type": "object", "additionalProperties": false, "required": ["nodes", "sources"], "properties": {"sources": {"const": ["tests/test_config.py", "tests/test_phase1_privfs_core.py", "tests/test_release_h0.py"]}, "nodes": {"minItems": 3, "items": {"type": "string", "pattern": "^tests/test_[A-Za-z0-9_]+\\.py::[A-Za-z0-9_:\\[\\]-]+$"}, "type": "array", "uniqueItems": true}}}
+  }
+}

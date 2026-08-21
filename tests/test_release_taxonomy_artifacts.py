@@ -627,20 +627,26 @@ class TestCommittedWorkflowParity:
                 }
                 assert mapped_matrix == _configured_matrix_rows(configured)
 
-                pytest_steps = []
+                pytest_selections = []
                 for step in configured["steps"]:
                     if "run" not in step:
                         continue
-                    arguments = shlex.split(step["run"])
-                    if arguments and arguments[0] == "pytest" and "-m" in arguments:
-                        pytest_steps.append((step, arguments))
-                assert len(pytest_steps) == 1
-                _step, arguments = pytest_steps[0]
-                assert arguments[arguments.index("-m") + 1] == \
-                    mapped["selection"]["mark_expression"]
-                if mapped["selection"]["keyword_expression"]:
-                    assert arguments[arguments.index("-k") + 1] == \
-                        mapped["selection"]["keyword_expression"]
+                    tokens = shlex.split(step["run"])
+                    for index, token in enumerate(tokens):
+                        if token != "pytest":
+                            continue
+                        arguments = tokens[index + 1:]
+                        if "-m" not in arguments:
+                            continue
+                        marker = arguments[arguments.index("-m") + 1]
+                        keyword = (arguments[arguments.index("-k") + 1]
+                                   if "-k" in arguments else "")
+                        pytest_selections.append((marker, keyword))
+                assert pytest_selections
+                assert set(pytest_selections) == {(
+                    mapped["selection"]["mark_expression"],
+                    mapped["selection"]["keyword_expression"],
+                )}
 
         offline = parsed_workflows[WORKFLOW_PATH]["jobs"]["offline"]
         mapped_offline = next(
@@ -675,17 +681,30 @@ class TestCommittedWorkflowParity:
         assert len(test_steps) == 1
         test_step = test_steps[0]
         arguments = shlex.split(test_step["run"])
-        assert arguments[arguments.index("-m") + 1] == \
-            mapped_offline["selection"]["mark_expression"]
+        pytest_arguments = [
+            arguments[index + 1:] for index, token in enumerate(arguments)
+            if token == "pytest"
+        ]
+        assert len(pytest_arguments) == 2
+        assert all(
+            values[values.index("-m") + 1] == mapped_offline["selection"]["mark_expression"]
+            for values in pytest_arguments
+        )
         assert "--quarry-shard-count 6" in test_step["run"]
         assert '--quarry-shard-index "${{ matrix.shard }}"' in test_step["run"]
         assert '${{ matrix.shard }}' in test_step["run"]
-        assert "--quarry-taxonomy-manifest" in arguments
-        report_option = arguments.index("--quarry-h0-shard-report")
-        assert arguments[report_option + 1] == (
+        expected_report = (
             "$RUNNER_TEMP/h0-shard-${{ matrix.python-version }}-"
             "${{ matrix.shard }}.json"
         )
+        assert [
+            arguments[index + 1] for index, token in enumerate(arguments)
+            if token == "--quarry-taxonomy-manifest"
+        ] == ["$RUNNER_TEMP/quarry-taxonomy.json"] * 2
+        assert [
+            arguments[index + 1] for index, token in enumerate(arguments)
+            if token == "--quarry-h0-shard-report"
+        ] == [expected_report] * 2
         assert test_step["env"]["QUARRY_OFFLINE_CI"] == "1"
 
         upload_steps = [
@@ -703,6 +722,9 @@ class TestCommittedWorkflowParity:
                 "${{ runner.temp }}/h0-shard-${{ matrix.python-version }}-"
                 "${{ matrix.shard }}.json\n"
                 "${{ runner.temp }}/quarry-taxonomy.json\n"
+                "${{ runner.temp }}/quarry-coverage-3.12-${{ matrix.shard }}*\n"
+                "${{ runner.temp }}/coverage-shard-${{ matrix.shard }}.json\n"
+                "${{ runner.temp }}/security-scan-fragment.json\n"
             ),
             "if-no-files-found": "error",
         }

@@ -1,0 +1,162 @@
+{
+  "$id": "urn:quarry:schema:static-security-scan-fragment:v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Quarry B-STATIC-SECURITY raw shard scan v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "artifact_type",
+    "ast_inventory",
+    "dependency_manifest",
+    "detect_secrets_baseline_digest",
+    "findings",
+    "h0_fragment_digest",
+    "h0_property_tests",
+    "job_instance_id",
+    "policy_digest",
+    "release",
+    "scan_tools",
+    "schema_version",
+    "suppressions",
+    "unsuppressed_findings"
+  ],
+  "properties": {
+    "artifact_type": {"const": "security-scan-fragment"},
+    "ast_inventory": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/ast_finding"},
+      "minItems": 1,
+      "uniqueItems": true
+    },
+    "dependency_manifest": {"$ref": "#/$defs/dependency_binding"},
+    "detect_secrets_baseline_digest": {"$ref": "#/$defs/digest"},
+    "findings": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/bandit_finding"},
+      "uniqueItems": true
+    },
+    "h0_fragment_digest": {"$ref": "#/$defs/digest"},
+    "h0_property_tests": {"$ref": "#/$defs/properties"},
+    "job_instance_id": {
+      "const": ".github/workflows/ci.yml#jobs.offline[python-version=3.12,shard=0]"
+    },
+    "policy_digest": {"$ref": "#/$defs/digest"},
+    "release": {"const": "0.3.10"},
+    "scan_tools": {
+      "type": "array",
+      "prefixItems": [
+        {"$ref": "#/$defs/bandit_tool"},
+        {"$ref": "#/$defs/detect_secrets_tool"}
+      ],
+      "items": false,
+      "minItems": 2,
+      "maxItems": 2
+    },
+    "schema_version": {"const": "quarry.static-security-scan-fragment.v1"},
+    "suppressions": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/suppression"},
+      "uniqueItems": true
+    },
+    "unsuppressed_findings": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9223372036854775807
+    }
+  },
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "dependency_binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["digest", "name", "path"],
+      "properties": {
+        "digest": {"$ref": "#/$defs/digest"},
+        "name": {"const": "package-metadata"},
+        "path": {"const": "pyproject.toml"}
+      }
+    },
+    "finding_base": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["api", "id", "line", "path", "source"],
+      "properties": {
+        "api": {"type": "string", "minLength": 1},
+        "id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._+-]*$"},
+        "line": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9223372036854775807
+        },
+        "path": {"type": "string", "minLength": 1},
+        "source": {"type": "string"}
+      }
+    },
+    "ast_finding": {
+      "allOf": [
+        {"$ref": "#/$defs/finding_base"},
+        {"properties": {"source": {"const": "ast"}}}
+      ]
+    },
+    "bandit_finding": {
+      "allOf": [
+        {"$ref": "#/$defs/finding_base"},
+        {"properties": {"source": {"const": "bandit"}}}
+      ]
+    },
+    "suppression": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["expires_before", "finding_id", "id", "owner", "rationale"],
+      "properties": {
+        "expires_before": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"},
+        "finding_id": {"type": "string", "pattern": "^bandit-[0-9a-f]{20}$"},
+        "id": {"type": "string", "pattern": "^security-suppression-[0-9a-f]{20}$"},
+        "owner": {"type": "string", "minLength": 1},
+        "rationale": {"type": "string", "minLength": 20}
+      }
+    },
+    "properties": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["nodes", "sources"],
+      "properties": {
+        "nodes": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1},
+          "minItems": 3,
+          "maxItems": 3,
+          "uniqueItems": true
+        },
+        "sources": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1},
+          "minItems": 3,
+          "maxItems": 3,
+          "uniqueItems": true
+        }
+      }
+    },
+    "bandit_tool": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version"],
+      "properties": {
+        "name": {"const": "bandit"},
+        "version": {"const": "1.9.4"}
+      }
+    },
+    "detect_secrets_tool": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version"],
+      "properties": {
+        "name": {"const": "detect-secrets"},
+        "version": {"const": "1.5.0"}
+      }
+    }
+  }
+}

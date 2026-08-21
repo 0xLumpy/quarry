@@ -59,6 +59,9 @@ MANIFEST_EVIDENCE_CASES_SCHEMA = "quarry.manifest-evidence-cases.v1"
 QUALITY_POLICY_SCHEMA = "quarry.quality-policy.v1"
 COVERAGE_POLICY_SCHEMA = "quarry.coverage-policy.v1"
 COVERAGE_SHARD_SCHEMA = "quarry.coverage-shard.v1"
+STATIC_SECURITY_POLICY_SCHEMA = "quarry.static-security-policy.v1"
+STATIC_SECURITY_FRAGMENT_SCHEMA = "quarry.static-security-scan-fragment.v1"
+SECURITY_FINDINGS_SCHEMA = "quarry.security-findings.v1"
 
 RELEASE = evidence.RELEASE_SCOPE
 LANE_ORDER = (
@@ -311,7 +314,10 @@ REQUIRED_ARTIFACTS = {
         ("coverage-report", "application/json"),
         *( (f"coverage-shard-{index}", "application/json") for index in range(6) ),
     ),
-    "B-STATIC-SECURITY": (("security-findings", "application/json"),),
+    "B-STATIC-SECURITY": (
+        ("security-findings", "application/json"),
+        ("security-scan-fragment", "application/json"),
+    ),
     "B-DETERMINISM": (("artifact-tree-diff", "application/json"),),
     "B-DOCS-POLICY": (("parity-report", "application/json"),),
     "C-PACKAGE-BUILD": (
@@ -417,6 +423,9 @@ SCHEMA_PATHS = {
     "quality-policy-schema": "release/evidence/schemas/quality-policy-v1.schema.json",
     "coverage-policy-schema": "release/evidence/schemas/coverage-policy-v1.schema.json",
     "coverage-shard-schema": "release/evidence/schemas/coverage-shard-v1.schema.json",
+    "static-security-policy-schema": "release/evidence/schemas/static-security-policy-v1.schema.json",
+    "static-security-fragment-schema": "release/evidence/schemas/static-security-scan-fragment-v1.schema.json",
+    "security-findings-schema": "release/evidence/schemas/security-findings-v1.schema.json",
 }
 SCHEMA_VERSIONS = {
     "aggregate-schema": AGGREGATE_SCHEMA,
@@ -439,6 +448,9 @@ SCHEMA_VERSIONS = {
     "quality-policy-schema": QUALITY_POLICY_SCHEMA,
     "coverage-policy-schema": COVERAGE_POLICY_SCHEMA,
     "coverage-shard-schema": COVERAGE_SHARD_SCHEMA,
+    "static-security-policy-schema": STATIC_SECURITY_POLICY_SCHEMA,
+    "static-security-fragment-schema": STATIC_SECURITY_FRAGMENT_SCHEMA,
+    "security-findings-schema": SECURITY_FINDINGS_SCHEMA,
 }
 MANIFEST_PATHS = {
     "aggregator-conformance-manifest": "release/evidence/aggregator-conformance-v1.json",
@@ -449,6 +461,7 @@ MANIFEST_PATHS = {
     "manifest-evidence-cases": "release/evidence/manifest-evidence-cases-v1.json",
     "quality-policy": "release/evidence/quality-policy-v1.json",
     "coverage-policy": "release/evidence/coverage-policy-v1.json",
+    "static-security-policy": "release/evidence/static-security-policy-v1.json",
 }
 SCHEMA_VALIDATION_FIXTURE_MANIFEST_PATH = "release/evidence/schema-validation-fixtures-v1.json"
 SCHEMA_VALIDATION_FIXTURE_PATHS = {
@@ -479,6 +492,13 @@ SCOPE_INPUT_PATHS = {
     "coverage-contract-tests": "tests/test_coverage_contract.py",
     "coverage-config": ".coveragerc",
     "coverage-shard-producer": "scripts/emit_coverage_shard.py",
+    "static-security-producer": "scripts/emit_static_security.py",
+    "security-exceptions": "release/evidence/security-exceptions-v1.json",
+    "security-exception-checker": "scripts/check_security_exceptions.py",
+    "secret-baseline": ".secrets.baseline",
+    "static-security-config-tests": "tests/test_config.py",
+    "static-security-path-tests": "tests/test_phase1_privfs_core.py",
+    "static-security-archive-tests": "tests/test_release_h0.py",
     "package-metadata": "pyproject.toml",
     "docs-parity-tests": "tests/test_docs_parity.py",
     "docs-policy-readme": "README.md",
@@ -555,6 +575,20 @@ _DOCS_POLICY_MATERIALS = (
 
 QUALITY_POLICY_PATH = "release/evidence/quality-policy-v1.json"
 COVERAGE_POLICY_PATH = "release/evidence/coverage-policy-v1.json"
+STATIC_SECURITY_POLICY_PATH = "release/evidence/static-security-policy-v1.json"
+_STATIC_SECURITY_JOB_ID = ".github/workflows/ci.yml#jobs.offline[python-version=3.12,shard=0]"
+_STATIC_SECURITY_CHECK_IDS = (
+    "bandit", "detect-secrets", "unsafe-api-inventory", "h0-properties",
+    "dependency-manifest",
+)
+_STATIC_SECURITY_BINDINGS = (
+    "static-security-policy", "static-security-policy-schema",
+    "static-security-fragment-schema", "security-findings-schema",
+    "security-exceptions", "security-exception-checker",
+    "static-security-producer", "secret-baseline",
+    "static-security-config-tests", "static-security-path-tests",
+    "static-security-archive-tests", "package-metadata",
+)
 _COVERAGE_CONFIG_PATH = ".coveragerc"
 _COVERAGE_CONFIG_BYTES = b"[run]\nbranch = True\nparallel = False\nrelative_files = True\nsource = src/quarry_recon\n"
 _COVERAGE_SOURCE_ROOT = "src/quarry_recon"
@@ -705,6 +739,137 @@ def read_coverage_shard(data: bytes) -> dict:
     if len(data) > 1024 * 1024:
         raise evidence.EvidenceError("coverage shard exceeds the one MiB artifact bound")
     return doc
+
+
+def read_static_security_policy(data: bytes) -> dict:
+    """Read the exact source, scan and H0 property roster for B-STATIC-SECURITY."""
+    doc = _object(_canonical_reader(data, "static security policy"), "static security policy", {
+        "ast_inventory", "bandit", "dependency_manifest", "detect_secrets",
+        "h0_property_tests", "release", "schema_version", "unsafe_apis",
+    })
+    if doc["schema_version"] != STATIC_SECURITY_POLICY_SCHEMA or doc["release"] != RELEASE:
+        raise evidence.EvidenceError("static security policy has unsupported identity")
+    bandit = _object(doc["bandit"], "static security Bandit policy", {
+        "confidence", "exceptions", "severity", "source_roster", "tool", "version",
+    })
+    if bandit != {**bandit, "tool": "bandit", "version": "1.9.4", "severity": "HIGH", "confidence": "HIGH", "source_roster": ["src"]}:
+        raise evidence.EvidenceError("static security Bandit policy is not frozen to HIGH/HIGH src")
+    for name, row, path in (("exceptions", bandit["exceptions"], "release/evidence/security-exceptions-v1.json"),
+                            ("baseline", _object(doc["detect_secrets"], "static security secret policy", {"baseline", "mode", "tool", "version"})["baseline"], ".secrets.baseline"),
+                            ("dependency", doc["dependency_manifest"], "pyproject.toml")):
+        item = _object(row, f"static security {name} binding", {"digest", "path"})
+        _digest(item["digest"], f"static security {name} digest")
+        if item["path"] != path:
+            raise evidence.EvidenceError("static security binding path is not frozen")
+    secrets = _object(doc["detect_secrets"], "static security secret policy", {"baseline", "mode", "tool", "version"})
+    if {key: secrets[key] for key in ("mode", "tool", "version")} != {"mode": "tracked-files", "tool": "detect-secrets", "version": "1.5.0"}:
+        raise evidence.EvidenceError("static security secret policy is not frozen to tracked detect-secrets")
+    if doc["unsafe_apis"] != ["subprocess.Popen", "subprocess.run", "yaml.load"]:
+        raise evidence.EvidenceError("static security unsafe API categories are not frozen")
+    inventory = _object(doc["ast_inventory"], "static security AST inventory", {"entries", "source_roster"})
+    if inventory["source_roster"] != ["src/quarry_recon"] or not inventory["entries"]:
+        raise evidence.EvidenceError("static security AST inventory source roster is not frozen")
+    entries = _array(inventory["entries"], "static security AST entries")
+    if entries != sorted(entries, key=lambda row: (row["path"], row["line"], row["api"])):
+        raise evidence.EvidenceError("static security AST inventory is not canonically ordered")
+    properties = _object(doc["h0_property_tests"], "static security H0 properties", {"nodes", "sources"})
+    if properties["sources"] != ["tests/test_config.py", "tests/test_phase1_privfs_core.py", "tests/test_release_h0.py"] or len(properties["nodes"]) != 3:
+        raise evidence.EvidenceError("static security H0 property roster is not frozen")
+    return doc
+
+
+def read_static_security_fragment(data: bytes) -> dict:
+    """Read one canonical, candidate-independent shard-0 security scan."""
+    doc = _object(_canonical_reader(data, "static security scan fragment"),
+                  "static security scan fragment", {
+        "artifact_type", "ast_inventory", "dependency_manifest",
+        "detect_secrets_baseline_digest", "findings", "h0_fragment_digest",
+        "h0_property_tests", "job_instance_id", "policy_digest", "release",
+        "scan_tools", "schema_version", "suppressions", "unsuppressed_findings",
+    })
+    if (doc["artifact_type"] != "security-scan-fragment" or
+            doc["schema_version"] != STATIC_SECURITY_FRAGMENT_SCHEMA or
+            doc["release"] != RELEASE or doc["job_instance_id"] != _STATIC_SECURITY_JOB_ID):
+        raise evidence.EvidenceError("static security scan fragment has unsupported identity")
+    for field in ("detect_secrets_baseline_digest", "h0_fragment_digest", "policy_digest"):
+        _digest(doc[field], f"static security scan {field}")
+    dependency = _object(doc["dependency_manifest"], "static security dependency manifest", {
+        "digest", "name", "path",
+    })
+    _digest(dependency["digest"], "static security dependency digest")
+    if dependency["name"] != "package-metadata" or dependency["path"] != "pyproject.toml":
+        raise evidence.EvidenceError("static security dependency binding is not frozen")
+    if doc["scan_tools"] != [
+        {"name": "bandit", "version": "1.9.4"},
+        {"name": "detect-secrets", "version": "1.5.0"},
+    ]:
+        raise evidence.EvidenceError("static security scan tool roster is not frozen")
+    properties = _object(doc["h0_property_tests"], "static security scan H0 properties", {
+        "nodes", "sources",
+    })
+    for field in ("nodes", "sources"):
+        values = _array(properties[field], f"static security scan H0 {field}")
+        if len(values) != 3 or len(set(values)) != 3 or any(type(value) is not str or not value for value in values):
+            raise evidence.EvidenceError("static security scan H0 property roster is invalid")
+
+    def findings(field: str, *, source: str) -> list:
+        rows = _array(doc[field], f"static security scan {field}")
+        parsed = []
+        for index, row in enumerate(rows):
+            item = _object(row, f"static security scan {field}[{index}]", {
+                "api", "id", "line", "path", "source",
+            })
+            _string(item["api"], f"static security scan {field} api")
+            _token(item["id"], f"static security scan {field} id")
+            if _integer(item["line"], f"static security scan {field} line") == 0:
+                raise evidence.EvidenceError("static security scan line must be positive")
+            _string(item["path"], f"static security scan {field} path")
+            if item["source"] != source:
+                raise evidence.EvidenceError("static security scan finding source is invalid")
+            parsed.append(item)
+        if parsed != sorted(parsed, key=lambda row: (row["path"], row["line"], row["api"]) if source == "ast" else (row["id"],)):
+            raise evidence.EvidenceError(f"static security scan {field} is not canonically ordered")
+        if len({row["id"] for row in parsed}) != len(parsed):
+            raise evidence.EvidenceError(f"static security scan {field} IDs are not unique")
+        return parsed
+
+    ast_inventory = findings("ast_inventory", source="ast")
+    if not ast_inventory:
+        raise evidence.EvidenceError("static security scan AST inventory is empty")
+    finding_rows = findings("findings", source="bandit")
+    suppressions = _array(doc["suppressions"], "static security scan suppressions")
+    for index, row in enumerate(suppressions):
+        item = _object(row, f"static security scan suppression[{index}]", {
+            "expires_before", "finding_id", "id", "owner", "rationale",
+        })
+        for field in ("expires_before", "finding_id", "id", "owner", "rationale"):
+            _string(item[field], f"static security scan suppression {field}")
+    if suppressions != sorted(suppressions, key=lambda row: row["id"]) or \
+            len({row["id"] for row in suppressions}) != len(suppressions):
+        raise evidence.EvidenceError("static security scan suppressions are not canonical and unique")
+    if _integer(doc["unsuppressed_findings"], "static security unsuppressed findings") != len(finding_rows):
+        raise evidence.EvidenceError("static security unsuppressed finding count does not reconcile")
+    return doc
+
+
+def _static_security_checks(fragment: Mapping[str, object]) -> list[dict]:
+    """Digest the five independently reviewed B-STATIC-SECURITY outcomes."""
+    facts = (
+        ("bandit", {
+            "findings": fragment["findings"],
+            "suppressions": fragment["suppressions"],
+            "tool": fragment["scan_tools"][0],
+        }),
+        ("detect-secrets", {
+            "baseline_digest": fragment["detect_secrets_baseline_digest"],
+            "tool": fragment["scan_tools"][1],
+        }),
+        ("unsafe-api-inventory", {"entries": fragment["ast_inventory"]}),
+        ("h0-properties", fragment["h0_property_tests"]),
+        ("dependency-manifest", fragment["dependency_manifest"]),
+    )
+    return [{"id": name, "result_digest": evidence.canonical_digest(fact), "status": "pass"}
+            for name, fact in facts]
 
 _MANIFEST_TEST_SOURCES = (
     "manifest-run-contract-tests",
@@ -4883,6 +5048,126 @@ def _semantic_coverage(
         raise evidence.EvidenceError("coverage gate-evidence measurements do not match the recomputed report")
 
 
+def _semantic_static_security(
+    gate: dict, bodies: Mapping[str, bytes], **context: object,
+) -> None:
+    """Reconcile one candidate-bound security report with its shard-0 raw scan."""
+    identity, report, scope, thresholds, resolver, inputs = (
+        context["identity"], context["report"], context["scope"], context["thresholds"],
+        context["resolver"], context["input_bodies"],
+    )
+    if (not all(isinstance(value, dict) for value in (identity, report, scope, thresholds)) or
+            not isinstance(resolver, ArtifactResolver) or not isinstance(inputs, Mapping)):
+        raise evidence.EvidenceError("static security verifier requires accepted release context")
+    signed = {item["name"]: item for item in gate["artifacts"]}
+    for name in ("security-findings", "security-scan-fragment"):
+        if name not in bodies or signed.get(name, {}).get("digest") != raw_sha256(bodies[name]):
+            raise evidence.EvidenceError("static security artifact does not match its exact signed digest")
+    policy_body = inputs.get("static-security-policy")
+    if type(policy_body) is not bytes:
+        raise evidence.EvidenceError("static security policy source is absent")
+    policy = read_static_security_policy(policy_body)
+    exceptions_body = inputs.get("security-exceptions")
+    if type(exceptions_body) is not bytes or raw_sha256(exceptions_body) != policy["bandit"]["exceptions"]["digest"]:
+        raise evidence.EvidenceError("static security exceptions are absent or drifted")
+    exceptions = _object(
+        evidence.load_json_bytes(exceptions_body, maximum=_DOCUMENT_BYTES),
+        "security exceptions", {"exceptions", "policy", "schema_version"},
+    )
+    if exceptions["schema_version"] != "quarry.security-exceptions.v1":
+        raise evidence.EvidenceError("static security exception schema is unsupported")
+    doc = _object(_artifact_document(bodies["security-findings"], "B-STATIC-SECURITY", "security-findings"), "security findings", {
+        "artifact_type", "ast_inventory", "bindings", "candidate_identity_digest", "dependency_manifest",
+        "detect_secrets_baseline_digest", "environment", "evidence_finished_at", "evidence_instance_id",
+        "evidence_started_at", "findings", "gate_id", "h0_fragment_digest", "h0_property_tests", "checks", "selection",
+        "job_instance_id", "name", "policy_digest", "release", "scan_fragment_digest", "schema_version",
+        "suppressions", "toolchain", "unsuppressed_findings",
+    })
+    if {key: doc[key] for key in ("artifact_type", "candidate_identity_digest", "gate_id", "name", "release", "schema_version")} != {
+        "artifact_type": "security-findings", "candidate_identity_digest": evidence.canonical_digest(identity),
+        "gate_id": "B-STATIC-SECURITY", "name": "security-findings", "release": RELEASE,
+        "schema_version": SECURITY_FINDINGS_SCHEMA,
+    }:
+        raise evidence.EvidenceError("security findings have the wrong candidate, gate or release")
+    instances = report["instances"]
+    if len(instances) != 1 or instances[0]["lane"] != "H0-hermetic" or instances[0]["environment"]["python"].rsplit(".", 1)[0] != "3.12":
+        raise evidence.EvidenceError("security findings require one exact Python 3.12 H0 instance")
+    instance = instances[0]
+    if any(doc[field] != instance[key] for field, key in (("evidence_instance_id", "id"), ("environment", "environment"), ("evidence_started_at", "started_at"), ("evidence_finished_at", "finished_at"))) or doc["toolchain"] != instance["toolchain"]:
+        raise evidence.EvidenceError("security findings do not bind the exact signed H0 instance/toolchain")
+    expected_selection = {"collected": 5, "deselected": 0, "failed": 0, "passed": 5, "selected": 5, "skipped": 0, "xfailed": 0, "xpassed": 0}
+    if doc["selection"] != expected_selection or instance["selection"] != expected_selection or gate["selection"] != expected_selection:
+        raise evidence.EvidenceError("security findings checks and signed selection do not reconcile")
+    checks = _array(doc["checks"], "security findings checks")
+    if [row.get("id") if type(row) is dict else None for row in checks] != list(_STATIC_SECURITY_CHECK_IDS) or any(_object(row, "security check", {"id", "result_digest", "status"})["status"] != "pass" for row in checks):
+        raise evidence.EvidenceError("security findings check roster is not the exact five-check outcome set")
+    tool_names = {row["name"]: row for row in instance["toolchain"]}
+    if set(tool_names) != {"bandit", "detect-secrets", "pytest"} or tool_names["bandit"]["version"] != "1.9.4" or tool_names["detect-secrets"]["version"] != "1.5.0":
+        raise evidence.EvidenceError("security findings toolchain is not the frozen scan/test roster")
+    by_name = {row["name"]: row for row in scope["input_bindings"]}
+    expected_bindings = []
+    for name in _STATIC_SECURITY_BINDINGS:
+        row, body = by_name.get(name), inputs.get(name)
+        if row is None or type(body) is not bytes or raw_sha256(body) != row["digest"]:
+            raise evidence.EvidenceError("static security source input is absent or drifted")
+        expected_bindings.append({"digest": row["digest"], "name": name, "path": row["path"]})
+    if doc["bindings"] != expected_bindings or doc["policy_digest"] != raw_sha256(policy_body):
+        raise evidence.EvidenceError("security findings do not bind the exact frozen source/config policy")
+    if doc["dependency_manifest"] != expected_bindings[-1] or doc["detect_secrets_baseline_digest"] != policy["detect_secrets"]["baseline"]["digest"]:
+        raise evidence.EvidenceError("security findings dependency or secrets baseline binding is not exact")
+    fragment = read_static_security_fragment(bodies["security-scan-fragment"])
+    if (doc["scan_fragment_digest"] != raw_sha256(bodies["security-scan-fragment"]) or
+            fragment["artifact_type"] != "security-scan-fragment"):
+        raise evidence.EvidenceError("security findings do not bind the canonical raw scan fragment")
+    for field in ("ast_inventory", "dependency_manifest", "detect_secrets_baseline_digest", "findings", "h0_fragment_digest", "h0_property_tests", "job_instance_id", "policy_digest", "release", "suppressions", "unsuppressed_findings"):
+        if doc[field] != fragment[field]:
+            raise evidence.EvidenceError("security findings do not reproduce the exact raw scan facts")
+    if (fragment["scan_tools"] != [{"name": "bandit", "version": "1.9.4"}, {"name": "detect-secrets", "version": "1.5.0"}] or
+            doc["dependency_manifest"] != {"digest": policy["dependency_manifest"]["digest"], "name": "package-metadata", "path": "pyproject.toml"} or
+            doc["h0_property_tests"] != policy["h0_property_tests"]):
+        raise evidence.EvidenceError("security findings do not bind the frozen dependency/property policy")
+    if checks != _static_security_checks(fragment):
+        raise evidence.EvidenceError("security findings check digests do not recompute from retained facts")
+    h0 = _artifact_document(resolver.read("B-HERMETIC-ALL", "test-report"), "B-HERMETIC-ALL", "test-report")
+    run = next((row for row in h0["runs"] if row["environment"]["python"].rsplit(".", 1)[0] == "3.12"), None)
+    if (doc["job_instance_id"] != _STATIC_SECURITY_JOB_ID or run is None or run["evidence_instance_id"] != instance["id"] or
+            next((row["digest"] for row in run["fragments"] if row["job_instance_id"] == _STATIC_SECURITY_JOB_ID), None) != doc["h0_fragment_digest"]):
+        raise evidence.EvidenceError("security findings do not bind the exact shard-0 H0 fragment")
+    taxonomy = evidence.read_pytest_taxonomy(resolver.read("A-TAXONOMY", "classification-manifest"))
+    h0_nodes = set(next(row["nodes"] for row in taxonomy["lanes"] if row["lane"] == "H0-hermetic"))
+    if not set(policy["h0_property_tests"]["nodes"]).issubset(h0_nodes):
+        raise evidence.EvidenceError("security property node roster is absent from the signed H0 taxonomy")
+    expected_ast = [{**row, "source": "ast"} for row in policy["ast_inventory"]["entries"]]
+    if doc["ast_inventory"] != expected_ast or doc["findings"] != sorted(doc["findings"], key=lambda row: row["id"]) or doc["unsuppressed_findings"] != len(doc["findings"]):
+        raise evidence.EvidenceError("security findings do not canonically recompute AST/unsuppressed facts")
+    release_tuple = tuple(int(value) for value in policy["release"].split("."))
+    expected_suppressions = []
+    for row in exceptions["exceptions"]:
+        expiry = tuple(int(value) for value in row["expires_before"].split("."))
+        if release_tuple >= expiry:
+            raise evidence.EvidenceError("security suppression is expired for the candidate release")
+        key = (row["path"], row["line"], row["test_id"])
+        stable = hashlib.sha256("\0".join(map(str, key)).encode()).hexdigest()[:20]
+        expected_suppressions.append({"expires_before": row["expires_before"], "finding_id": "bandit-" + stable, "id": "security-suppression-" + stable, "owner": row["owner"], "rationale": row["rationale"]})
+    if doc["suppressions"] != sorted(expected_suppressions, key=lambda row: row["id"]):
+        raise evidence.EvidenceError("security suppressions do not exactly reconcile reviewed IDs, owner, rationale and expiry")
+    rows = [row for row in thresholds["thresholds"] if row["gate_id"] == "B-STATIC-SECURITY"]
+    expected_threshold = ("B-STATIC-SECURITY", "absolute", "unsuppressed_findings", "at_most", "maximum", "count")
+    if [tuple(row[key] for key in ("gate_id", "class", "metric", "operator", "statistic", "unit")) for row in rows] != [expected_threshold]:
+        raise evidence.EvidenceError("static security threshold metric contract is not frozen")
+    threshold = rows[0]
+    breached = threshold["limit"] is not None and doc["unsuppressed_findings"] > threshold["limit"]
+    if breached:
+        raise evidence.EvidenceError("security findings contain an accepted-threshold breach")
+    expected_measurements = [{
+        "baseline_digest": threshold["baseline_digest"], "class": threshold["class"],
+        "invalidated_trials": 0, "metric": "unsuppressed_findings", "observed_trials": 1,
+        "statistic": "maximum", "unit": "count", "value": doc["unsuppressed_findings"],
+    }]
+    if report["measurements"] != expected_measurements:
+        raise evidence.EvidenceError("static security gate-evidence measurements do not match recomputed findings")
+
+
 def _semantic_manifest(
     gate: dict, bodies: Mapping[str, bytes], **context: object,
 ) -> None:
@@ -5514,6 +5799,7 @@ SEMANTIC_VERIFIERS = MappingProxyType({
     "B-MANIFEST": _semantic_manifest,
     "B-QUALITY": _semantic_quality,
     "B-COVERAGE": _semantic_coverage,
+    "B-STATIC-SECURITY": _semantic_static_security,
     "C-PACKAGE-BUILD": _semantic_package_build,
     "C-NETWORK-BOUNDARY": _semantic_network_boundary,
     "C-NET-DENY": _semantic_network_denial,
