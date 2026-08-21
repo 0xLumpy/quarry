@@ -250,6 +250,34 @@ def _copy_regular(source: Path, destination: Path, expected: dict, *, mode: int 
     return _file_record("launch-copy", destination)
 
 
+def _copy_adjacent_python_library(source_root: Path, interpreter_link: Path,
+                                  interpreter: Path, destination: Path,
+                                  rows: list[dict]) -> None:
+    """Preserve a venv interpreter's adjacent libpython dependency when it exists."""
+    version = interpreter.name.removeprefix("python").split(".")
+    if len(version) != 2 or not all(part.isdigit() for part in version):
+        return
+    library_name = f"libpython{version[0]}.{version[1]}.so.1.0"
+    try:
+        library = (interpreter.parent.parent / "lib" / library_name).resolve(strict=True)
+    except OSError:
+        return
+    if not library.is_file():
+        return
+    venv_root = interpreter_link.parent.parent
+    target = destination.parent.parent / "lib" / library_name
+    target_relative = venv_root.relative_to(source_root) / "lib" / library_name
+    receipt_row = next((row for row in rows if row.get("path") == target_relative.as_posix()), None)
+    library_record = _file_record("python-runtime-library", library)
+    if receipt_row is not None:
+        if (receipt_row.get("kind"), receipt_row.get("sha256"), receipt_row.get("bytes")) != (
+                "file", library_record["sha256"], library_record["bytes"]):
+            raise RuntimeIdentityError("managed Python runtime library conflicts with its receipt")
+        return
+    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _copy_regular(library, target, library_record, mode=library_record["mode"])
+
+
 def _copy_receipt_payload(source_root: Path, receipt: dict, launch_root: Path,
                           index: int) -> tuple[Path, dict]:
     """Materialize a complete receipt closure below the private per-launch authority."""
@@ -310,6 +338,9 @@ def _copy_receipt_payload(source_root: Path, receipt: dict, launch_root: Path,
                         )
                     _copy_regular(
                         expected_resolved, destination, external, mode=external["mode"],
+                    )
+                    _copy_adjacent_python_library(
+                        source_root, source, expected_resolved, destination, rows,
                     )
                 else:
                     try:
