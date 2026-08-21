@@ -12,6 +12,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import signal
 import threading
 import time
 from contextlib import nullcontext

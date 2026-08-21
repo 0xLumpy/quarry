@@ -737,8 +737,9 @@ def _open_contact(ctx, host, contact, req, timeout, *, insecure=False,
         # Unmanaged/programmatic compatibility remains on the legacy opener.
         # Production CLI runs bind a NetworkPolicyScope before phase work and
         # therefore cannot reach this branch.
-        opener = _INSECURE_OPENER if insecure else _NO_REDIRECT_OPENER
-        return _open_no_follow(req, timeout, opener)
+        if insecure is not False:
+            raise ValueError("native HTTPS certificate verification cannot be disabled")
+        return _open_no_follow(req, timeout, _NO_REDIRECT_OPENER)
     if (type(contact) is not netguard.ContactState or contact[0] != "contact"
             or not contact.approved):
         raise PermissionError("native transport has no exact approved peer set")
