@@ -1247,6 +1247,32 @@ _FAULT_H0_MATRIX_CONTRACTS = MappingProxyType({
         ("fault-campaign-settlement-tests", "manifest-campaign-tests"),
     ),
 })
+
+# The mixed-lane runner matrix is already part of the frozen case manifest.
+# These path partitions mirror the repository's pytest lane taxonomy without
+# introducing a second node roster: every node still comes from CASES.
+_FAULT_RUNNER_H0_PATHS = frozenset({
+    "tests/test_runner_preflight.py",
+    "tests/test_runner_protocol_parent_validation.py",
+    "tests/test_runner_repository_composition.py",
+    "tests/test_runner_stream_engine.py",
+})
+_FAULT_RUNNER_H1_PATHS = frozenset({
+    "tests/test_qr39_001_runner_streaming.py",
+    "tests/test_runner_cancel.py",
+    "tests/test_runner_stderr.py",
+})
+_FAULT_RUNNER_NODEIDS = tuple(
+    nodeid for case in fault_runner_evidence.CASES for nodeid in case["nodeids"]
+)
+_FAULT_RUNNER_H0_NODEIDS = tuple(
+    nodeid for nodeid in _FAULT_RUNNER_NODEIDS
+    if nodeid.split("::", 1)[0] in _FAULT_RUNNER_H0_PATHS
+)
+_FAULT_RUNNER_H1_NODEIDS = tuple(
+    nodeid for nodeid in _FAULT_RUNNER_NODEIDS
+    if nodeid.split("::", 1)[0] in _FAULT_RUNNER_H1_PATHS
+)
 # This is the owner subset for B-MANIFEST's semantic authority.  Candidate
 # identity still binds the full source closure; projections and durability have
 # different gate owners and are intentionally not duplicated here.
@@ -6997,6 +7023,128 @@ def _semantic_fault_h0_matrix(
     )
 
 
+def _semantic_fault_runner(
+    gate: dict, bodies: Mapping[str, bytes], **context: object,
+) -> None:
+    """Reconcile the frozen mixed runner matrix with retained H0 and signed H1."""
+    identity = context["identity"]
+    report = context["report"]
+    resolver = context["resolver"]
+    scope = context["scope"]
+    inputs = context["input_bodies"]
+    if (gate["gate_id"] != "C-FAULT-RUNNER" or not isinstance(identity, dict) or
+            not isinstance(report, dict) or not isinstance(resolver, ArtifactResolver) or
+            not isinstance(scope, dict) or not isinstance(inputs, Mapping)):
+        raise evidence.EvidenceError(
+            "fault-runner verifier requires accepted aggregate context"
+        )
+
+    scope_bindings = {row["name"]: row for row in scope["input_bindings"]}
+    bound_inputs: dict[str, bytes] = {}
+    for name, path in fault_runner_evidence.INPUT_PATHS.items():
+        binding = scope_bindings.get(name)
+        body = inputs.get(name)
+        if (binding is None or binding["path"] != path or type(body) is not bytes or
+                raw_sha256(body) != binding["digest"]):
+            raise evidence.EvidenceError(
+                "fault-runner source input is absent, redirected or drifted"
+            )
+        bound_inputs[name] = body
+    try:
+        fault_runner_evidence.read_case_manifest(
+            bound_inputs["fault-runner-case-manifest"]
+        )
+    except fault_runner_evidence.FaultRunnerEvidenceError as exc:
+        raise evidence.EvidenceError(str(exc)) from exc
+
+    if (len(_FAULT_RUNNER_NODEIDS) != fault_runner_evidence.NODE_COUNT or
+            len(set(_FAULT_RUNNER_NODEIDS)) != len(_FAULT_RUNNER_NODEIDS) or
+            set(_FAULT_RUNNER_NODEIDS) !=
+            set(_FAULT_RUNNER_H0_NODEIDS) | set(_FAULT_RUNNER_H1_NODEIDS) or
+            set(_FAULT_RUNNER_H0_NODEIDS) & set(_FAULT_RUNNER_H1_NODEIDS)):
+        raise evidence.EvidenceError("fault-runner frozen lane partition is inconsistent")
+    h0_nodes = set(_FAULT_RUNNER_H0_NODEIDS)
+    h1_nodes = set(_FAULT_RUNNER_H1_NODEIDS)
+    for case in fault_runner_evidence.CASES:
+        observed_lanes = []
+        case_nodes = set(case["nodeids"])
+        if case_nodes & h0_nodes:
+            observed_lanes.append("H0-hermetic")
+        if case_nodes & h1_nodes:
+            observed_lanes.append("H1-tool-integration")
+        if observed_lanes != case["required_lanes"]:
+            raise evidence.EvidenceError(
+                "fault-runner case lane partition differs from the frozen manifest"
+            )
+
+    matrix_body = bodies.get("fault-matrix")
+    matrix_record = next(
+        (row for row in gate["artifacts"] if row["name"] == "fault-matrix"), None,
+    )
+    if (type(matrix_body) is not bytes or matrix_record is None or
+            matrix_record["media_type"] != "application/json" or
+            matrix_record["digest"] != raw_sha256(matrix_body)):
+        raise evidence.EvidenceError(
+            "fault-runner matrix does not match its signed gate record"
+        )
+    expected_matrix = _machine_report_document(
+        gate_id="C-FAULT-RUNNER",
+        name="fault-matrix",
+        identity=identity,
+        subjects=_FAULT_RUNNER_NODEIDS,
+    )
+    if _artifact_document(matrix_body, "C-FAULT-RUNNER", "fault-matrix") != expected_matrix:
+        raise evidence.EvidenceError(
+            "C-FAULT-RUNNER fault matrix is not the exact frozen mixed-lane roster"
+        )
+
+    instances = report["instances"]
+    if [row["lane"] for row in instances] != [
+        "H0-hermetic", "H1-tool-integration",
+    ]:
+        raise evidence.EvidenceError(
+            "fault-runner evidence requires one exact signed H0 and H1 instance"
+        )
+    h0, h1 = instances
+
+    def selection(count: int) -> dict[str, int]:
+        return {
+            "collected": count,
+            "deselected": 0,
+            "failed": 0,
+            "passed": count,
+            "selected": count,
+            "skipped": 0,
+            "xfailed": 0,
+            "xpassed": 0,
+        }
+
+    expected_h0 = selection(len(_FAULT_RUNNER_H0_NODEIDS))
+    expected_h1 = selection(len(_FAULT_RUNNER_H1_NODEIDS))
+    expected_total = {
+        key: expected_h0[key] + expected_h1[key] for key in expected_h0
+    }
+    if (h0["selection"] != expected_h0 or h1["selection"] != expected_h1 or
+            gate["selection"] != expected_total):
+        raise evidence.EvidenceError(
+            "fault-runner signed records do not select the exact H0/H1 partition"
+        )
+    expected_owner = [{
+        "digest": raw_sha256(matrix_body), "name": "fault-matrix",
+    }]
+    if h0["artifacts"] or h1["artifacts"] != expected_owner:
+        raise evidence.EvidenceError(
+            "fault-runner matrix is not owned by the exact signed H1 instance"
+        )
+    _reconcile_h0_node_subset(
+        resolver=resolver,
+        identity=identity,
+        instance=h0,
+        nodeids=_FAULT_RUNNER_H0_NODEIDS,
+        label="fault-runner",
+    )
+
+
 def _semantic_manifest(
     gate: dict, bodies: Mapping[str, bytes], **context: object,
 ) -> None:
@@ -7802,6 +7950,7 @@ SEMANTIC_VERIFIERS = MappingProxyType({
     "C-FAULT-REVISION": _semantic_fault_revision,
     "C-FAULT-FINALIZE": _semantic_fault_h0_matrix,
     "C-FAULT-CAMPAIGN": _semantic_fault_h0_matrix,
+    "C-FAULT-RUNNER": _semantic_fault_runner,
     "C-PACKAGE-BUILD": _semantic_package_build,
     "C-PYTHON-MATRIX": _semantic_python_matrix,
     "C-NETWORK-BOUNDARY": _semantic_network_boundary,

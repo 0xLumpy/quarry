@@ -321,8 +321,11 @@ the required H0 and H1 lanes.  Its candidate-labeled companion is source plan
 only: every case is `not_executed`, every outcome digest is null, and all
 signing, lane-isolation, ownership, interval and toolchain claims are false.
 Local execution is a development check, not release evidence.
-`C-FAULT-RUNNER` stays `OPEN` until accepted signed H0 and H1 instances own and
-reconcile the exact outcomes without changing the frozen plan.
+The obligation verifier reuses the 32 exact H0 nodes from the already validated
+`B-HERMETIC-ALL` run and requires one signed H1 instance to own the 26 remaining
+nodes in one exact 58-row machine matrix.  The source plan itself remains
+non-promoting.  `C-FAULT-RUNNER` stays `OPEN` until accepted signed H0 and H1
+instances own and reconcile those outcomes without changing the frozen plan.
 
 The committed `C-FAULT-STORE` v1 case manifest freezes nine production
 boundaries and 60 exact pytest node IDs.  Its candidate-labeled companion is a

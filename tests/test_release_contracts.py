@@ -367,6 +367,7 @@ def _h0_collection_nodes() -> list[str]:
     nodes.extend(contracts._FAULT_REVISION_NODEIDS)
     nodes.extend(contracts._FAULT_FINALIZE_NODEIDS)
     nodes.extend(contracts._FAULT_CAMPAIGN_NODEIDS)
+    nodes.extend(contracts._FAULT_RUNNER_H0_NODEIDS)
     return sorted(set(nodes), key=lambda value: value.encode("utf-8"))
 
 
@@ -538,6 +539,15 @@ def _supporting_bodies(
                 gate_id=gate_id,
                 identity=identity,
                 nodeids=nodeids,
+            )
+        )
+    elif gate_id == "C-FAULT-RUNNER":
+        bodies["fault-matrix"] = contracts.canonical_json_line(
+            contracts._machine_report_document(
+                gate_id=gate_id,
+                name="fault-matrix",
+                identity=identity,
+                subjects=contracts._FAULT_RUNNER_NODEIDS,
             )
         )
     elif gate_id == "B-SCHEMA":
@@ -1934,6 +1944,17 @@ def _scenario(tmp_path: Path, *, approved_at: str = "2026-08-01T00:00:00Z"):
                         "passed": count, "selected": count, "skipped": 0,
                         "xfailed": 0, "xpassed": 0,
                     }
+                if gate_id == "C-FAULT-RUNNER":
+                    count = len(
+                        contracts._FAULT_RUNNER_H0_NODEIDS
+                        if environment["lane"] == "H0-hermetic"
+                        else contracts._FAULT_RUNNER_H1_NODEIDS
+                    )
+                    selection = {
+                        "collected": count, "deselected": 0, "failed": 0,
+                        "passed": count, "selected": count, "skipped": 0,
+                        "xfailed": 0, "xpassed": 0,
+                    }
                 if gate_id == "B-DOCS-POLICY":
                     selection = {
                         "collected": len(contracts._DOCS_POLICY_TEST_ROSTER), "deselected": 0,
@@ -2072,6 +2093,11 @@ def _scenario(tmp_path: Path, *, approved_at: str = "2026-08-01T00:00:00Z"):
                     key: artifact[key] for key in ("digest", "media_type", "name")
                 })
                 target_instance = instances[0]
+                if gate_id == "C-FAULT-RUNNER":
+                    target_instance = next(
+                        instance for instance in instances
+                        if instance["lane"] == "H1-tool-integration"
+                    )
                 if gate_id in {"C-SBOM", "C-VULNERABILITY"} and (
                         artifact_name.startswith("sbom-observation-") or artifact_name.startswith("vulnerability-observation-")):
                     minor = artifact_name.rsplit("-", 1)[1]
@@ -2138,6 +2164,11 @@ def _scenario(tmp_path: Path, *, approved_at: str = "2026-08-01T00:00:00Z"):
             "C-FAULT-STORE", "C-FAULT-REVISION", *contracts._FAULT_H0_MATRIX_CONTRACTS,
         }:
             selection = copy.deepcopy(instances[0]["selection"])
+        if gate_id == "C-FAULT-RUNNER":
+            selection = {
+                name: sum(instance["selection"][name] for instance in instances)
+                for name in selection
+            }
         if gate_id == "C-CORPUS-SYNTHETIC":
             selection = copy.deepcopy(instances[0]["selection"])
         rule = None
@@ -2761,7 +2792,7 @@ class TestIncompleteSemanticRegistry:
             | {
                 "A-IDENTITY", "A-EVIDENCE-SCHEMA", "A-TAXONOMY", "A-CORPUS", "A-THRESHOLDS", "A-SUPPORT",
                 "B-HERMETIC-ALL", "B-SCHEMA", "B-DOCS-POLICY", "B-MANIFEST", "B-QUALITY", "B-COVERAGE", "B-STATIC-SECURITY", "B-DETERMINISM",
-                "C-PACKAGE-BUILD", "C-PACKAGE-INSTALL", "C-PYTHON-MATRIX", "C-SBOM", "C-VULNERABILITY", "C-PROVENANCE", "C-SOURCE-REGISTRY", "C-CORPUS-SYNTHETIC", "C-PATH-IDENTITY", "C-FAULT-STORE", "C-FAULT-REVISION", "C-FAULT-FINALIZE", "C-FAULT-CAMPAIGN", "C-NETWORK-BOUNDARY", "C-NET-DENY",
+                "C-PACKAGE-BUILD", "C-PACKAGE-INSTALL", "C-PYTHON-MATRIX", "C-SBOM", "C-VULNERABILITY", "C-PROVENANCE", "C-SOURCE-REGISTRY", "C-CORPUS-SYNTHETIC", "C-PATH-IDENTITY", "C-FAULT-STORE", "C-FAULT-REVISION", "C-FAULT-FINALIZE", "C-FAULT-CAMPAIGN", "C-FAULT-RUNNER", "C-NETWORK-BOUNDARY", "C-NET-DENY",
                 "E-DOCS", "E-PROJECT-HYGIENE", "E-ARTIFACTS",
                 *contracts.V310_05_SEMANTIC_GATES,
             }
@@ -2963,6 +2994,71 @@ class TestFaultStoreSemanticEvidence:
         arguments, gate, bodies, report = self._case(tmp_path / "environment")
         report["instances"][0]["environment"]["python"] = "3.11.99"
         with pytest.raises(evidence.EvidenceError, match="one validated H0 run"):
+            self._verify(arguments, gate, bodies, report)
+
+
+class TestFaultRunnerSemanticEvidence:
+    @staticmethod
+    def _case(tmp_path):
+        arguments = _scenario(tmp_path)
+        gate = _gate(arguments, "C-FAULT-RUNNER")
+        indexed = {
+            row["name"]: row for row in arguments["artifact_index"]["artifacts"]
+            if row["gate_id"] == "C-FAULT-RUNNER"
+        }
+        bodies = {
+            "fault-matrix": (
+                arguments["artifact_root"] / indexed["fault-matrix"]["path"]
+            ).read_bytes(),
+        }
+        report = contracts.read_evidence_report(
+            (arguments["artifact_root"] / indexed["gate-evidence"]["path"]).read_bytes(),
+            identity=arguments["identity"],
+            gate_id="C-FAULT-RUNNER",
+        )
+        return arguments, gate, bodies, report
+
+    @staticmethod
+    def _verify(arguments, gate, bodies, report):
+        with contracts.ArtifactResolver(
+            arguments["artifact_root"], arguments["artifact_index"],
+            identity=arguments["identity"],
+        ) as resolver:
+            contracts._semantic_fault_runner(
+                gate,
+                bodies,
+                identity=arguments["identity"],
+                input_bodies=arguments["input_bodies"],
+                report=report,
+                resolver=resolver,
+                scope=arguments["scope"],
+            )
+
+    def test_exact_mixed_lane_matrix_reuses_h0_and_owns_h1(self, tmp_path):
+        arguments, gate, bodies, report = self._case(tmp_path)
+        self._verify(arguments, gate, bodies, report)
+
+    def test_node_or_lane_partition_substitution_fails(self, tmp_path):
+        arguments, gate, bodies, report = self._case(tmp_path / "node")
+        document = json.loads(bodies["fault-matrix"])
+        document["records"][-1]["result"]["subject"] = (
+            "tests/substituted.py::test_case"
+        )
+        document["records"][-1]["result_digest"] = evidence.canonical_digest(
+            document["records"][-1]["result"]
+        )
+        bodies["fault-matrix"] = contracts.canonical_json_line(document)
+        digest = contracts.raw_sha256(bodies["fault-matrix"])
+        next(row for row in gate["artifacts"] if row["name"] == "fault-matrix")[
+            "digest"
+        ] = digest
+        report["instances"][1]["artifacts"][0]["digest"] = digest
+        with pytest.raises(evidence.EvidenceError, match="exact frozen mixed-lane roster"):
+            self._verify(arguments, gate, bodies, report)
+
+        arguments, gate, bodies, report = self._case(tmp_path / "lane")
+        report["instances"][1]["selection"]["selected"] -= 1
+        with pytest.raises(evidence.EvidenceError, match="exact H0/H1 partition"):
             self._verify(arguments, gate, bodies, report)
 
 
