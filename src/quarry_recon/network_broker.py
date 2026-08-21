@@ -359,6 +359,7 @@ _SECCOMP_RET_ALLOW = 0x7FFF0000
 _AUDIT_ARCH_X86_64 = 0xC000003E
 _AUDIT_ARCH_AARCH64 = 0xC00000B7
 _X32_SYSCALL_BIT = 0x40000000
+_PIDFD_OPEN_SYSCALL = 434
 _KCMP_FILE = 0
 _KCMP_FILES = 2
 _SO_PROTOCOL = 38
@@ -947,6 +948,24 @@ def _syscall(library, number: int, *args) -> int:
     return int(result)
 
 
+def _open_pidfd(pid: int) -> int:
+    """Open a pidfd on supported Linux builds even when CPython omits the wrapper."""
+    opener = getattr(os, "pidfd_open", None)
+    if opener is not None:
+        return opener(pid, 0)
+    _architecture()
+    return _syscall(_libc(), _PIDFD_OPEN_SYSCALL, pid, 0)
+
+
+def _send_pidfd_signal(pidfd: int, signum: int) -> None:
+    """Signal through a pidfd with the same supported-kernel fallback."""
+    sender = getattr(signal, "pidfd_send_signal", None)
+    if sender is not None:
+        sender(pidfd, signum)
+        return
+    _syscall(_libc(), _architecture().pidfd_send_signal, pidfd, signum, 0, 0)
+
+
 def install_listener(*, profile: str = "standard") -> int:
     """Install the fixed inherited filter in the calling launcher."""
     architecture = _architecture()
@@ -1288,7 +1307,7 @@ def _require_eof_until(fd: int, *, deadline_monotonic: float,
 def _abort_direct_child(child_pid: int, child_pidfd: int,
                         *, deadline_monotonic: float) -> None:
     try:
-        signal.pidfd_send_signal(child_pidfd, signal.SIGKILL)
+        _send_pidfd_signal(child_pidfd, signal.SIGKILL)
     except (AttributeError, ProcessLookupError):
         pass
     except OSError as exc:
@@ -1407,7 +1426,7 @@ def duplicate_reported_listener(
             or deadline_monotonic <= time.monotonic()):
         raise NetworkBrokerRefused("network_broker_handoff_identity_invalid")
     try:
-        pidfd = os.pidfd_open(child_pid, 0)
+        pidfd = _open_pidfd(child_pid)
     except (AttributeError, OSError) as exc:
         raise NetworkBrokerRefused("network_broker_pidfd_open_failed") from exc
     listener = -1
@@ -1641,7 +1660,7 @@ def _thread_group_number(tid: int, *, validate) -> int:
 def _thread_group_pidfd(tid: int, *, validate) -> int:
     tgid = _thread_group_number(tid, validate=validate)
     try:
-        pidfd = os.pidfd_open(tgid, 0)
+        pidfd = _open_pidfd(tgid)
     except (AttributeError, OSError) as exc:
         raise NetworkBrokerRefused("network_broker_pidfd_open_failed") from exc
     try:
@@ -3999,7 +4018,7 @@ class NetworkBrokerSession:
             if control.owner_tgid == os.getpid():
                 owner_duplicate = os.dup(control.owner_fd)
             else:
-                pidfd = os.pidfd_open(control.owner_tgid, 0)
+                pidfd = _open_pidfd(control.owner_tgid)
                 try:
                     owner_duplicate = _pidfd_getfd(pidfd, control.owner_fd)
                 finally:
@@ -4056,7 +4075,7 @@ class NetworkBrokerSession:
             if control.owner_tgid == os.getpid():
                 owner_duplicate = os.dup(control.owner_fd)
             else:
-                pidfd = os.pidfd_open(control.owner_tgid, 0)
+                pidfd = _open_pidfd(control.owner_tgid)
                 try:
                     owner_duplicate = _pidfd_getfd(pidfd, control.owner_fd)
                 finally:

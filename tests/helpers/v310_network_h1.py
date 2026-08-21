@@ -607,11 +607,11 @@ def _wait(pid: int, deadline: float) -> int:
 
 def _pidfd_kill(pid: int) -> None:
     try:
-        pidfd = os.pidfd_open(pid, 0)
+        pidfd = network_broker._open_pidfd(pid)
     except OSError:
         return
     try:
-        signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+        network_broker._send_pidfd_signal(pidfd, signal.SIGKILL)
     except ProcessLookupError:
         pass
     finally:

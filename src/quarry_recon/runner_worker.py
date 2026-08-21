@@ -62,6 +62,8 @@ from .network_broker import (
     NetworkBrokerRefused,
     NetworkBrokerSession,
     NetworkEffectFence,
+    _open_pidfd,
+    _send_pidfd_signal,
     acquire_worker_subreaper,
     acknowledge_listener,
     attest_exec_fds,
@@ -1727,7 +1729,7 @@ def _configure_network_broker(
                 launcher._browser_pid = browser_pid
                 _verify_browser_descendant(browser_pid, launcher.pid)
                 launcher._browser_preexec_identity_verified = True
-                launcher._browser_pidfd = os.pidfd_open(browser_pid, 0)
+                launcher._browser_pidfd = _open_pidfd(browser_pid)
                 browser_handoff = duplicate_reported_listener(
                     browser_pid, launcher._browser_report_read,
                     expected_profile="browser", deadline_monotonic=float(deadline),
@@ -2056,14 +2058,14 @@ def _kill_browser_authority(launcher, state: dict) -> None:
         state["browser_killed"] = True
         return
     try:
-        signal.pidfd_send_signal(browser_pidfd, 0)
+        _send_pidfd_signal(browser_pidfd, 0)
     except ProcessLookupError:
         pass
     else:
         try:
             os.killpg(browser_pid, signal.SIGKILL)
         except ProcessLookupError:
-            signal.pidfd_send_signal(browser_pidfd, signal.SIGKILL)
+            _send_pidfd_signal(browser_pidfd, signal.SIGKILL)
     state["browser_killed"] = True
     # Commit retirement before close: cancellation may make close ambiguous,
     # but no retry may ever target a subsequently reused numeric descriptor.
@@ -2121,8 +2123,8 @@ def _kill_and_reap_adopted_children(deadline: float) -> tuple[tuple[int, int], .
         for value in values:
             pidfd = -1
             try:
-                pidfd = os.pidfd_open(int(value), 0)
-                signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+                pidfd = _open_pidfd(int(value))
+                _send_pidfd_signal(pidfd, signal.SIGKILL)
             except ProcessLookupError:
                 pass
             finally:
@@ -2164,8 +2166,8 @@ def _kill_adopted_browser_descendants(browser_session, deadline: float) -> None:
         for value in values:
             pidfd = -1
             try:
-                pidfd = os.pidfd_open(int(value), 0)
-                signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+                pidfd = _open_pidfd(int(value))
+                _send_pidfd_signal(pidfd, signal.SIGKILL)
             except ProcessLookupError:
                 pass
             finally:
