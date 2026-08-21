@@ -40,7 +40,7 @@ Quarry is under active development. Commands, schemas, and report formats may st
 Run Quarry on a VPS. Reconnaissance runs can be long, and high-volume DNS traffic may be throttled
 or blocked on residential connections.
 
-Python 3.10+, `sudo` for system packages, and outbound internet access.
+Python 3.10–3.12, `sudo` for system packages, and outbound internet access.
 
 | | Minimum | Recommended |
 |---|---|---|

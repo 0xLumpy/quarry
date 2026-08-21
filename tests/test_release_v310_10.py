@@ -94,8 +94,8 @@ def test_pull_request_ci_selects_every_public_nonlive_lane_separately():
             expected_actions.append(UPLOAD_ARTIFACT)
         assert actions == expected_actions
         assert job["timeout-minutes"] <= 45
-    assert jobs["offline"]["strategy"]["matrix"]["python-version"] == ["3.10", "3.12"]
-    assert jobs["package"]["strategy"]["matrix"]["python-version"] == ["3.10", "3.12"]
+    assert jobs["offline"]["strategy"]["matrix"]["python-version"] == ["3.10", "3.11", "3.12"]
+    assert jobs["package"]["strategy"]["matrix"]["python-version"] == ["3.10", "3.11", "3.12"]
     package_steps = jobs["package"]["steps"]
     build_index = next(
         index for index, step in enumerate(package_steps)

@@ -71,7 +71,7 @@ def test_wheel_carries_spdx_license_and_runtime_data():
         metadata_name = next(name for name in names if name.endswith(".dist-info/METADATA"))
         metadata = archive.read(metadata_name).decode("utf-8", "strict")
         assert "License-Expression: MIT\n" in metadata
-        assert "Requires-Python: >=3.10\n" in metadata
+        assert "Requires-Python: >=3.10,<3.13\n" in metadata
         assert any(name.endswith(".dist-info/licenses/LICENSE") for name in names)
         assert "quarry_recon/data/target.template.yaml" in names
         assert "quarry_recon/data/tools.yaml" in names

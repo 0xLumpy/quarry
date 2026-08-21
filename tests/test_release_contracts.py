@@ -973,6 +973,85 @@ def _supporting_bodies(
             "install_inventory_digest": contracts.raw_sha256(bodies["install-inventory"]),
             "schema_version": contracts.PACKAGE_INSTALL_SMOKE_SCHEMA,
         })
+    elif gate_id == "C-PYTHON-MATRIX":
+        bindings = {row["name"]: row["digest"] for row in scope["input_bindings"]}
+        h0_test_report = json.loads(emitted[("B-HERMETIC-ALL", "test-report")])
+        taxonomy = evidence.read_pytest_taxonomy(emitted[("A-TAXONOMY", "classification-manifest")])
+        h0_selection = {
+            "collected": taxonomy["selection"]["collected"],
+            "deselected": taxonomy["selection"]["deselected"],
+            "failed": 0,
+            "passed": taxonomy["selection"]["selected"],
+            "selected": taxonomy["selection"]["selected"],
+            "skipped": 0,
+            "xfailed": 0,
+            "xpassed": 0,
+        }
+        h0_runs = {
+            tuple(row["environment"][key] for key in (
+                "architecture", "isolation_profile", "os", "python", "runner_image",
+            )): row for row in h0_test_report["runs"]
+        }
+
+        def source_artifacts(source_gate, names):
+            return [{
+                "digest": next(row["digest"] for row in indexed
+                               if row["gate_id"] == source_gate and row["name"] == name),
+                "name": name,
+            } for name in names]
+
+        rows = []
+        for instance in evidence_instances:
+            environment = instance["environment"]
+            key = tuple(environment[field] for field in (
+                "architecture", "isolation_profile", "os", "python", "runner_image",
+            ))
+            row = {
+                "candidate_identity_digest": evidence.canonical_digest(identity),
+                "environment": environment,
+                "h0": None,
+                "lane": instance["lane"],
+                "p0": None,
+                "package_metadata_digest": bindings["package-metadata"],
+                "support_matrix_digest": bindings["support-matrix"],
+            }
+            if instance["lane"] == "H0-hermetic":
+                run = h0_runs[key]
+                row["h0"] = {
+                    "evidence_instance_id": run["evidence_instance_id"],
+                    "fragment_count": len(run["fragments"]),
+                    "full_h0_roster": run["fragments"][0]["report"]["full_h0_roster"],
+                    "selection": h0_selection,
+                    "test_report_digest": next(
+                        item["digest"] for item in indexed
+                        if item["gate_id"] == "B-HERMETIC-ALL" and item["name"] == "test-report"
+                    ),
+                }
+            else:
+                p0_index = sum(
+                    row["lane"] == "P0-package-supply" for row in rows
+                )
+                row["p0"] = {
+                    "build_artifacts": source_artifacts(
+                        "C-PACKAGE-BUILD", ("build-log", "package-inventory", "sdist", "wheel"),
+                    ),
+                    "build_evidence_instance_id": f"instance-{p0_index:02d}",
+                    "install_artifacts": source_artifacts(
+                        "C-PACKAGE-INSTALL", ("install-inventory", "smoke-results"),
+                    ),
+                    "install_evidence_instance_id": f"instance-{p0_index:02d}",
+                }
+            rows.append(row)
+        bodies["python-matrix-report"] = contracts.canonical_json_line({
+            "artifact_type": "python-matrix-report",
+            "candidate_identity_digest": evidence.canonical_digest(identity),
+            "gate_id": gate_id,
+            "package_metadata_digest": bindings["package-metadata"],
+            "release": "0.3.10",
+            "rows": rows,
+            "schema_version": contracts.PYTHON_MATRIX_REPORT_SCHEMA,
+            "support_matrix_digest": bindings["support-matrix"],
+        })
     elif gate_id == "C-NETWORK-BOUNDARY":
         bodies["network-boundary-trace"] = _network_boundary_body(identity, support)
     elif gate_id == "C-NET-DENY":
@@ -1481,6 +1560,11 @@ def _scenario(tmp_path: Path, *, approved_at: str = "2026-08-01T00:00:00Z"):
                     environment for environment in supported_environments
                     if environment["lane"] == "H0-hermetic"
                 ]
+            elif gate_id in {"C-PACKAGE-BUILD", "C-PACKAGE-INSTALL"}:
+                instance_specs = [
+                    environment for environment in supported_environments
+                    if environment["lane"] == "P0-package-supply"
+                ]
             elif gate_id == "C-PYTHON-MATRIX":
                 instance_specs = [
                     environment for environment in supported_environments
@@ -1546,12 +1630,20 @@ def _scenario(tmp_path: Path, *, approved_at: str = "2026-08-01T00:00:00Z"):
                 if gate_id == "B-STATIC-SECURITY":
                     selection = {"collected": 5, "deselected": 0, "failed": 0, "passed": 5,
                                  "selected": 5, "skipped": 0, "xfailed": 0, "xpassed": 0}
+                instance_id = f"instance-{instance_index:02d}"
+                if gate_id in {"B-COVERAGE", "B-STATIC-SECURITY"}:
+                    h0_index = next(
+                        index for index, candidate in enumerate(
+                            row for row in supported_environments if row["lane"] == "H0-hermetic"
+                        ) if candidate["python"] == environment["python"]
+                    )
+                    instance_id = f"instance-{h0_index:02d}"
                 instances.append({
                     "artifacts": [],
                     "assertions": [assertion],
                     "environment": instance_environment,
                     "finished_at": instance_finished_at,
-                    "id": "instance-01" if gate_id in {"B-COVERAGE", "B-STATIC-SECURITY"} else f"instance-{instance_index:02d}",
+                    "id": instance_id,
                     "lane": environment["lane"],
                     "selection": selection,
                     "started_at": gate_started_at,
@@ -2043,7 +2135,7 @@ class TestCommittedContracts:
             "checkout_on_sys_path"
         ] == {"const": False}
         h0_runs = schema["$defs"]["h0_test_report"]["properties"]["runs"]
-        assert h0_runs["minItems"] == h0_runs["maxItems"] == 2
+        assert h0_runs["minItems"] == h0_runs["maxItems"] == 3
         h0_fragments = schema["$defs"]["h0_run"]["properties"]["fragments"]
         assert h0_fragments["minItems"] == h0_fragments["maxItems"] == 6
         assert schema["$defs"]["h0_fragment"]["properties"]["report"] == {
@@ -2067,7 +2159,7 @@ class TestCommittedContracts:
         isolation_instances = schema["$defs"]["h0_isolation_self_test"][
             "properties"
         ]["instances"]
-        assert isolation_instances["minItems"] == isolation_instances["maxItems"] == 2
+        assert isolation_instances["minItems"] == isolation_instances["maxItems"] == 3
         attempts = schema["$defs"]["h0_isolation_instance"]["properties"]["attempts"]
         assert attempts["items"] is False
         assert attempts["minItems"] == attempts["maxItems"] == 5
@@ -2257,7 +2349,7 @@ class TestIncompleteSemanticRegistry:
             | {
                 "A-IDENTITY", "A-EVIDENCE-SCHEMA", "A-TAXONOMY", "A-CORPUS", "A-THRESHOLDS", "A-SUPPORT",
                 "B-HERMETIC-ALL", "B-SCHEMA", "B-DOCS-POLICY", "B-MANIFEST", "B-QUALITY", "B-COVERAGE", "B-STATIC-SECURITY", "B-DETERMINISM",
-                "C-PACKAGE-BUILD", "C-PACKAGE-INSTALL", "C-NETWORK-BOUNDARY", "C-NET-DENY",
+                "C-PACKAGE-BUILD", "C-PACKAGE-INSTALL", "C-PYTHON-MATRIX", "C-NETWORK-BOUNDARY", "C-NET-DENY",
                 *contracts.V310_05_SEMANTIC_GATES,
             }
         )
@@ -2265,7 +2357,7 @@ class TestIncompleteSemanticRegistry:
         arguments = _scenario(tmp_path)
         with pytest.raises(
             evidence.EvidenceError,
-            match="C-PYTHON-MATRIX has no registered obligation-specific semantic verifier",
+            match="C-SBOM has no registered obligation-specific semantic verifier",
         ):
             contracts.aggregate_records(**arguments)
 
@@ -2615,7 +2707,7 @@ class TestH0HermeticSemanticEvidence:
         offline["instances"].pop()
         context["input_bodies"] = dict(context["input_bodies"])
         context["input_bodies"]["verification-job-map"] = contracts.canonical_json_line(job_map)
-        with pytest.raises(evidence.EvidenceError, match="2x6 offline matrix"):
+        with pytest.raises(evidence.EvidenceError, match="3x6 offline matrix"):
             contracts._semantic_h0_hermetic_all(gate, bodies, **context)
 
     @pytest.mark.parametrize(
@@ -2708,6 +2800,69 @@ class TestPackageInstallSemanticEvidence:
                     record["digest"] = contracts.raw_sha256(bodies[artifact])
         with pytest.raises(evidence.EvidenceError, match=match):
             self._verify(arguments, gate, bodies, report)
+
+
+class TestPythonMatrixSemanticEvidence:
+    @staticmethod
+    def _case(tmp_path):
+        arguments = _scenario(tmp_path)
+        gate = _gate(arguments, "C-PYTHON-MATRIX")
+        index = next(
+            row for row in arguments["artifact_index"]["artifacts"]
+            if row["gate_id"] == "C-PYTHON-MATRIX" and row["name"] == "python-matrix-report"
+        )
+        return arguments, gate, {"python-matrix-report": (arguments["artifact_root"] / index["path"]).read_bytes()}
+
+    @staticmethod
+    def _verify(arguments, gate, bodies):
+        with contracts.ArtifactResolver(
+            arguments["artifact_root"], arguments["artifact_index"], identity=arguments["identity"],
+        ) as resolver:
+            contracts._semantic_python_matrix(
+                gate, bodies, identity=arguments["identity"], scope=arguments["scope"],
+                support=arguments["support_matrix"], resolver=resolver,
+                input_bodies=arguments["input_bodies"],
+            )
+
+    def test_exact_candidate_bound_matrix_reconciles_retained_h0_and_p0_evidence(self, tmp_path):
+        arguments, gate, bodies = self._case(tmp_path)
+        self._verify(arguments, gate, bodies)
+
+    @pytest.mark.parametrize(
+        ("mutate", "match"),
+        [
+            (lambda doc: doc["rows"].pop(), "cardinality"),
+            (lambda doc: doc["rows"].append(copy.deepcopy(doc["rows"][0])), "cardinality"),
+            (lambda doc: doc["rows"][0]["environment"].update(python="3.11.9"), "sorted one-to-one"),
+            (lambda doc: doc["rows"][0]["h0"].update(test_report_digest=_digest("f")), "validated test run"),
+            (lambda doc: doc["rows"][-1]["p0"].update(build_evidence_instance_id="forged-instance"), "exact source"),
+            (lambda doc: doc["rows"][-1]["p0"]["install_artifacts"][0].update(digest=_digest("e")), "exact source"),
+        ],
+    )
+    def test_matrix_forgery_fails_closed(self, tmp_path, mutate, match):
+        arguments, gate, bodies = self._case(tmp_path)
+        document = json.loads(bodies["python-matrix-report"])
+        mutate(document)
+        bodies["python-matrix-report"] = contracts.canonical_json_line(document)
+        with pytest.raises(evidence.EvidenceError, match=match):
+            self._verify(arguments, gate, bodies)
+
+    def test_matrix_refuses_a_source_gate_missing_the_second_p0_environment(self, tmp_path):
+        arguments, gate, bodies = self._case(tmp_path)
+        _rewrite_report(
+            arguments, "C-PACKAGE-INSTALL", lambda report, _gate: report["instances"].pop(),
+        )
+        with pytest.raises(evidence.EvidenceError, match="every accepted P0 environment"):
+            self._verify(arguments, gate, bodies)
+
+    def test_matrix_refuses_bound_metadata_outside_the_reviewed_minor_range(self, tmp_path):
+        arguments, gate, bodies = self._case(tmp_path)
+        arguments["input_bodies"] = dict(arguments["input_bodies"])
+        arguments["input_bodies"]["package-metadata"] = arguments["input_bodies"][
+            "package-metadata"
+        ].replace(b'requires-python = ">=3.10,<3.13"', b'requires-python = ">=3.10"')
+        with pytest.raises(evidence.EvidenceError, match="exact published requires-python policy"):
+            self._verify(arguments, gate, bodies)
 
 
 class TestArtifactsAndAggregation:

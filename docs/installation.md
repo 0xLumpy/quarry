@@ -3,7 +3,7 @@
 Quarry runs on Linux (Debian/Kali/Ubuntu-family tested). It installs a Python CLI plus ~25 Go and
 Python tools, DNS resolvers, wordlists, and Nuclei templates. Chromium is needed for screenshots.
 
-**Prerequisites:** Git, Python 3.10+, outbound internet, and root or a working `sudo` (system packages
+**Prerequisites:** Git, Python 3.10–3.12, outbound internet, and root or a working `sudo` (system packages
 are installed during the build).
 
 ## Full install (blank host)

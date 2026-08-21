@@ -1,0 +1,72 @@
+{
+  "$id": "urn:quarry:schema:python-matrix-report:v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "artifact_type": {"const": "python-matrix-report"},
+    "candidate_identity_digest": {"$ref": "#/$defs/digest"},
+    "gate_id": {"const": "C-PYTHON-MATRIX"},
+    "package_metadata_digest": {"$ref": "#/$defs/digest"},
+    "release": {"const": "0.3.10"},
+    "rows": {"items": {"$ref": "#/$defs/row"}, "maxItems": 6, "minItems": 6, "type": "array", "uniqueItems": true},
+    "schema_version": {"const": "quarry.python-matrix-report.v1"},
+    "support_matrix_digest": {"$ref": "#/$defs/digest"}
+  },
+  "required": ["artifact_type", "candidate_identity_digest", "gate_id", "package_metadata_digest", "release", "rows", "schema_version", "support_matrix_digest"],
+  "title": "Quarry C-PYTHON-MATRIX candidate-bound report v1",
+  "type": "object",
+  "$defs": {
+    "artifact": {
+      "additionalProperties": false,
+      "properties": {"digest": {"$ref": "#/$defs/digest"}, "name": {"type": "string"}},
+      "required": ["digest", "name"],
+      "type": "object"
+    },
+    "digest": {"pattern": "^sha256:[0-9a-f]{64}$", "type": "string"},
+    "environment": {
+      "additionalProperties": false,
+      "properties": {"architecture": {"minLength": 1, "type": "string"}, "isolation_profile": {"$ref": "#/$defs/digest"}, "os": {"minLength": 1, "type": "string"}, "python": {"minLength": 1, "type": "string"}, "runner_image": {"$ref": "#/$defs/digest"}},
+      "required": ["architecture", "isolation_profile", "os", "python", "runner_image"],
+      "type": "object"
+    },
+    "h0": {
+      "additionalProperties": false,
+      "properties": {"evidence_instance_id": {"$ref": "#/$defs/token"}, "fragment_count": {"const": 6}, "full_h0_roster": {"$ref": "#/$defs/roster"}, "selection": {"$ref": "#/$defs/selection"}, "test_report_digest": {"$ref": "#/$defs/digest"}},
+      "required": ["evidence_instance_id", "fragment_count", "full_h0_roster", "selection", "test_report_digest"],
+      "type": "object"
+    },
+    "h0_row": {
+      "additionalProperties": false,
+      "properties": {"candidate_identity_digest": {"$ref": "#/$defs/digest"}, "environment": {"$ref": "#/$defs/environment"}, "h0": {"$ref": "#/$defs/h0"}, "lane": {"const": "H0-hermetic"}, "p0": {"type": "null"}, "package_metadata_digest": {"$ref": "#/$defs/digest"}, "support_matrix_digest": {"$ref": "#/$defs/digest"}},
+      "required": ["candidate_identity_digest", "environment", "h0", "lane", "p0", "package_metadata_digest", "support_matrix_digest"],
+      "type": "object"
+    },
+    "p0": {
+      "additionalProperties": false,
+      "properties": {"build_artifacts": {"items": false, "prefixItems": [{"allOf": [{"$ref": "#/$defs/artifact"}, {"properties": {"name": {"const": "build-log"}}, "required": ["name"]}]}, {"allOf": [{"$ref": "#/$defs/artifact"}, {"properties": {"name": {"const": "package-inventory"}}, "required": ["name"]}]}, {"allOf": [{"$ref": "#/$defs/artifact"}, {"properties": {"name": {"const": "sdist"}}, "required": ["name"]}]}, {"allOf": [{"$ref": "#/$defs/artifact"}, {"properties": {"name": {"const": "wheel"}}, "required": ["name"]}]}], "maxItems": 4, "minItems": 4, "type": "array"}, "build_evidence_instance_id": {"$ref": "#/$defs/token"}, "install_artifacts": {"items": false, "prefixItems": [{"allOf": [{"$ref": "#/$defs/artifact"}, {"properties": {"name": {"const": "install-inventory"}}, "required": ["name"]}]}, {"allOf": [{"$ref": "#/$defs/artifact"}, {"properties": {"name": {"const": "smoke-results"}}, "required": ["name"]}]}], "maxItems": 2, "minItems": 2, "type": "array"}, "install_evidence_instance_id": {"$ref": "#/$defs/token"}},
+      "required": ["build_artifacts", "build_evidence_instance_id", "install_artifacts", "install_evidence_instance_id"],
+      "type": "object"
+    },
+    "p0_row": {
+      "additionalProperties": false,
+      "properties": {"candidate_identity_digest": {"$ref": "#/$defs/digest"}, "environment": {"$ref": "#/$defs/environment"}, "h0": {"type": "null"}, "lane": {"const": "P0-package-supply"}, "p0": {"$ref": "#/$defs/p0"}, "package_metadata_digest": {"$ref": "#/$defs/digest"}, "support_matrix_digest": {"$ref": "#/$defs/digest"}},
+      "required": ["candidate_identity_digest", "environment", "h0", "lane", "p0", "package_metadata_digest", "support_matrix_digest"],
+      "type": "object"
+    },
+    "roster": {
+      "additionalProperties": false,
+      "properties": {"count": {"maximum": 9223372036854775807, "minimum": 1, "type": "integer"}, "digest": {"$ref": "#/$defs/digest"}},
+      "required": ["count", "digest"],
+      "type": "object"
+    },
+    "row": {"oneOf": [{"$ref": "#/$defs/h0_row"}, {"$ref": "#/$defs/p0_row"}]},
+    "selection": {
+      "additionalProperties": false,
+      "properties": {"collected": {"$ref": "#/$defs/count"}, "deselected": {"$ref": "#/$defs/count"}, "failed": {"$ref": "#/$defs/count"}, "passed": {"$ref": "#/$defs/count"}, "selected": {"$ref": "#/$defs/count"}, "skipped": {"$ref": "#/$defs/count"}, "xfailed": {"$ref": "#/$defs/count"}, "xpassed": {"$ref": "#/$defs/count"}},
+      "required": ["collected", "deselected", "failed", "passed", "selected", "skipped", "xfailed", "xpassed"],
+      "type": "object"
+    },
+    "count": {"maximum": 9223372036854775807, "minimum": 0, "type": "integer"},
+    "token": {"pattern": "^[A-Za-z0-9][A-Za-z0-9._+-]*$", "type": "string"}
+  }
+}

@@ -655,7 +655,7 @@ class TestCommittedWorkflowParity:
         )
         assert mapped_offline["lane"] == "H0-hermetic"
         assert mapped_offline["capabilities"] == []
-        assert offline["strategy"]["matrix"]["python-version"] == ["3.10", "3.12"]
+        assert offline["strategy"]["matrix"]["python-version"] == ["3.10", "3.11", "3.12"]
         assert offline["strategy"]["matrix"]["shard"] == ["0", "1", "2", "3", "4", "5"]
         setup = next(
             step for step in offline["steps"]

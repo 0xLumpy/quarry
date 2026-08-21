@@ -236,7 +236,7 @@
     },
     "h0_isolation_self_test": {
       "additionalProperties": false,
-      "properties": {"artifact_type": {"const": "h0-isolation-self-test"}, "candidate_identity_digest": {"$ref": "#/$defs/digest"}, "gate_id": {"const": "B-HERMETIC-ALL"}, "instances": {"items": {"$ref": "#/$defs/h0_isolation_instance"}, "maxItems": 2, "minItems": 2, "type": "array"}, "name": {"const": "isolation-self-test"}, "release": {"const": "0.3.10"}, "schema_version": {"const": "quarry.gate-artifact.v1"}},
+      "properties": {"artifact_type": {"const": "h0-isolation-self-test"}, "candidate_identity_digest": {"$ref": "#/$defs/digest"}, "gate_id": {"const": "B-HERMETIC-ALL"}, "instances": {"items": {"$ref": "#/$defs/h0_isolation_instance"}, "maxItems": 3, "minItems": 3, "type": "array"}, "name": {"const": "isolation-self-test"}, "release": {"const": "0.3.10"}, "schema_version": {"const": "quarry.gate-artifact.v1"}},
       "required": ["artifact_type", "candidate_identity_digest", "gate_id", "instances", "name", "release", "schema_version"],
       "type": "object"
     },
@@ -278,7 +278,7 @@
     },
     "h0_test_report": {
       "additionalProperties": false,
-      "properties": {"artifact_type": {"const": "h0-test-report"}, "candidate_identity_digest": {"$ref": "#/$defs/digest"}, "collection_manifest_digest": {"$ref": "#/$defs/digest"}, "gate_id": {"const": "B-HERMETIC-ALL"}, "name": {"const": "test-report"}, "release": {"const": "0.3.10"}, "runs": {"items": {"$ref": "#/$defs/h0_run"}, "maxItems": 2, "minItems": 2, "type": "array"}, "schema_version": {"const": "quarry.gate-artifact.v1"}},
+      "properties": {"artifact_type": {"const": "h0-test-report"}, "candidate_identity_digest": {"$ref": "#/$defs/digest"}, "collection_manifest_digest": {"$ref": "#/$defs/digest"}, "gate_id": {"const": "B-HERMETIC-ALL"}, "name": {"const": "test-report"}, "release": {"const": "0.3.10"}, "runs": {"items": {"$ref": "#/$defs/h0_run"}, "maxItems": 3, "minItems": 3, "type": "array"}, "schema_version": {"const": "quarry.gate-artifact.v1"}},
       "required": ["artifact_type", "candidate_identity_digest", "collection_manifest_digest", "gate_id", "name", "release", "runs", "schema_version"],
       "type": "object"
     },

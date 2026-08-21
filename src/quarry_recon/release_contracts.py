@@ -67,6 +67,7 @@ SECURITY_FINDINGS_SCHEMA = "quarry.security-findings.v1"
 DETERMINISM_FIXTURE_SCHEMA = "quarry.determinism-fixture.v1"
 DETERMINISM_FRAGMENT_SCHEMA = "quarry.determinism-tree-diff-fragment.v1"
 ARTIFACT_TREE_DIFF_SCHEMA = "quarry.artifact-tree-diff.v1"
+PYTHON_MATRIX_REPORT_SCHEMA = "quarry.python-matrix-report.v1"
 
 RELEASE = evidence.RELEASE_SCOPE
 LANE_ORDER = (
@@ -437,6 +438,7 @@ SCHEMA_PATHS = {
     "determinism-fixture-schema": "release/evidence/schemas/determinism-fixture-v1.schema.json",
     "determinism-fragment-schema": "release/evidence/schemas/determinism-tree-diff-fragment-v1.schema.json",
     "artifact-tree-diff-schema": "release/evidence/schemas/artifact-tree-diff-v1.schema.json",
+    "python-matrix-report-schema": "release/evidence/schemas/python-matrix-report-v1.schema.json",
 }
 SCHEMA_VERSIONS = {
     "aggregate-schema": AGGREGATE_SCHEMA,
@@ -465,6 +467,7 @@ SCHEMA_VERSIONS = {
     "determinism-fixture-schema": DETERMINISM_FIXTURE_SCHEMA,
     "determinism-fragment-schema": DETERMINISM_FRAGMENT_SCHEMA,
     "artifact-tree-diff-schema": ARTIFACT_TREE_DIFF_SCHEMA,
+    "python-matrix-report-schema": PYTHON_MATRIX_REPORT_SCHEMA,
 }
 MANIFEST_PATHS = {
     "aggregator-conformance-manifest": "release/evidence/aggregator-conformance-v1.json",
@@ -2773,6 +2776,111 @@ def _artifact_document(body: bytes, gate_id: str, name: str) -> dict:
     if type(value) is not dict:
         raise evidence.EvidenceError(f"supporting artifact {gate_id}/{name} must be an object")
     return value
+
+
+_PYTHON_MATRIX_LANES = ("H0-hermetic", "P0-package-supply")
+_PYTHON_MATRIX_SELECTION_FIELDS = (
+    "collected", "deselected", "failed", "passed", "selected", "skipped", "xfailed", "xpassed",
+)
+
+
+def _matrix_environment(value: object, name: str) -> dict:
+    environment = _object(value, name, {
+        "architecture", "isolation_profile", "os", "python", "runner_image",
+    })
+    for field in ("architecture", "os", "python"):
+        _string(environment[field], f"{name}.{field}")
+    for field in ("isolation_profile", "runner_image"):
+        _digest(environment[field], f"{name}.{field}")
+    return environment
+
+
+def validate_python_matrix_report(document: object, *, identity: object) -> dict:
+    """Read the candidate-bound C-PYTHON-MATRIX report before cross-gate reconciliation."""
+    identity_doc = evidence.validate_candidate_identity(identity)
+    doc = _object(document, "python matrix report", {
+        "artifact_type", "candidate_identity_digest", "gate_id", "package_metadata_digest",
+        "release", "rows", "schema_version", "support_matrix_digest",
+    })
+    _schema(doc, PYTHON_MATRIX_REPORT_SCHEMA, "python matrix report")
+    if (doc["artifact_type"] != "python-matrix-report" or doc["gate_id"] != "C-PYTHON-MATRIX" or
+            doc["candidate_identity_digest"] != evidence.canonical_digest(identity_doc)):
+        raise evidence.EvidenceError("python matrix report is bound to the wrong candidate or gate")
+    for field in ("package_metadata_digest", "support_matrix_digest"):
+        _digest(doc[field], f"python matrix report.{field}")
+    rows = _array(doc["rows"], "python matrix report.rows")
+    if len(rows) != 6:
+        raise evidence.EvidenceError("python matrix report has the wrong frozen support-row cardinality")
+    parsed = []
+    for index, record in enumerate(rows):
+        row = _object(record, f"python matrix report.rows[{index}]", {
+            "candidate_identity_digest", "environment", "h0", "lane", "p0",
+            "package_metadata_digest", "support_matrix_digest",
+        })
+        if row["lane"] not in _PYTHON_MATRIX_LANES:
+            raise evidence.EvidenceError("python matrix report has an unsupported lane")
+        environment = _matrix_environment(row["environment"], f"python matrix report.rows[{index}].environment")
+        if (row["candidate_identity_digest"] != doc["candidate_identity_digest"] or
+                row["support_matrix_digest"] != doc["support_matrix_digest"] or
+                row["package_metadata_digest"] != doc["package_metadata_digest"]):
+            raise evidence.EvidenceError("python matrix row redirects a report-level candidate or scope binding")
+        if row["lane"] == "H0-hermetic":
+            if row["p0"] is not None:
+                raise evidence.EvidenceError("H0 python matrix row contains P0 evidence")
+            h0 = _object(row["h0"], f"python matrix report.rows[{index}].h0", {
+                "evidence_instance_id", "fragment_count", "full_h0_roster", "selection",
+                "test_report_digest",
+            })
+            _token(h0["evidence_instance_id"], "python matrix H0 evidence instance")
+            if _integer(h0["fragment_count"], "python matrix H0 fragment count") != 6:
+                raise evidence.EvidenceError("python matrix H0 fragment count must be exactly six")
+            roster = _object(h0["full_h0_roster"], "python matrix H0 full roster", {"count", "digest"})
+            if _integer(roster["count"], "python matrix H0 roster count") == 0:
+                raise evidence.EvidenceError("python matrix H0 roster is empty")
+            _digest(roster["digest"], "python matrix H0 roster digest")
+            selection = _object(h0["selection"], "python matrix H0 selection", _PYTHON_MATRIX_SELECTION_FIELDS)
+            for field in _PYTHON_MATRIX_SELECTION_FIELDS:
+                _integer(selection[field], f"python matrix H0 selection.{field}")
+            _digest(h0["test_report_digest"], "python matrix H0 test report digest")
+        else:
+            if row["h0"] is not None:
+                raise evidence.EvidenceError("P0 python matrix row contains H0 evidence")
+            p0 = _object(row["p0"], f"python matrix report.rows[{index}].p0", {
+                "build_artifacts", "build_evidence_instance_id", "install_artifacts",
+                "install_evidence_instance_id",
+            })
+            for field in ("build_evidence_instance_id", "install_evidence_instance_id"):
+                _token(p0[field], f"python matrix P0 {field}")
+            for field, expected_names in (
+                ("build_artifacts", ("build-log", "package-inventory", "sdist", "wheel")),
+                ("install_artifacts", ("install-inventory", "smoke-results")),
+            ):
+                artifacts = _array(p0[field], f"python matrix P0 {field}")
+                observed = []
+                for artifact_index, artifact in enumerate(artifacts):
+                    item = _object(artifact, f"python matrix P0 {field}[{artifact_index}]", {"digest", "name"})
+                    _digest(item["digest"], f"python matrix P0 {field} digest")
+                    observed.append(item["name"])
+                if tuple(observed) != expected_names:
+                    raise evidence.EvidenceError("python matrix P0 source artifact roster is not exact and sorted")
+        parsed.append(row)
+    sort_key = lambda row: (
+        LANE_ORDER.index(row["lane"]), row["environment"]["os"], row["environment"]["architecture"],
+        row["environment"]["python"], row["environment"]["runner_image"], row["environment"]["isolation_profile"],
+    )
+    if parsed != sorted(parsed, key=sort_key) or len({
+        (row["lane"], *(row["environment"][field] for field in (
+            "architecture", "isolation_profile", "os", "python", "runner_image",
+        ))) for row in parsed
+    }) != len(parsed):
+        raise evidence.EvidenceError("python matrix rows are not sorted one-to-one support environments")
+    return doc
+
+
+def read_python_matrix_report(data: bytes, *, identity: object) -> dict:
+    return validate_python_matrix_report(
+        _canonical_reader(data, "python matrix report"), identity=identity,
+    )
 
 
 def _validate_generic_supporting_artifact(
@@ -5578,12 +5686,12 @@ def _semantic_h0_hermetic_all(
         topology.append((matrix["python-version"], matrix["shard"]))
         topology_ids[(matrix["python-version"], int(matrix["shard"]))] = instance["id"]
     expected_topology = [
-        (python, str(shard)) for python in ("3.10", "3.12") for shard in range(6)
+        (python, str(shard)) for python in ("3.10", "3.11", "3.12") for shard in range(6)
     ]
     if topology != expected_topology:
-        raise evidence.EvidenceError("H0 runner topology is not the frozen 2x6 offline matrix")
+        raise evidence.EvidenceError("H0 runner topology is not the frozen 3x6 offline matrix")
     if [environment["python"].rsplit(".", 1)[0] for environment in expected_environments] != \
-            ["3.10", "3.12"]:
+            ["3.10", "3.11", "3.12"]:
         raise evidence.EvidenceError("H0 support environments do not match the frozen runner matrix")
 
     test_report = _h0_artifact(
@@ -5748,6 +5856,171 @@ def _semantic_h0_hermetic_all(
             raise evidence.EvidenceError(
                 "B-HERMETIC-ALL gate evidence counts do not match logical H0 collection counts"
             )
+
+
+def _matrix_source_report(
+    resolver: ArtifactResolver, *, gate_id: str, identity: dict,
+) -> dict:
+    """Rehash and parse a prior gate's retained, signed-artifact report.
+
+    Aggregate order validates and signature-checks B-HERMETIC-ALL and both P0
+    source gates before C-PYTHON-MATRIX.  This second read is deliberately a
+    narrow cross-gate reconciliation, not a new gate-record authority path.
+    """
+    record = resolver.record(gate_id, "gate-evidence")
+    body = resolver.read(gate_id, "gate-evidence")
+    if record["digest"] != raw_sha256(body):
+        raise evidence.EvidenceError("python matrix source gate-evidence bytes do not match their index")
+    return read_evidence_report(body, identity=identity, gate_id=gate_id)
+
+
+def _matrix_source_artifacts(
+    resolver: ArtifactResolver, *, gate_id: str, names: tuple[str, ...],
+) -> list[dict]:
+    artifacts = []
+    for name in names:
+        record = resolver.record(gate_id, name)
+        body = resolver.read(gate_id, name)
+        if record["digest"] != raw_sha256(body) or record["size"] != len(body):
+            raise evidence.EvidenceError("python matrix source artifact bytes do not match their index")
+        artifacts.append({"digest": record["digest"], "name": name})
+    return artifacts
+
+
+def _semantic_python_matrix(
+    gate: dict, bodies: Mapping[str, bytes], **context: object,
+) -> None:
+    """Bind each accepted H0/P0 environment to retained source-gate evidence."""
+    identity = context["identity"]
+    scope = context["scope"]
+    support = context["support"]
+    resolver = context["resolver"]
+    if not isinstance(identity, dict) or not isinstance(scope, dict) or not isinstance(support, dict) or \
+            not isinstance(resolver, ArtifactResolver):
+        raise evidence.EvidenceError("python matrix verifier requires accepted aggregate context")
+    report = read_python_matrix_report(bodies["python-matrix-report"], identity=identity)
+    bindings = {row["name"]: row["digest"] for row in scope["input_bindings"]}
+    if report["support_matrix_digest"] != bindings.get("support-matrix") or \
+            report["package_metadata_digest"] != bindings.get("package-metadata"):
+        raise evidence.EvidenceError("python matrix report does not bind accepted support/package scope bytes")
+    inputs = context["input_bodies"]
+    if not isinstance(inputs, Mapping) or type(inputs.get("package-metadata")) is not bytes:
+        raise evidence.EvidenceError("python matrix verifier requires bound package metadata bytes")
+    if evidence._toml is None:  # pragma: no cover - dependency contract is separately tested
+        raise evidence.EvidenceError("python matrix verifier has no TOML parser")
+    try:
+        package_metadata = evidence._toml.loads(inputs["package-metadata"].decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, TypeError) as exc:
+        raise evidence.EvidenceError("python matrix package metadata is not parseable TOML") from exc
+    project = package_metadata.get("project") if type(package_metadata) is dict else None
+    if type(project) is not dict or project.get("requires-python") != ">=3.10,<3.13":
+        raise evidence.EvidenceError(
+            "python matrix support topology does not match exact published requires-python policy"
+        )
+
+    expected = [row for row in support["environments"] if row["lane"] in _PYTHON_MATRIX_LANES]
+    if len(expected) != 6:
+        raise evidence.EvidenceError("python matrix support topology is no longer the frozen six-row contract")
+    expected_rows = [{"lane": row["lane"], "environment": _h0_environment(row)} for row in expected]
+    if [{"lane": row["lane"], "environment": row["environment"]} for row in report["rows"]] != expected_rows:
+        raise evidence.EvidenceError("python matrix rows do not cover the exact sorted accepted H0/P0 topology")
+
+    h0_report = _matrix_source_report(resolver, gate_id="B-HERMETIC-ALL", identity=identity)
+    build_report = _matrix_source_report(resolver, gate_id="C-PACKAGE-BUILD", identity=identity)
+    install_report = _matrix_source_report(resolver, gate_id="C-PACKAGE-INSTALL", identity=identity)
+    h0_expected = [_h0_environment(row) for row in expected if row["lane"] == "H0-hermetic"]
+    p0_expected = [_h0_environment(row) for row in expected if row["lane"] == "P0-package-supply"]
+    if [row["environment"] for row in h0_report["instances"]] != h0_expected or \
+            any(row["lane"] != "H0-hermetic" for row in h0_report["instances"]):
+        raise evidence.EvidenceError("python matrix H0 source report does not cover every accepted H0 environment")
+    for source_name, source_report in (("build", build_report), ("install", install_report)):
+        if [row["environment"] for row in source_report["instances"]] != p0_expected or \
+                any(row["lane"] != "P0-package-supply" for row in source_report["instances"]):
+            raise evidence.EvidenceError(
+                f"python matrix {source_name} source report does not cover every accepted P0 environment"
+            )
+
+    test_record = resolver.record("B-HERMETIC-ALL", "test-report")
+    test_body = resolver.read("B-HERMETIC-ALL", "test-report")
+    if test_record["digest"] != raw_sha256(test_body) or test_record["size"] != len(test_body):
+        raise evidence.EvidenceError("python matrix H0 test-report bytes do not match their index")
+    test_report = _h0_artifact(
+        test_body, name="test-report", artifact_type="h0-test-report", identity=identity,
+        members={"collection_manifest_digest", "runs"},
+    )
+    runs = _array(test_report["runs"], "python matrix H0 test report.runs")
+    runs_by_environment = {}
+    for index, row in enumerate(runs):
+        run = _object(row, f"python matrix H0 test report.runs[{index}]", {
+            "environment", "evidence_instance_id", "fragments",
+        })
+        environment = _matrix_environment(run["environment"], "python matrix H0 run environment")
+        fragments = _array(run["fragments"], "python matrix H0 run fragments")
+        parsed_fragments = []
+        for fragment_index, fragment_row in enumerate(fragments):
+            fragment = _object(fragment_row, f"python matrix H0 fragment[{fragment_index}]", {
+                "digest", "job_instance_id", "report",
+            })
+            fragment_body = evidence.canonical_json_bytes(fragment["report"])
+            if fragment["digest"] != raw_sha256(fragment_body):
+                raise evidence.EvidenceError("python matrix H0 fragment digest is not rehashed")
+            parsed_fragments.append(evidence.read_h0_shard_outcome_report(fragment_body))
+        if (len(parsed_fragments) != 6 or
+                [fragment["shard_index"] for fragment in parsed_fragments] != list(range(6))):
+            raise evidence.EvidenceError("python matrix H0 run does not retain the exact six fragments")
+        first = parsed_fragments[0]
+        if any(fragment["full_h0_roster"] != first["full_h0_roster"] for fragment in parsed_fragments):
+            raise evidence.EvidenceError("python matrix H0 fragments disagree on the full roster")
+        runs_by_environment[tuple(environment[field] for field in (
+            "architecture", "isolation_profile", "os", "python", "runner_image",
+        ))] = {"evidence_instance_id": run["evidence_instance_id"], "fragments": parsed_fragments}
+    if len(runs_by_environment) != len(h0_expected):
+        raise evidence.EvidenceError("python matrix H0 test report has duplicate or missing environments")
+
+    build_artifacts = _matrix_source_artifacts(
+        resolver, gate_id="C-PACKAGE-BUILD", names=("build-log", "package-inventory", "sdist", "wheel"),
+    )
+    install_artifacts = _matrix_source_artifacts(
+        resolver, gate_id="C-PACKAGE-INSTALL", names=("install-inventory", "smoke-results"),
+    )
+    h0_instances = {tuple(row["environment"][field] for field in (
+        "architecture", "isolation_profile", "os", "python", "runner_image",
+    )): row for row in h0_report["instances"]}
+    build_instances = {tuple(row["environment"][field] for field in (
+        "architecture", "isolation_profile", "os", "python", "runner_image",
+    )): row for row in build_report["instances"]}
+    install_instances = {tuple(row["environment"][field] for field in (
+        "architecture", "isolation_profile", "os", "python", "runner_image",
+    )): row for row in install_report["instances"]}
+    for row in report["rows"]:
+        key = tuple(row["environment"][field] for field in (
+            "architecture", "isolation_profile", "os", "python", "runner_image",
+        ))
+        if row["lane"] == "H0-hermetic":
+            source = h0_instances.get(key)
+            run = runs_by_environment.get(key)
+            if source is None or run is None:
+                raise evidence.EvidenceError("python matrix H0 row does not resolve an accepted source environment")
+            h0 = row["h0"]
+            selection = source["selection"]
+            if (h0["evidence_instance_id"] != source["id"] or
+                    run["evidence_instance_id"] != source["id"] or
+                    h0["test_report_digest"] != test_record["digest"] or
+                    h0["selection"] != selection or h0["fragment_count"] != len(run["fragments"]) or
+                    h0["full_h0_roster"] != run["fragments"][0]["full_h0_roster"] or
+                    selection["failed"] != 0 or selection["skipped"] != 0 or
+                    selection["xfailed"] != 0 or selection["xpassed"] != 0 or
+                    selection["passed"] != selection["selected"]):
+                raise evidence.EvidenceError("python matrix H0 row does not reconcile its validated test run")
+        else:
+            p0 = row["p0"]
+            build = build_instances.get(key)
+            install = install_instances.get(key)
+            if build is None or install is None or \
+                    p0["build_evidence_instance_id"] != build["id"] or \
+                    p0["install_evidence_instance_id"] != install["id"] or \
+                    p0["build_artifacts"] != build_artifacts or p0["install_artifacts"] != install_artifacts:
+                raise evidence.EvidenceError("python matrix P0 row does not reconcile exact source instances/artifacts")
 
 
 def _semantic_evidence_schema(
@@ -6029,6 +6302,7 @@ SEMANTIC_VERIFIERS = MappingProxyType({
     "B-STATIC-SECURITY": _semantic_static_security,
     "B-DETERMINISM": _semantic_determinism,
     "C-PACKAGE-BUILD": _semantic_package_build,
+    "C-PYTHON-MATRIX": _semantic_python_matrix,
     "C-NETWORK-BOUNDARY": _semantic_network_boundary,
     "C-NET-DENY": _semantic_network_denial,
     "C-PACKAGE-INSTALL": _semantic_package_install,
