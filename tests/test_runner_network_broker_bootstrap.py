@@ -837,6 +837,9 @@ def test_gowitness_incomplete_controller_cancels_every_shared_component(monkeypa
     monkeypatch.setattr(
         runner_worker, "reap_adopted_descendants", lambda **_kwargs: (),
     )
+    monkeypatch.setattr(
+        runner_worker, "_kill_and_reap_adopted_children", lambda _deadline: (),
+    )
     with pytest.raises(NetworkBrokerRefused, match="settlement_incomplete"):
         runner_worker._settle_network_broker(launcher)
     assert events == [
@@ -1062,6 +1065,9 @@ def test_gowitness_cleanup_baseexception_retries_from_monotone_state(monkeypatch
     )
     monkeypatch.setattr(
         runner_worker, "reap_adopted_descendants", lambda **_kwargs: (),
+    )
+    monkeypatch.setattr(
+        runner_worker, "_kill_and_reap_adopted_children", lambda _deadline: (),
     )
     deadline = time.monotonic() + 1
     with pytest.raises(KeyboardInterrupt, match="cleanup cancellation"):
