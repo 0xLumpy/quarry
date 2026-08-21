@@ -102,7 +102,7 @@ def test_source_plan_binds_exact_candidate_inputs_but_claims_no_execution(source
             input_bodies=bodies,
             accepting=True,
         )
-    assert "C-FAULT-STORE" not in contracts.SEMANTIC_VERIFIERS
+    assert "C-FAULT-STORE" in contracts.SEMANTIC_VERIFIERS
     assert "C-FAULT-STORE" not in contracts.PROVISIONAL_SEMANTIC_VERIFIERS
     assert contracts.REQUIRED_ARTIFACTS["C-FAULT-STORE"] == (
         ("fault-matrix", "application/json"),

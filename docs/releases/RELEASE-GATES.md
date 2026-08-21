@@ -329,9 +329,11 @@ boundaries and 60 exact pytest node IDs.  Its candidate-labeled companion is a
 source plan only: every case is `not_executed`, every outcome digest is null,
 and all signing, H0 isolation, ownership, interval and toolchain claims are
 false.  Local execution of the roster checks the implementation during
-development, but it is not release evidence.  `C-FAULT-STORE` therefore stays
-`OPEN` until an accepted signed H0 instance owns and reconciles the exact
-outcomes without changing this frozen plan.
+development, but it is not release evidence.  The obligation verifier reuses
+the already validated `B-HERMETIC-ALL` shard results: it requires all 60 nodes
+in that exact passing roster and one signed H0 `C-FAULT-STORE` record owning
+the unchanged source plan.  This avoids a second pytest pass.  The gate remains
+`OPEN` until those accepted signed records exist.
 
 #### Performance and scale matrix
 

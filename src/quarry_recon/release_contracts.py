@@ -6343,6 +6343,126 @@ def _semantic_path_identity(
         raise evidence.EvidenceError("path identity collection environment does not match signed H0")
 
 
+def _semantic_fault_store(
+    gate: dict, bodies: Mapping[str, bytes], **context: object,
+) -> None:
+    """Reconcile the frozen store-fault roster with retained H0 shard evidence."""
+    if gate["gate_id"] != "C-FAULT-STORE":  # pragma: no cover - registry invariant
+        raise evidence.EvidenceError("fault-store verifier received the wrong gate")
+    identity = context["identity"]
+    report = context["report"]
+    resolver = context["resolver"]
+    scope = context["scope"]
+    inputs = context["input_bodies"]
+    if (not isinstance(identity, dict) or not isinstance(report, dict) or
+            not isinstance(resolver, ArtifactResolver) or not isinstance(scope, dict) or
+            not isinstance(inputs, Mapping)):
+        raise evidence.EvidenceError("fault-store verifier requires accepted aggregate context")
+
+    scope_bindings = {row["name"]: row for row in scope["input_bindings"]}
+    bound_inputs: dict[str, bytes] = {}
+    for name, path in fault_store_evidence.INPUT_PATHS.items():
+        binding = scope_bindings.get(name)
+        body = inputs.get(name)
+        if (binding is None or binding["path"] != path or type(body) is not bytes or
+                raw_sha256(body) != binding["digest"]):
+            raise evidence.EvidenceError("fault-store source input is absent, redirected or drifted")
+        bound_inputs[name] = body
+
+    matrix_body = bodies.get("fault-matrix")
+    signed = {item["name"]: item for item in gate["artifacts"]}
+    matrix_record = signed.get("fault-matrix")
+    if (type(matrix_body) is not bytes or matrix_record is None or
+            matrix_record["media_type"] != "application/json" or
+            matrix_record["digest"] != raw_sha256(matrix_body)):
+        raise evidence.EvidenceError("fault-store matrix does not match its signed gate record")
+    try:
+        plan = fault_store_evidence.read_source_plan(
+            matrix_body,
+            candidate_identity_digest=evidence.canonical_digest(identity),
+            input_bodies=bound_inputs,
+        )
+    except fault_store_evidence.FaultStoreEvidenceError as exc:
+        raise evidence.EvidenceError(str(exc)) from exc
+    expected_bindings = [
+        {"digest": scope_bindings[name]["digest"], "name": name, "path": path}
+        for name, path in fault_store_evidence.INPUT_PATHS.items()
+    ]
+    if plan["input_bindings"] != expected_bindings:
+        raise evidence.EvidenceError("fault-store matrix does not bind the exact accepted scope inputs")
+
+    instances = report["instances"]
+    if len(instances) != 1 or instances[0]["lane"] != "H0-hermetic":
+        raise evidence.EvidenceError("fault-store evidence requires one exact signed H0 instance")
+    instance = instances[0]
+    selection = {
+        "collected": fault_store_evidence.NODE_COUNT,
+        "deselected": 0,
+        "failed": 0,
+        "passed": fault_store_evidence.NODE_COUNT,
+        "selected": fault_store_evidence.NODE_COUNT,
+        "skipped": 0,
+        "xfailed": 0,
+        "xpassed": 0,
+    }
+    if (instance["selection"] != selection or gate["selection"] != selection or
+            instance["artifacts"] != [{"digest": raw_sha256(matrix_body), "name": "fault-matrix"}]):
+        raise evidence.EvidenceError(
+            "fault-store signed H0 record does not own and select the exact frozen roster"
+        )
+
+    # B-HERMETIC-ALL is ordered and semantically verified before this gate.  Reopen
+    # its retained artifacts here only to bind this obligation's exact subset to
+    # that already-validated execution, without running pytest a second time.
+    source_report = _matrix_source_report(
+        resolver, gate_id="B-HERMETIC-ALL", identity=identity,
+    )
+    collection_record = resolver.record("B-HERMETIC-ALL", "collection-manifest")
+    collection_body = resolver.read("B-HERMETIC-ALL", "collection-manifest")
+    test_record = resolver.record("B-HERMETIC-ALL", "test-report")
+    test_body = resolver.read("B-HERMETIC-ALL", "test-report")
+    if (collection_record["digest"] != raw_sha256(collection_body) or
+            collection_record["size"] != len(collection_body) or
+            test_record["digest"] != raw_sha256(test_body) or
+            test_record["size"] != len(test_body)):
+        raise evidence.EvidenceError("fault-store source H0 artifacts do not match their index")
+    taxonomy = evidence.read_pytest_taxonomy(collection_body)
+    test_report = _h0_artifact(
+        test_body, name="test-report", artifact_type="h0-test-report", identity=identity,
+        members={"collection_manifest_digest", "runs"},
+    )
+    if test_report["collection_manifest_digest"] != collection_record["digest"]:
+        raise evidence.EvidenceError("fault-store source H0 report binds another collection manifest")
+    expected_nodes = [
+        nodeid for case in fault_store_evidence.CASES for nodeid in case["nodeids"]
+    ]
+    full_nodes = taxonomy["lanes"][0]["nodes"]
+    missing = sorted(set(expected_nodes) - set(full_nodes), key=lambda value: value.encode("utf-8"))
+    if missing or len(expected_nodes) != fault_store_evidence.NODE_COUNT:
+        raise evidence.EvidenceError("fault-store source H0 roster omits a frozen fault node")
+
+    matching_source_instances = [
+        row for row in source_report["instances"]
+        if row["lane"] == "H0-hermetic" and row["environment"] == instance["environment"]
+    ]
+    matching_runs = [
+        row for row in test_report["runs"]
+        if row.get("environment") == instance["environment"]
+    ]
+    if len(matching_source_instances) != 1 or len(matching_runs) != 1:
+        raise evidence.EvidenceError("fault-store reconciliation does not resolve one validated H0 run")
+    source_instance = matching_source_instances[0]
+    source_selection = source_instance["selection"]
+    if (matching_runs[0].get("evidence_instance_id") != source_instance["id"] or
+            source_instance["toolchain"] != instance["toolchain"] or
+            source_selection["passed"] != len(full_nodes) or
+            source_selection["selected"] != len(full_nodes) or
+            any(source_selection[name] for name in (
+                "failed", "skipped", "xfailed", "xpassed",
+            ))):
+        raise evidence.EvidenceError("fault-store roster does not reconcile a complete passing H0 run")
+
+
 def _semantic_manifest(
     gate: dict, bodies: Mapping[str, bytes], **context: object,
 ) -> None:
@@ -7143,6 +7263,7 @@ SEMANTIC_VERIFIERS = MappingProxyType({
     "B-DETERMINISM": _semantic_determinism,
     "C-SOURCE-REGISTRY": _semantic_source_registry,
     "C-PATH-IDENTITY": _semantic_path_identity,
+    "C-FAULT-STORE": _semantic_fault_store,
     "C-PACKAGE-BUILD": _semantic_package_build,
     "C-PYTHON-MATRIX": _semantic_python_matrix,
     "C-NETWORK-BOUNDARY": _semantic_network_boundary,

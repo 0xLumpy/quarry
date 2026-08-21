@@ -18,6 +18,7 @@ from jsonschema import Draft202012Validator, FormatChecker
 
 from quarry_recon import release_contracts as contracts
 from quarry_recon import release_evidence as evidence
+from quarry_recon import fault_store_evidence
 from quarry_recon import release_v310_05
 from quarry_recon import resource_contract
 from quarry_recon import path_identity_evidence
@@ -351,9 +352,8 @@ def _taxonomy_body(environment: dict, toolchain: list[dict]) -> bytes:
     })
 
 
-def _h0_collection_taxonomy_body(environment: dict, toolchain: list[dict]) -> bytes:
-    document = json.loads(_taxonomy_body(environment, toolchain))
-    h0_nodes = [
+def _h0_collection_nodes() -> list[str]:
+    nodes = [
         "tests/test_config.py::TestProfileLoad::test_valid_profile_loads",
         "tests/test_phase1_privfs_core.py::test_strict_walk_refuses_a_symlink_at_every_directory_depth[1]",
         "tests/test_release_h0.py::test_tool_open_refuses_relative_or_non_normalized_paths[git]",
@@ -361,7 +361,15 @@ def _h0_collection_taxonomy_body(environment: dict, toolchain: list[dict]) -> by
         "tests/taxonomy.py::test_offline_3",
         "tests/taxonomy.py::test_offline_5",
     ]
-    h0_nodes.sort(key=lambda value: value.encode("utf-8"))
+    nodes.extend(
+        nodeid for case in fault_store_evidence.CASES for nodeid in case["nodeids"]
+    )
+    return sorted(set(nodes), key=lambda value: value.encode("utf-8"))
+
+
+def _h0_collection_taxonomy_body(environment: dict, toolchain: list[dict]) -> bytes:
+    document = json.loads(_taxonomy_body(environment, toolchain))
+    h0_nodes = _h0_collection_nodes()
     document["lanes"][0]["nodes"] = h0_nodes
     document["selection"].update({
         "collected": len(h0_nodes) + 4,
@@ -486,6 +494,20 @@ def _supporting_bodies(
             input_bodies=path_inputs,
         )
         bodies["property-corpus"] = path_inputs["path-identity-corpus"]
+    elif gate_id == "C-FAULT-STORE":
+        fault_inputs = {
+            name: (ROOT / path).read_bytes()
+            for name, path in fault_store_evidence.INPUT_PATHS.items()
+        }
+        plan = fault_store_evidence.build_source_plan(
+            candidate_identity_digest=evidence.canonical_digest(identity),
+            input_bodies=fault_inputs,
+        )
+        bodies["fault-matrix"] = fault_store_evidence.canonical_source_plan_bytes(
+            plan,
+            candidate_identity_digest=evidence.canonical_digest(identity),
+            input_bodies=fault_inputs,
+        )
     elif gate_id == "B-SCHEMA":
         registry_body = (ROOT / evidence.REGISTRY_PATH).read_bytes()
         fixture_manifest_body = (ROOT / contracts.SCHEMA_VALIDATION_FIXTURE_MANIFEST_PATH).read_bytes()
@@ -1826,14 +1848,26 @@ def _scenario(tmp_path: Path, *, approved_at: str = "2026-08-01T00:00:00Z"):
                     "selected": 1, "skipped": 0, "xfailed": 0, "xpassed": 0,
                 }
                 if gate_id == "A-TAXONOMY":
+                    h0_count = len(_h0_collection_nodes())
                     selection = {
-                        "collected": 10, "deselected": 4, "failed": 0, "passed": 6,
-                        "selected": 6, "skipped": 0, "xfailed": 0, "xpassed": 0,
+                        "collected": h0_count + 4, "deselected": 4, "failed": 0,
+                        "passed": h0_count, "selected": h0_count, "skipped": 0,
+                        "xfailed": 0, "xpassed": 0,
                     }
                 if gate_id == "B-HERMETIC-ALL":
+                    h0_count = len(_h0_collection_nodes())
                     selection = {
-                        "collected": 10, "deselected": 4, "failed": 0, "passed": 6,
-                        "selected": 6, "skipped": 0, "xfailed": 0, "xpassed": 0,
+                        "collected": h0_count + 4, "deselected": 4, "failed": 0,
+                        "passed": h0_count, "selected": h0_count, "skipped": 0,
+                        "xfailed": 0, "xpassed": 0,
+                    }
+                if gate_id == "C-FAULT-STORE":
+                    selection = {
+                        "collected": fault_store_evidence.NODE_COUNT,
+                        "deselected": 0, "failed": 0,
+                        "passed": fault_store_evidence.NODE_COUNT,
+                        "selected": fault_store_evidence.NODE_COUNT,
+                        "skipped": 0, "xfailed": 0, "xpassed": 0,
                     }
                 if gate_id == "B-DOCS-POLICY":
                     selection = {
@@ -1860,8 +1894,12 @@ def _scenario(tmp_path: Path, *, approved_at: str = "2026-08-01T00:00:00Z"):
                         "selected": 6, "skipped": 0, "xfailed": 0, "xpassed": 0,
                     }
                 if gate_id == "B-COVERAGE":
-                    selection = {"collected": 10, "deselected": 4, "failed": 0, "passed": 6,
-                                 "selected": 6, "skipped": 0, "xfailed": 0, "xpassed": 0}
+                    h0_count = len(_h0_collection_nodes())
+                    selection = {
+                        "collected": h0_count + 4, "deselected": 4, "failed": 0,
+                        "passed": h0_count, "selected": h0_count, "skipped": 0,
+                        "xfailed": 0, "xpassed": 0,
+                    }
                 if gate_id == "B-STATIC-SECURITY":
                     selection = {"collected": 5, "deselected": 0, "failed": 0, "passed": 5,
                                  "selected": 5, "skipped": 0, "xfailed": 0, "xpassed": 0}
@@ -2030,6 +2068,8 @@ def _scenario(tmp_path: Path, *, approved_at: str = "2026-08-01T00:00:00Z"):
         if gate_id in {"B-DOCS-POLICY", "B-QUALITY", "B-COVERAGE", "B-STATIC-SECURITY"}:
             selection = copy.deepcopy(instances[0]["selection"])
         if gate_id == "B-MANIFEST":
+            selection = copy.deepcopy(instances[0]["selection"])
+        if gate_id == "C-FAULT-STORE":
             selection = copy.deepcopy(instances[0]["selection"])
         rule = None
         reason = None
@@ -2652,7 +2692,7 @@ class TestIncompleteSemanticRegistry:
             | {
                 "A-IDENTITY", "A-EVIDENCE-SCHEMA", "A-TAXONOMY", "A-CORPUS", "A-THRESHOLDS", "A-SUPPORT",
                 "B-HERMETIC-ALL", "B-SCHEMA", "B-DOCS-POLICY", "B-MANIFEST", "B-QUALITY", "B-COVERAGE", "B-STATIC-SECURITY", "B-DETERMINISM",
-                "C-PACKAGE-BUILD", "C-PACKAGE-INSTALL", "C-PYTHON-MATRIX", "C-SBOM", "C-VULNERABILITY", "C-PROVENANCE", "C-SOURCE-REGISTRY", "C-PATH-IDENTITY", "C-NETWORK-BOUNDARY", "C-NET-DENY",
+                "C-PACKAGE-BUILD", "C-PACKAGE-INSTALL", "C-PYTHON-MATRIX", "C-SBOM", "C-VULNERABILITY", "C-PROVENANCE", "C-SOURCE-REGISTRY", "C-PATH-IDENTITY", "C-FAULT-STORE", "C-NETWORK-BOUNDARY", "C-NET-DENY",
                 *contracts.V310_05_SEMANTIC_GATES,
             }
         )
@@ -2741,6 +2781,64 @@ class TestPathIdentitySemanticEvidence:
         context["report"]["instances"][0]["artifacts"][0]["digest"] = digest
         with pytest.raises(evidence.EvidenceError, match="contradicts its expected disposition"):
             contracts._semantic_path_identity(gate, bodies, **context)
+
+
+class TestFaultStoreSemanticEvidence:
+    @staticmethod
+    def _case(tmp_path):
+        arguments = _scenario(tmp_path)
+        gate = _gate(arguments, "C-FAULT-STORE")
+        indexed = next(
+            row for row in arguments["artifact_index"]["artifacts"]
+            if row["gate_id"] == "C-FAULT-STORE" and row["name"] == "fault-matrix"
+        )
+        body = (arguments["artifact_root"] / indexed["path"]).read_bytes()
+        report_index = next(
+            row for row in arguments["artifact_index"]["artifacts"]
+            if row["gate_id"] == "C-FAULT-STORE" and row["name"] == "gate-evidence"
+        )
+        report = contracts.read_evidence_report(
+            (arguments["artifact_root"] / report_index["path"]).read_bytes(),
+            identity=arguments["identity"],
+            gate_id="C-FAULT-STORE",
+        )
+        return arguments, gate, {"fault-matrix": body}, report
+
+    @staticmethod
+    def _verify(arguments, gate, bodies, report):
+        with contracts.ArtifactResolver(
+            arguments["artifact_root"], arguments["artifact_index"],
+            identity=arguments["identity"],
+        ) as resolver:
+            contracts._semantic_fault_store(
+                gate,
+                bodies,
+                identity=arguments["identity"],
+                input_bodies=arguments["input_bodies"],
+                report=report,
+                resolver=resolver,
+                scope=arguments["scope"],
+            )
+
+    def test_frozen_fault_roster_reuses_the_validated_h0_run(self, tmp_path):
+        arguments, gate, bodies, report = self._case(tmp_path)
+        self._verify(arguments, gate, bodies, report)
+
+    def test_source_plan_or_h0_environment_substitution_fails(self, tmp_path):
+        arguments, gate, bodies, report = self._case(tmp_path / "plan")
+        document = json.loads(bodies["fault-matrix"])
+        document["cases"][0]["execution_status"] = "passed"
+        bodies["fault-matrix"] = contracts.canonical_json_line(document)
+        digest = contracts.raw_sha256(bodies["fault-matrix"])
+        next(row for row in gate["artifacts"] if row["name"] == "fault-matrix")["digest"] = digest
+        report["instances"][0]["artifacts"][0]["digest"] = digest
+        with pytest.raises(evidence.EvidenceError, match="differs from exact candidate inputs"):
+            self._verify(arguments, gate, bodies, report)
+
+        arguments, gate, bodies, report = self._case(tmp_path / "environment")
+        report["instances"][0]["environment"]["python"] = "3.11.99"
+        with pytest.raises(evidence.EvidenceError, match="one validated H0 run"):
+            self._verify(arguments, gate, bodies, report)
 
 
 class TestVulnerabilitySemanticEvidence:
@@ -3145,10 +3243,18 @@ class TestH0HermeticSemanticEvidence:
         gate, bodies, context = self._case(tmp_path)
         report = json.loads(bodies["test-report"])
         fragment_record = report["runs"][0]["fragments"][0]
-        fragment_record["report"]["outcomes"].update(passed=0, skipped=1)
+        taxonomy = evidence.read_pytest_taxonomy(bodies["collection-manifest"])
+        selected_nodes = [
+            nodeid for nodeid in taxonomy["lanes"][0]["nodes"]
+            if evidence.h0_shard_index(nodeid, 6) == 0
+        ]
+        passed_nodes = selected_nodes[:-1]
+        fragment_record["report"]["outcomes"].update(
+            passed=len(passed_nodes), skipped=1,
+        )
         fragment_record["report"]["passed_roster"] = {
-            "count": 0,
-            "digest": evidence.h0_roster_digest([]),
+            "count": len(passed_nodes),
+            "digest": evidence.h0_roster_digest(passed_nodes),
         }
         fragment_record["digest"] = contracts.raw_sha256(
             evidence.canonical_json_bytes(fragment_record["report"])
@@ -3167,9 +3273,12 @@ class TestH0HermeticSemanticEvidence:
         gate, bodies, context = self._case(tmp_path)
         report = json.loads(bodies["test-report"])
         fragment_record = report["runs"][0]["fragments"][0]
-        fragment_record["report"]["selected_roster"] = copy.deepcopy(
+        wrong_roster = copy.deepcopy(
             report["runs"][0]["fragments"][1]["report"]["selected_roster"]
         )
+        fragment_record["report"]["selected_roster"] = wrong_roster
+        fragment_record["report"]["passed_roster"] = copy.deepcopy(wrong_roster)
+        fragment_record["report"]["outcomes"]["passed"] = wrong_roster["count"]
         fragment_record["digest"] = contracts.raw_sha256(
             evidence.canonical_json_bytes(fragment_record["report"])
         )
