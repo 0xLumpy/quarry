@@ -1437,8 +1437,39 @@ def _remove_authenticated_once(
         # is ambiguous and permanently consumes the removal authority.
         attempt.state = "attempting"; _rmdir_cgroup(name, parent_fd)
         unlinked = os.fstat(anchor.fd)
-        if ((unlinked.st_dev, unlinked.st_ino) != identity
-                or unlinked.st_nlink != 0):
+        identity_changed = (unlinked.st_dev, unlinked.st_ino) != identity
+        name_absent_on_cgroup2 = False
+        if not identity_changed and unlinked.st_nlink != 0:
+            # cgroup2 can retain a non-zero synthetic link count on an open
+            # descriptor after a successful rmdir (observed on WSL2).  In that
+            # filesystem only, absence of the authenticated name confirms the
+            # completed removal.  Ordinary filesystems retain the stricter
+            # zero-link check that detects a same-name swap.
+            try:
+                os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                try:
+                    original_still_named = False
+                    with os.scandir(parent_fd) as entries:
+                        for index, entry in enumerate(entries, 1):
+                            if index > _MAX_DESCENDANT_ENTRIES:
+                                original_still_named = True
+                                break
+                            candidate = entry.stat(follow_symlinks=False)
+                            if ((candidate.st_dev, candidate.st_ino)
+                                    == identity):
+                                original_still_named = True
+                                break
+                    name_absent_on_cgroup2 = (
+                        not original_still_named
+                        and _fstatfs_type(anchor.fd) == _CGROUP2_SUPER_MAGIC
+                    )
+                except OSError:
+                    pass
+            except OSError:
+                pass
+        if (identity_changed
+                or (unlinked.st_nlink != 0 and not name_absent_on_cgroup2)):
             attempt.state = "ambiguous"
             raise ContainmentFailure(reason)
         attempt.state = "removed"
