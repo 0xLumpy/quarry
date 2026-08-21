@@ -191,16 +191,20 @@ def test_schema_and_manual_shape_contracts_are_exact(source_plan):
     jsonschema = pytest.importorskip("jsonschema")
     document, bodies = source_plan
     manifest = fault_runner.case_manifest_document()
-    manifest_schema = json.loads(
-        (
-            ROOT / fault_runner.INPUT_PATHS["fault-runner-case-manifest-schema"]
-        ).read_bytes()
+    manifest_schema_raw = (
+        ROOT / fault_runner.INPUT_PATHS["fault-runner-case-manifest-schema"]
+    ).read_bytes()
+    plan_schema_raw = (
+        ROOT / fault_runner.INPUT_PATHS["fault-runner-source-plan-schema"]
+    ).read_bytes()
+    assert manifest_schema_raw == fault_runner._canonical(
+        fault_runner.case_manifest_schema_document()
     )
-    plan_schema = json.loads(
-        (
-            ROOT / fault_runner.INPUT_PATHS["fault-runner-source-plan-schema"]
-        ).read_bytes()
+    assert plan_schema_raw == fault_runner._canonical(
+        fault_runner.source_plan_schema_document()
     )
+    manifest_schema = json.loads(manifest_schema_raw)
+    plan_schema = json.loads(plan_schema_raw)
     manifest_validator = jsonschema.Draft202012Validator(manifest_schema)
     plan_validator = jsonschema.Draft202012Validator(plan_schema)
     assert list(manifest_validator.iter_errors(manifest)) == []
