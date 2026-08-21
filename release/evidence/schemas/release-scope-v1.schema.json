@@ -5,14 +5,15 @@
   "properties": {
     "approval": {"oneOf": [{"$ref": "#/$defs/review"}, {"type": "null"}]},
     "input_bindings": {"items": {"$ref": "#/$defs/binding"}, "maxItems": 195, "minItems": 195, "type": "array", "uniqueItems": true},
+    "milestone_mode": {"const": "internal-integrity"},
     "obligations": {"items": {"$ref": "#/$defs/obligation"}, "maxItems": 64, "minItems": 64, "type": "array", "uniqueItems": true},
     "production_trust_policy": {
       "additionalProperties": false,
-      "properties": {"digest": {"type": "null"}, "name": {"const": "production-trust-policy"}, "path": {"const": "release/evidence/trust-policy-v1.json"}, "required_before_nomination": {"const": true}},
-      "required": ["digest", "name", "path", "required_before_nomination"],
+      "properties": {"digest": {"type": "null"}, "disposition": {"const": "not_applicable_until_publish"}, "name": {"const": "production-trust-policy"}, "path": {"const": "release/evidence/trust-policy-v1.json"}, "required_before_nomination": {"const": false}},
+      "required": ["digest", "disposition", "name", "path", "required_before_nomination"],
       "type": "object"
     },
-    "record_inputs": {"items": {"$ref": "#/$defs/token"}, "maxItems": 198, "minItems": 198, "type": "array", "uniqueItems": true},
+    "record_inputs": {"items": {"$ref": "#/$defs/token"}, "maxItems": 197, "minItems": 197, "type": "array", "uniqueItems": true},
     "release": {"const": "0.3.10"},
     "schema_version": {"const": "quarry.release-scope.v1"},
     "selected_record_slots": {"items": {"$ref": "#/$defs/gate"}, "maxItems": 56, "minItems": 56, "type": "array", "uniqueItems": true},
@@ -55,7 +56,7 @@
     },
     "token": {"pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$", "type": "string"}
   },
-  "required": ["approval", "input_bindings", "obligations", "production_trust_policy", "record_inputs", "release", "schema_version", "selected_record_slots", "stages"],
+  "required": ["approval", "input_bindings", "milestone_mode", "obligations", "production_trust_policy", "record_inputs", "release", "schema_version", "selected_record_slots", "stages"],
   "title": "Quarry release scope v1",
   "type": "object"
 }

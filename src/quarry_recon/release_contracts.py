@@ -84,6 +84,7 @@ FAULT_STORE_CASE_MANIFEST_SCHEMA = fault_store_evidence.CASE_MANIFEST_SCHEMA_VER
 FAULT_STORE_SOURCE_PLAN_SCHEMA = fault_store_evidence.SOURCE_PLAN_SCHEMA_VERSION
 
 RELEASE = evidence.RELEASE_SCOPE
+MILESTONE_MODE = "internal-integrity"
 LANE_ORDER = (
     "H0-hermetic",
     "H1-tool-integration",
@@ -1923,17 +1924,19 @@ def build_release_scope(input_bodies: Mapping[str, bytes], *, approval: object =
         bindings.append({"digest": raw_sha256(body), "name": name, "path": path})
     record_inputs = sorted(
         [record["name"] for record in bindings]
-        + ["candidate-identity", "production-trust-policy", "release-scope"]
+        + ["candidate-identity", "release-scope"]
     )
     document = {
         "approval": approval,
         "input_bindings": bindings,
+        "milestone_mode": MILESTONE_MODE,
         "obligations": _expected_obligations(),
         "production_trust_policy": {
+            "disposition": "not_applicable_until_publish",
             "digest": None,
             "name": "production-trust-policy",
             "path": PRODUCTION_TRUST_POLICY_PATH,
-            "required_before_nomination": True,
+            "required_before_nomination": False,
         },
         "record_inputs": record_inputs,
         "release": RELEASE,
@@ -1969,11 +1972,14 @@ def validate_release_scope(
 ) -> dict:
     """Validate the exact v0.3.10 universe and synthetic-only selection."""
     doc = _object(document, "release scope", {
-        "approval", "input_bindings", "obligations", "production_trust_policy",
-        "record_inputs", "release", "schema_version", "selected_record_slots", "stages",
+        "approval", "input_bindings", "milestone_mode", "obligations",
+        "production_trust_policy", "record_inputs", "release", "schema_version",
+        "selected_record_slots", "stages",
     })
     _schema(doc, RELEASE_SCOPE_SCHEMA, "release scope")
     _review(doc["approval"], "release scope.approval")
+    if doc["milestone_mode"] != MILESTONE_MODE:
+        raise evidence.EvidenceError("release scope must select the internal integrity milestone")
 
     bindings = _array(doc["input_bindings"], "release scope.input_bindings")
     for index, record in enumerate(bindings):
@@ -1986,18 +1992,21 @@ def validate_release_scope(
         raise evidence.EvidenceError("release scope input bindings are not the exact v1 input set")
 
     trust = _object(doc["production_trust_policy"], "release scope.production_trust_policy", {
-        "digest", "name", "path", "required_before_nomination",
+        "digest", "disposition", "name", "path", "required_before_nomination",
     })
     if trust != {
         "digest": None,
+        "disposition": "not_applicable_until_publish",
         "name": "production-trust-policy",
         "path": PRODUCTION_TRUST_POLICY_PATH,
-        "required_before_nomination": True,
+        "required_before_nomination": False,
     }:
-        raise evidence.EvidenceError("release scope must leave the production trust root explicitly pending")
+        raise evidence.EvidenceError(
+            "release scope must mark the production trust root not applicable until publish"
+        )
 
     expected_record_inputs = [item["name"] for item in bindings] + [
-        "candidate-identity", "production-trust-policy", "release-scope",
+        "candidate-identity", "release-scope",
     ]
     expected_record_inputs.sort()
     if doc["record_inputs"] != expected_record_inputs:
@@ -2025,9 +2034,15 @@ def validate_release_scope(
     if require_ready:
         _approved(doc, "release scope")
         if trust_policy is None:
-            raise evidence.EvidenceError(
-                "production trust policy authority is unresolved before nomination"
-            )
+            if trusted_policy_digest is not None:
+                raise evidence.EvidenceError(
+                    "internal milestone scope cannot claim an unprovided trust policy"
+                )
+            if doc["approval"]["signature"] is not None:
+                raise evidence.EvidenceError(
+                    "internal milestone sign-off must not claim a cryptographic signature"
+                )
+            return doc
         verify_contract_review(
             doc, policy=trust_policy, trusted_policy_digest=trusted_policy_digest,
         )
@@ -3156,8 +3171,10 @@ def read_evidence_report(data: bytes, *, identity: object, gate_id: str) -> dict
 
 
 def _raw_input_map(scope: dict, *, policy: dict) -> dict[str, str]:
+    # The trust policy authenticates public evidence but is not an input to the
+    # v0.3.10 internal-integrity candidate. Distribution ceremony is dormant.
+    _ = policy
     result = {record["name"]: record["digest"] for record in scope["input_bindings"]}
-    result["production-trust-policy"] = raw_sha256(canonical_json_line(policy))
     result["release-scope"] = raw_sha256(canonical_json_line(scope))
     return result
 
@@ -3201,10 +3218,6 @@ def validate_candidate_bindings(
         raise evidence.EvidenceError("candidate package version is not nomination-eligible")
     expected = {record["name"]: (record["path"], record["digest"])
                 for record in scope_doc["input_bindings"]}
-    expected["production-trust-policy"] = (
-        scope_doc["production_trust_policy"]["path"],
-        raw_sha256(canonical_json_line(policy_doc)),
-    )
     expected["release-scope"] = (
         "release/evidence/release-scope-v1.json",
         raw_sha256(canonical_json_line(scope_doc)),

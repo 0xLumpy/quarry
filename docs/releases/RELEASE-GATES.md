@@ -1,5 +1,23 @@
 # Quarry release gates
 
+## v0.3.10 applicability
+
+`v0.3.10` is an unpublished internal-integrity milestone for its sole
+maintainer and user. Production signing keys, signature thresholds and roles,
+key validity or rotation, detached multiparty approval, signed tags,
+publication receipts, and CI-VM image attestation are
+`not_applicable_until_publish`. They become required when Quarry is published,
+has a second maintainer, or is operated as a service. The package remains
+version `0.3.9`; the milestone identity is its clean commit/tree plus frozen
+scope, inputs, managed tool receipts, and observed local/Linux-CI environment.
+The maintainer's ledger sign-off is deliberately not a cryptographic signature.
+
+This disposition does not weaken Quarry-native evidence: exact observation and
+tool provenance, canonical content digests, sealed-run immutability,
+reproducibility, fault behavior, and output contracts remain required. The
+public-distribution lifecycle later in this document is retained as dormant
+design, not as a `v0.3.10` ship blocker.
+
 Status: Phase 0 gate contract. It defines the evidence required to promote a
 release; it does not assert that all required runners, thresholds, schemas, or
 evidence collectors already exist.
@@ -376,11 +394,24 @@ signed H1 owner for the exact combined 124-row matrix.  The gate remains
 
 #### Performance and scale matrix
 
-Performance claims require a versioned benchmark manifest. It identifies the
+Performance observations require a versioned benchmark manifest. It identifies the
 fixture digest, operation, concurrency, warmup/repetition rule, CPU/memory/disk
 limits, host or runner class, tool identities, and both absolute and regression
-thresholds. Until numeric thresholds are reviewed, each performance gate is
-`open`; descriptive measurements cannot close it.
+measurements. For `v0.3.10`, resource and speed values are measure-and-record
+and do not block the integrity milestone. Hard numeric limits are deferred.
+Correctness outcomes remain blocking even when collected by a performance gate:
+
+- `C-PERF-RUNNER` requires zero evidence-byte mismatches, leaked processes, and
+  leaked file descriptors;
+- `C-PERF-REPORT` requires deterministic artifacts and complete observation
+  coverage; and
+- `C-PERF-PHASE-FAIRNESS` requires every obligation to start or retain an
+  explicit terminal/remainder reason, with no silent starvation.
+
+`C-PERF-CAMPAIGN` is entirely measure-and-record; campaign correctness remains
+enforced by `B-MANIFEST` and `C-FAULT-CAMPAIGN`. RSS, latency, throughput, disk
+size, artifact size, and regression-budget observations are non-blocking for
+all four remaining performance gates.
 
 | Gate | Measurement | Required threshold classes |
 |---|---|---|
@@ -416,6 +447,12 @@ applicable; a violated assertion remains `fail` under the general result
 vocabulary. A script-level `SKIP` never closes a slot.
 
 ### Phase E: publication gate
+
+The publication-only parts of this phase, including production trust,
+`E-APPROVAL`, signed tagging, and publication receipts, are N/A for the
+`v0.3.10` internal-integrity milestone under the applicability rule above.
+`E-DOCS`, `E-PROJECT-HYGIENE`, and the internal artifact/content checks remain
+applicable.
 
 The publication decision is a separate, reproducible aggregation step:
 

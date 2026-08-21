@@ -1879,11 +1879,6 @@ def _identity(scope: dict, policy: dict) -> dict:
     )
     inputs.extend([
         {
-            "digest": contracts.raw_sha256(contracts.canonical_json_line(policy)),
-            "name": "production-trust-policy",
-            "path": contracts.PRODUCTION_TRUST_POLICY_PATH,
-        },
-        {
             "digest": contracts.raw_sha256(contracts.canonical_json_line(scope)),
             "name": "release-scope",
             "path": "release/evidence/release-scope-v1.json",
@@ -2654,20 +2649,28 @@ class TestCommittedContracts:
             list(contracts.UNSELECTED_CORPUS_GATES)
         assert all(row["disposition"] == "required_not_applicable"
                    for row in scope["obligations"] if row["id"] in contracts.LIVE_GATES)
-        assert scope["approval"] is None
+        assert scope["milestone_mode"] == "internal-integrity"
+        assert scope["approval"] == {
+            "approved_at": "2026-08-21T17:13:17Z",
+            "review_id": "v0.3.10-internal-integrity-scope",
+            "reviewer": "0xLumpy",
+            "signature": None,
+        }
         assert scope["production_trust_policy"]["digest"] is None
+        assert scope["production_trust_policy"]["disposition"] == \
+            "not_applicable_until_publish"
+        assert scope["production_trust_policy"]["required_before_nomination"] is False
         assert not (ROOT / contracts.PRODUCTION_TRUST_POLICY_PATH).exists()
-        with pytest.raises(evidence.EvidenceError, match="draft"):
-            contracts.read_release_scope(
-                (ROOT / "release/evidence/release-scope-v1.json").read_bytes(),
-                require_ready=True,
-            )
+        assert contracts.read_release_scope(
+            (ROOT / "release/evidence/release-scope-v1.json").read_bytes(),
+            require_ready=True,
+        ) == scope
 
     def test_every_committed_input_binding_rehashes_and_v1_frozen_bytes_are_unchanged(self):
         scope = _read("release/evidence/release-scope-v1.json", contracts.read_release_scope)
         bodies = {row["name"]: (ROOT / row["path"]).read_bytes() for row in scope["input_bindings"]}
         contracts.verify_scope_input_bodies(scope, bodies)
-        assert contracts.build_release_scope(bodies) == scope
+        assert contracts.build_release_scope(bodies, approval=scope["approval"]) == scope
         assert contracts.raw_sha256((ROOT / evidence.REGISTRY_PATH).read_bytes()) == \
             "sha256:0153272d9327582759ff73d49a9c01c05063f722df3fef02c4861c41d3697ca4"
         assert contracts.raw_sha256((ROOT / evidence.SCHEMA_PATHS["candidate_identity"]).read_bytes()) == \
@@ -2696,7 +2699,7 @@ class TestCommittedContracts:
         record_inputs = scope_schema["properties"]["record_inputs"]
         assert bindings["minItems"] == bindings["maxItems"] == len(contracts.SCOPE_INPUT_PATHS)
         assert record_inputs["minItems"] == record_inputs["maxItems"] == \
-            len(contracts.SCOPE_INPUT_PATHS) + 3
+            len(contracts.SCOPE_INPUT_PATHS) + 2
         support_schema = json.loads(
             (ROOT / contracts.SCHEMA_PATHS["support-matrix-schema"]).read_bytes()
         )
@@ -2841,11 +2844,11 @@ class TestCommittedContracts:
 
 
 class TestScopeAndManifestRefusals:
-    def test_even_a_reviewed_scope_fails_closed_without_external_production_authority(self):
+    def test_internal_signoff_and_optional_external_review_are_unambiguous(self):
         scope = _read("release/evidence/release-scope-v1.json", contracts.read_release_scope)
         policy = _policy()
         _sign_contract_review(scope, policy)
-        with pytest.raises(evidence.EvidenceError, match="trust policy authority"):
+        with pytest.raises(evidence.EvidenceError, match="internal milestone sign-off"):
             contracts.validate_release_scope(scope, require_ready=True)
         with pytest.raises(evidence.EvidenceError, match="authority"):
             contracts.validate_release_scope(
@@ -3002,7 +3005,7 @@ class TestSourceRegistryAggregateEvidence:
     def test_aggregate_reaches_next_unimplemented_gate_after_source_registry(self, tmp_path, monkeypatch):
         arguments = _scenario(tmp_path)
         self._promote_predecessors(monkeypatch)
-        with pytest.raises(evidence.EvidenceError, match="gate C-CORPUS-SYNTHETIC"):
+        with pytest.raises(evidence.EvidenceError, match="gate C-POLICY-TRACE"):
             contracts.aggregate_records(**arguments)
 
     @pytest.mark.parametrize(("mutate", "match"), [

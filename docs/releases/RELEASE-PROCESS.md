@@ -1,5 +1,23 @@
 # Release process and integrity
 
+## Applicability
+
+The signing, detached-approval, tag and publication procedure below is dormant
+for the unpublished `v0.3.10` internal-integrity milestone. It becomes required
+when Quarry is published to an external package index, gains a second
+maintainer, or is operated as a service. For `v0.3.10`, the package remains
+version `0.3.9`; acceptance means the scoped integrity invariants pass on the
+maintainer's actual local and Linux CI environments and the maintainer records
+an unsigned sign-off in the release ledger. No production trust policy, signed
+tag, detached approval, CI image attestation, or publication receipt is a
+milestone prerequisite.
+
+This applicability rule does not relax observation provenance, immutable
+sealed-run evidence, content-digest verification, reproducibility, or the
+required tool/output receipts. The remaining sections define the deferred
+external-distribution procedure and stay dormant until one of the publication
+triggers above applies.
+
 This procedure implements the ordering in
 [`RELEASE-GATES.md`](RELEASE-GATES.md). It does not replace that contract or the
 version-specific scope ledger. A CI result, changelog entry, commit message, or
