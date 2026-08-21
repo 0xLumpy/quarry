@@ -5488,7 +5488,6 @@ def _semantic_publication_subjects(
 # dependency closure belongs to later owners).
 PROVISIONAL_SEMANTIC_VERIFIERS = MappingProxyType({
     **{gate_id: _semantic_benchmark for gate_id in PERFORMANCE_OPERATIONS},
-    "E-ARTIFACTS": _semantic_publication_subjects,
 })
 
 
@@ -7670,6 +7669,7 @@ SEMANTIC_VERIFIERS = MappingProxyType({
     "C-PERF-INGEST": _semantic_resource_benchmark,
     "C-PERF-DISK": _semantic_resource_benchmark,
     "C-PERF-RESOLVER": _semantic_resource_benchmark,
+    "E-ARTIFACTS": _semantic_publication_subjects,
     **{gate_id: _semantic_v310_05 for gate_id in V310_05_SEMANTIC_GATES},
 })
 

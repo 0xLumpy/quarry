@@ -2748,9 +2748,11 @@ class TestIncompleteSemanticRegistry:
                 "A-IDENTITY", "A-EVIDENCE-SCHEMA", "A-TAXONOMY", "A-CORPUS", "A-THRESHOLDS", "A-SUPPORT",
                 "B-HERMETIC-ALL", "B-SCHEMA", "B-DOCS-POLICY", "B-MANIFEST", "B-QUALITY", "B-COVERAGE", "B-STATIC-SECURITY", "B-DETERMINISM",
                 "C-PACKAGE-BUILD", "C-PACKAGE-INSTALL", "C-PYTHON-MATRIX", "C-SBOM", "C-VULNERABILITY", "C-PROVENANCE", "C-SOURCE-REGISTRY", "C-CORPUS-SYNTHETIC", "C-PATH-IDENTITY", "C-FAULT-STORE", "C-FAULT-REVISION", "C-FAULT-FINALIZE", "C-FAULT-CAMPAIGN", "C-NETWORK-BOUNDARY", "C-NET-DENY",
+                "E-ARTIFACTS",
                 *contracts.V310_05_SEMANTIC_GATES,
             }
         )
+        assert "E-ARTIFACTS" not in contracts.PROVISIONAL_SEMANTIC_VERIFIERS
         assert "C-PERF-PHASE-FAIRNESS" not in contracts.SEMANTIC_VERIFIERS
         arguments = _scenario(tmp_path)
         with pytest.raises(evidence.EvidenceError, match="gate C-TOOLS"):
