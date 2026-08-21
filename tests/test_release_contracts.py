@@ -2817,11 +2817,18 @@ class TestCommittedContracts:
         with pytest.raises(evidence.EvidenceError, match="canonical|LF"):
             reader(body[:-1] + b" \n")
 
-    def test_draft_matrices_cannot_be_used_as_accepted_inputs(self):
-        with pytest.raises(evidence.EvidenceError, match="draft"):
-            contracts.read_support_matrix(
-                (ROOT / "release/evidence/support-matrix-v1.json").read_bytes(), require_ready=True,
-            )
+    def test_internal_support_matrix_is_ready_without_distribution_attestation(self):
+        support = contracts.read_support_matrix(
+            (ROOT / "release/evidence/support-matrix-v1.json").read_bytes(), require_ready=True,
+        )
+        assert support["approval"]["signature"] is None
+        assert len(support["tools"]) == 26
+        assert len(support["template_sets"]) == 1
+        assert {row["runner_image"] for row in support["environments"]} == {
+            "github-actions-ubuntu-latest", "local-linux",
+        }
+
+    def test_draft_threshold_matrix_cannot_be_used_as_an_accepted_input(self):
         with pytest.raises(evidence.EvidenceError, match="draft"):
             contracts.read_threshold_manifest(
                 (ROOT / "release/evidence/threshold-benchmark-v1.json").read_bytes(),

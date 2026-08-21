@@ -21,7 +21,7 @@
         "isolation_profile": {"oneOf": [{"$ref": "#/$defs/digest"}, {"type": "null"}]},
         "os": {"$ref": "#/$defs/token"},
         "python": {"$ref": "#/$defs/token"},
-        "runner_image": {"oneOf": [{"$ref": "#/$defs/digest"}, {"type": "null"}]}
+        "runner_image": {"oneOf": [{"$ref": "#/$defs/digest"}, {"$ref": "#/$defs/token"}, {"type": "null"}]}
       },
       "required": ["architecture", "executable_digest", "implementation", "isolation_profile", "os", "python", "runner_image"],
       "type": "object"
@@ -35,7 +35,7 @@
         "lane": {"enum": ["H0-hermetic", "H1-tool-integration", "C0-private-corpus", "P0-package-supply"]},
         "os": {"$ref": "#/$defs/token"},
         "python": {"$ref": "#/$defs/token"},
-        "runner_image": {"oneOf": [{"$ref": "#/$defs/digest"}, {"type": "null"}]}
+        "runner_image": {"oneOf": [{"$ref": "#/$defs/digest"}, {"$ref": "#/$defs/token"}, {"type": "null"}]}
       },
       "required": ["architecture", "isolation_profile", "lane", "os", "python", "runner_image"],
       "type": "object"

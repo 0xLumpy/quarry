@@ -2104,9 +2104,13 @@ def validate_support_matrix(
             raise evidence.EvidenceError("support matrix environment lane is unsupported")
         for field in ("architecture", "os", "python"):
             _token(item[field], f"support matrix environment {field}")
-        for field in ("isolation_profile", "runner_image"):
-            if item[field] is not None:
-                _digest(item[field], f"support matrix environment {field}")
+        if item["isolation_profile"] is not None:
+            _digest(item["isolation_profile"], "support matrix environment isolation_profile")
+        if item["runner_image"] is not None:
+            if str(item["runner_image"]).startswith("sha256:"):
+                _digest(item["runner_image"], "support matrix environment runner_image")
+            else:
+                _token(item["runner_image"], "support matrix environment runner_image")
         environment_keys.append((
             LANE_ORDER.index(item["lane"]), item["os"], item["architecture"], item["python"],
         ))
@@ -2129,9 +2133,14 @@ def validate_support_matrix(
         })
         for field in ("architecture", "implementation", "os", "python"):
             _token(item[field], f"support matrix aggregator {field}")
-        for field in ("executable_digest", "isolation_profile", "runner_image"):
+        for field in ("executable_digest", "isolation_profile"):
             if item[field] is not None:
                 _digest(item[field], f"support matrix aggregator {field}")
+        if item["runner_image"] is not None:
+            if str(item["runner_image"]).startswith("sha256:"):
+                _digest(item["runner_image"], "support matrix aggregator runner_image")
+            else:
+                _token(item["runner_image"], "support matrix aggregator runner_image")
         aggregator_keys.append((
             item["os"], item["architecture"], item["implementation"], item["python"],
         ))
@@ -2155,7 +2164,18 @@ def validate_support_matrix(
     if require_ready:
         _approved(doc, "support matrix")
         if trust_policy is None:
-            raise evidence.EvidenceError("support matrix has no external review authority")
+            if doc["approval"]["signature"] is not None:
+                raise evidence.EvidenceError(
+                    "internal support matrix sign-off must not claim a cryptographic signature"
+                )
+            if (not doc["tools"] or not doc["template_sets"] or
+                    any(row["runner_image"] is None for row in environments) or
+                    any(row["runner_image"] is None or row["executable_digest"] is None
+                        for row in aggregators)):
+                raise evidence.EvidenceError(
+                    "internal support matrix has unresolved environment, tool or template identities"
+                )
+            return doc
         verify_contract_review(
             doc, policy=trust_policy, trusted_policy_digest=trusted_policy_digest,
         )
