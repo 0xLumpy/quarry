@@ -169,6 +169,26 @@ def _doors() -> list[dict]:
             sorted(network_policy.TRANSPORT_DOORS.items())]
 
 
+def _derived_counts(contracts: list[dict], doors: list[dict]) -> dict:
+    """Return the complete count contract from the resolved rows themselves."""
+    planned_ids = {row["source_id"] for row in contracts if row["section"] == "planned"}
+    auxiliary_ids = {row["source_id"] for row in contracts if row["section"] == "auxiliary"}
+    door_ids = {row["source_id"] for row in doors}
+    if len(planned_ids) + len(auxiliary_ids) != len(contracts):
+        raise SourceRegistryEvidenceError("resolved source contracts are not a disjoint partition")
+    if len(door_ids) != len(doors):
+        raise SourceRegistryEvidenceError("resolved transport doors are not unique")
+    return {
+        "planned_contract_count": len(planned_ids),
+        "auxiliary_contract_count": len(auxiliary_ids),
+        "canonical_contract_count": len(contracts),
+        "planned_door_count": len(door_ids & planned_ids),
+        "auxiliary_door_count": len(door_ids & auxiliary_ids),
+        "transport_door_count": len(doors),
+        "ownership_count": sum("ownership" in row and row["ownership"] is not None for row in contracts),
+    }
+
+
 def _static_emitter_inventory() -> dict:
     """Reuse the contract-boundary literal emitter discovery, deterministically."""
     package = importlib.import_module("quarry_recon.phases")
@@ -213,15 +233,40 @@ def _static_emitter_inventory() -> dict:
 def _synthetic_admissions(doors: list[dict]) -> list[dict]:
     rows = []
     for door in doors:
+        if door["source_id"] == "crawl.jxscout_chunks":
+            rows.append({
+                "door": door,
+                "synthetic_probe": {
+                    "kind": "environment-dependent",
+                    "value": "requires verified jxscout-chunks executable, bundle, and private scratch root",
+                },
+                "admission_class": "environment-dependent",
+                "admitted": None,
+                "observed_door": None,
+                "reason": "exact bwrap admission depends on local ownership, mode, and executable identity",
+            })
+            continue
         if door["helpers"]:
             probe = {"kind": "helper", "value": door["helpers"][0]}
             observed = network_policy.transport_door(door["source_id"], helper=probe["value"])
         else:
             argv = ["/synthetic/bin/" + door["argv0"][0], *door["required_argv"]]
+            if door["profile"] == "nuclei-authorized-http":
+                argv.extend(("-pt", "http,dns"))
             probe = {"kind": "argv", "value": argv}
             observed = network_policy.transport_door(door["source_id"], argv=argv)
+        if not door["supported"]:
+            if observed is not None:
+                raise SourceRegistryEvidenceError("unsupported transport door was admitted by a synthetic probe")
+            admission_class, admitted = "unsupported", None
+            reason = door["unsupported_reason"]
+        else:
+            if observed is None:
+                raise SourceRegistryEvidenceError("supported deterministic transport door was not admitted")
+            admission_class, admitted, reason = "deterministic", True, ""
         rows.append({
-            "door": door, "synthetic_probe": probe, "admitted": observed is not None,
+            "door": door, "synthetic_probe": probe, "admission_class": admission_class,
+            "admitted": admitted, "reason": reason,
             "observed_door": None if observed is None else _door_row(door["source_id"], observed),
         })
     return rows
@@ -242,7 +287,7 @@ def build(*, candidate_identity_digest: str, input_bodies: Mapping[str, bytes],
         raise SourceRegistryEvidenceError("registry reconciliation inputs are not the exact bounded set")
     contracts = _contracts(input_bodies["docs-policy-sources-registry"])
     doors = _doors()
-    return verify({
+    document = {
         "schema_version": SCHEMA_VERSION,
         "artifact_type": "source-registry-reconciliation",
         "release": "0.3.10",
@@ -254,7 +299,7 @@ def build(*, candidate_identity_digest: str, input_bodies: Mapping[str, bytes],
              "digest": "sha256:" + hashlib.sha256(input_bodies[name]).hexdigest()}
             for name, path in sorted(_INPUT_PATHS.items())
         ],
-        "counts": dict(_COUNTS),
+        "counts": _derived_counts(contracts, doors),
         "contracts": contracts,
         "doors": doors,
         "local_event_without_transport": list(_LOCAL_EVENT),
@@ -280,7 +325,8 @@ def build(*, candidate_identity_digest: str, input_bodies: Mapping[str, bytes],
             "receipt": _receipt(lane="H1-tool-integration", case_id="synthetic-transport-admission",
                                 nodeid=_H1_CASE, evidence_instance_id=h1_evidence_instance_id),
         },
-    })
+    }
+    return verify(document, input_bodies=input_bodies)
 
 
 def _verify_inputs(rows: object) -> None:
@@ -367,6 +413,9 @@ def verify(document: object, *, candidate_identity_digest: str | None = None,
             if input_bodies[name] != Path(module.__file__).read_bytes():
                 raise SourceRegistryEvidenceError("scope bytes are not the local semantic module being verified")
         root = Path(__file__).resolve().parents[2]
+        if input_bodies["docs-policy-sources-registry"] != (
+                root / _INPUT_PATHS["docs-policy-sources-registry"]).read_bytes():
+            raise SourceRegistryEvidenceError("scope bytes are not the local source registry being verified")
         for name in ("source-registry-reconciliation-schema", "source-registry-reconciliation-producer",
                      "source-registry-reconciliation-runtime", "source-registry-reconciliation-tests",
                      "source-registry-reconciliation-h1-tests"):
@@ -384,8 +433,6 @@ def verify(document: object, *, candidate_identity_digest: str | None = None,
             "test_h1_synthetic_transport_admission_receipt"} - found:
             raise SourceRegistryEvidenceError("source registry partition receipt tests are absent")
         registry_bytes = input_bodies["docs-policy-sources-registry"]
-    if doc["counts"] != _COUNTS:
-        raise SourceRegistryEvidenceError("registry reconciliation cardinality contract drift")
     expected_contracts, expected_doors = _contracts(registry_bytes), _doors()
     if input_bodies is not None and expected_contracts != _contracts():
         raise SourceRegistryEvidenceError("bound source registry bytes do not reproduce the executing source registry")
@@ -402,6 +449,9 @@ def verify(document: object, *, candidate_identity_digest: str | None = None,
         raise SourceRegistryEvidenceError("registry reconciliation contracts omit, overlap, or alter an emitted ID")
     if doc["doors"] != expected_doors:
         raise SourceRegistryEvidenceError("registry reconciliation transport doors omit or alter admission facts")
+    derived_counts = _derived_counts(expected_contracts, expected_doors)
+    if derived_counts != _COUNTS or doc["counts"] != derived_counts:
+        raise SourceRegistryEvidenceError("registry reconciliation cardinality contract drift")
     if doc["local_event_without_transport"] != _LOCAL_EVENT:
         raise SourceRegistryEvidenceError("only evidence.ownership may be a local event without a transport door")
     ids = [row["source_id"] for row in expected_contracts]

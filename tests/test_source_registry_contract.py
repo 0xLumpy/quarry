@@ -37,6 +37,7 @@ def test_reconciliation_is_canonical_complete_and_execution_free():
     assert artifact["local_event_without_transport"] == ["evidence.ownership"]
     assert artifact["h0_static_emitter"]["executed_lane_count"] == 0
     assert artifact["h1_synthetic_admission"]["executed_lane_count"] == 0
+    assert artifact["counts"] == registry._derived_counts(artifact["contracts"], artifact["doors"])
 
 
 
@@ -51,6 +52,14 @@ def test_reconciliation_rejects_each_authoritative_input_digest_mutation(name):
     mutated[name] += b"# mutation\n"
     with pytest.raises(registry.SourceRegistryEvidenceError, match="digest drift"):
         registry.verify(artifact, input_bodies=mutated)
+
+
+@pytest.mark.parametrize("name", sorted(registry._INPUT_PATHS))
+def test_build_rejects_every_substituted_bound_source_input(name):
+    bodies = _inputs()
+    bodies[name] += b"# substituted input\n"
+    with pytest.raises(registry.SourceRegistryEvidenceError):
+        registry.build(candidate_identity_digest=_CANDIDATE, input_bodies=bodies)
 
 
 @pytest.mark.parametrize("mutation", ["auxiliary", "door", "special", "literal", "dynamic", "h1", "nodeid", "selection"])
@@ -93,6 +102,7 @@ def test_schema_and_reader_reject_the_same_receipt_and_probe_shape_mutations():
     artifact, _bodies = _artifact()
     schema = json.loads((ROOT / "release/evidence/schemas/source-registry-reconciliation-v1.schema.json").read_bytes())
     validator = validator_module.Draft202012Validator(schema)
+    assert list(validator.iter_errors(artifact)) == []
     for mutate in (
         lambda item: item["h0_static_emitter"]["receipt"].pop("selection"),
         lambda item: item["h1_synthetic_admission"]["receipt"]["selection"].update(selected=2),
@@ -103,3 +113,20 @@ def test_schema_and_reader_reject_the_same_receipt_and_probe_shape_mutations():
         assert list(validator.iter_errors(changed))
         with pytest.raises(registry.SourceRegistryEvidenceError):
             registry.verify(changed)
+
+
+def test_synthetic_admissions_are_exact_for_nuclei_and_jxscout_boundaries():
+    artifact, _bodies = _artifact()
+    admissions = {row["door"]["source_id"]: row for row in artifact["h1_synthetic_admission"]["admissions"]}
+    nuclei = [row for source_id, row in admissions.items() if "nuclei" in source_id]
+    assert nuclei
+    assert all(row["admission_class"] == "deterministic" and row["admitted"] is True and
+               row["synthetic_probe"]["value"][-2:] == ["-pt", "http,dns"]
+               for row in nuclei)
+    assert admissions["crawl.jxscout_chunks"]["admission_class"] == "environment-dependent"
+    assert admissions["crawl.jxscout_chunks"]["admitted"] is None
+    assert admissions["crawl.jxscout_ast"]["admission_class"] == "unsupported"
+    assert admissions["crawl.jxscout_ast"]["admitted"] is None
+    for row in admissions.values():
+        if row["admission_class"] == "deterministic":
+            assert row["door"]["supported"] is True and row["admitted"] is True

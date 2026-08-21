@@ -2633,16 +2633,19 @@ class TestIncompleteSemanticRegistry:
 
 class TestSourceRegistryAggregateEvidence:
     @staticmethod
-    def _promote_tools(monkeypatch):
-        """Let the aggregate reach C-SOURCE-REGISTRY without claiming C-TOOLS promotion."""
+    def _promote_predecessors(monkeypatch):
+        """Let the aggregate reach C-SOURCE-REGISTRY without changing production promotion."""
         monkeypatch.setattr(contracts, "SEMANTIC_VERIFIERS", MappingProxyType({
-            **contracts.SEMANTIC_VERIFIERS, "C-TOOLS": lambda *_args, **_kwargs: None,
+            **contracts.SEMANTIC_VERIFIERS,
+            "C-TOOLS": lambda *_args, **_kwargs: None,
+            "C-OUTPUT-CONTRACT": lambda *_args, **_kwargs: None,
+            "C-NETWORK-BOUNDARY": lambda *_args, **_kwargs: None,
         }))
 
     def test_aggregate_reaches_next_unimplemented_gate_after_source_registry(self, tmp_path, monkeypatch):
         arguments = _scenario(tmp_path)
-        self._promote_tools(monkeypatch)
-        with pytest.raises(evidence.EvidenceError, match="gate C-OUTPUT-CONTRACT"):
+        self._promote_predecessors(monkeypatch)
+        with pytest.raises(evidence.EvidenceError, match="gate C-CORPUS-SYNTHETIC"):
             contracts.aggregate_records(**arguments)
 
     @pytest.mark.parametrize(("mutate", "match"), [
@@ -2655,7 +2658,7 @@ class TestSourceRegistryAggregateEvidence:
     ])
     def test_receipt_substitutions_fail_during_aggregate(self, tmp_path, monkeypatch, mutate, match):
         arguments = _scenario(tmp_path)
-        self._promote_tools(monkeypatch)
+        self._promote_predecessors(monkeypatch)
         artifact = next(row for row in arguments["artifact_index"]["artifacts"]
                         if row["gate_id"] == "C-SOURCE-REGISTRY" and
                         row["name"] == "registry-reconciliation")
