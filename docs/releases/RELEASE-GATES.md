@@ -367,6 +367,13 @@ union-truth cases.  Their source files and exact node projections are scope
 bound, and each verifier requires one complete passing retained H0 run.  Both
 remain `OPEN` until their signed H0 records are accepted.
 
+`C-FAULT-INTERRUPT` freezes 107 existing H0 source-line and transition cases
+covering attempt allocation, managed acquisition, publication, revision and
+campaign settlement, plus the existing 17-case H1 runner-cancellation lane.
+Its verifier reconciles the H0 subset with `B-HERMETIC-ALL` and requires one
+signed H1 owner for the exact combined 124-row matrix.  The gate remains
+`OPEN` until those candidate-bound signed H0/H1 records are accepted.
+
 #### Performance and scale matrix
 
 Performance claims require a versioned benchmark manifest. It identifies the

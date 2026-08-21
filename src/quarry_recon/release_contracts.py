@@ -440,6 +440,21 @@ _ARCHIVE_FETCH_INPUTS = MappingProxyType({
     "archive-fetch-h0-tests": "tests/test_qr39_007_installer_staging.py",
     "archive-fetch-h1-tests": "tests/test_archive_fetch_integration.py",
 })
+_FAULT_INTERRUPT_INPUTS = MappingProxyType({
+    "fault-interrupt-test-attempt": "tests/test_phase1_attempt_authority.py",
+    "fault-interrupt-test-acquisition": "tests/test_phase1_managed_acquisition.py",
+    "fault-interrupt-test-stage-publication": "tests/test_phase1_stage_publication.py",
+    "manifest-revision-tests": "tests/test_v310_revision_transaction.py",
+    "fault-interrupt-test-campaign-union": "tests/test_campaign_union.py",
+    "fault-runner-test-cancel": "tests/test_runner_cancel.py",
+    "fault-store-runtime-store": "src/quarry_recon/store.py",
+    "fault-runner-runtime-contract": "src/quarry_recon/contract.py",
+    "fault-store-runtime-privfs": "src/quarry_recon/privfs.py",
+    "manifest-revision-runtime": "src/quarry_recon/revision.py",
+    "manifest-campaign-runtime": "src/quarry_recon/campaign.py",
+    "fault-runner-runtime-runner": "src/quarry_recon/runner.py",
+    "fault-interrupt-runtime-params": "src/quarry_recon/phases/params.py",
+})
 
 SCHEMA_PATHS = {
     "aggregate-schema": "release/evidence/schemas/release-aggregate-v1.schema.json",
@@ -628,6 +643,7 @@ SCOPE_INPUT_PATHS = {
     **fault_store_evidence.INPUT_PATHS,
     **path_identity_evidence.INPUT_PATHS,
     **_ARCHIVE_FETCH_INPUTS,
+    **_FAULT_INTERRUPT_INPUTS,
     "private-files-case-roster": "release/evidence/private-files-case-roster-v1.json",
     "private-files-evidence-producer": "scripts/emit_private_files_evidence.py",
     "private-files-evidence-runtime": "src/quarry_recon/private_files_evidence.py",
@@ -1310,6 +1326,151 @@ _ARCHIVE_FETCH_H0_NODEIDS = (
 _ARCHIVE_FETCH_H1_NODEIDS = (
     "tests/test_archive_fetch_integration.py::test_local_redirect_download_verifies_and_extracts_the_same_archive",
 )
+_FAULT_INTERRUPT_ATTEMPT_NODEIDS = (
+    tuple(
+        "tests/test_phase1_attempt_authority.py::"
+        "test_directory_allocation_source_line_cancellation_settles_descriptors"
+        f"[{method}-{kind}]"
+        for method in ("fresh_artifact_dir", "create_artifact_dir")
+        for kind in ("KeyboardInterrupt", "SystemExit")
+    )
+    + tuple(
+        "tests/test_phase1_attempt_authority.py::"
+        "test_artifact_claim_cleanup_source_line_cancellation_is_terminal"
+        f"[{kind}]"
+        for kind in ("KeyboardInterrupt", "SystemExit")
+    )
+    + tuple(
+        "tests/test_phase1_attempt_authority.py::"
+        "test_directory_allocation_effect_lines_are_owned_by_active_fences"
+        f"[{method}-{operation}-{kind}]"
+        for method, operation in (
+            ("fresh_artifact_dir", "allocate_fresh"),
+            ("create_artifact_dir", "create_exact"),
+        )
+        for kind in ("KeyboardInterrupt", "SystemExit")
+    )
+    + tuple(
+        "tests/test_phase1_attempt_authority.py::"
+        "test_claim_effect_and_cleanup_lines_are_owned_by_active_fences"
+        f"[{operation}-{kind}]"
+        for operation in (
+            "open_writer", "fence", "_settle", "settle", "open", "close_once",
+            "_close_owned_descriptors_twice", "reconcile", "__exit__",
+        )
+        for kind in ("KeyboardInterrupt", "SystemExit")
+    )
+    + tuple(
+        "tests/test_phase1_attempt_authority.py::"
+        "test_claim_publication_source_line_cancellation_is_terminal_and_preserves_truth"
+        f"[{kind}]"
+        for kind in ("KeyboardInterrupt", "SystemExit")
+    )
+)
+_FAULT_INTERRUPT_ACQUISITION_NODEIDS = (
+    tuple(
+        "tests/test_phase1_managed_acquisition.py::"
+        f"test_stream_to_fd_attaches_exact_prefix_to_cancellation[{kind}]"
+        for kind in ("KeyboardInterrupt", "SystemExit")
+    )
+    + tuple(
+        "tests/test_phase1_managed_acquisition.py::"
+        "test_stream_to_fd_source_line_cancellation_is_exact_and_settled"
+        f"[{operation}-{kind}]"
+        for operation in (
+            "stream_to_fd", "_stream_to_fd_body", "activate", "begin_chunk", "take0",
+            "reconcile_descriptor", "finalize0", "attach", "reconcile0", "take1",
+            "finalize1", "_activate_descriptor_stream", "_take_descriptor_stream",
+            "_reconcile_descriptor_stream", "_finalize_descriptor_stream", "settle",
+            "remember", "reconcile1", "_leave", "__exit__", "result",
+        )
+        for kind in ("KeyboardInterrupt", "SystemExit")
+    )
+    + tuple(
+        "tests/test_phase1_managed_acquisition.py::"
+        "test_each_fence_exit_source_line_cancellation_has_terminal_metadata"
+        f"[{kind}-{invocation}]"
+        for kind in ("KeyboardInterrupt", "SystemExit")
+        for invocation in (1, 2, 3)
+    )
+    + tuple(
+        "tests/test_phase1_managed_acquisition.py::"
+        f"test_governor_total_sync_source_lines_are_fenced[{kind}]"
+        for kind in ("KeyboardInterrupt", "SystemExit")
+    )
+    + tuple(
+        "tests/test_phase1_managed_acquisition.py::"
+        f"test_governor_reservation_creation_has_no_pre_fence_effect[{kind}]"
+        for kind in ("KeyboardInterrupt", "SystemExit")
+    )
+    + (
+        "tests/test_phase1_managed_acquisition.py::"
+        "test_cancelling_one_stream_does_not_settle_another_active_token",
+    )
+    + tuple(
+        "tests/test_phase1_managed_acquisition.py::"
+        "test_ownership_forfeit_source_line_cancellation_is_terminal"
+        f"[{operation}-{kind}]"
+        for operation in ("refuse_ownership", "forfeit", "_forfeit_descriptor_stream")
+        for kind in ("KeyboardInterrupt", "SystemExit")
+    )
+    + (
+        "tests/test_phase1_managed_acquisition.py::"
+        "test_cleanup_fault_never_masks_exact_cancellation",
+        "tests/test_phase1_managed_acquisition.py::"
+        "test_cleanup_fault_attaches_without_replacing_incomplete",
+    )
+)
+_FAULT_INTERRUPT_TRANSITION_NODEIDS = (
+    "tests/test_phase1_stage_publication.py::"
+    "test_publication_cancellation_before_rename_fences_and_preserves_prior_final",
+    "tests/test_phase1_stage_publication.py::"
+    "test_settlement_cancellation_requires_explicit_fence_and_never_publishes",
+    *(
+        "tests/test_v310_revision_transaction.py::"
+        f"{test_name}[sentinel{index}]"
+        for test_name in (
+            "test_close_after_effect_preserves_control_flow_and_marks_landed",
+            "test_restored_pointer_settlement_preserves_control_flow",
+            "test_prepublication_control_flow_is_preserved_exactly",
+            "test_pointer_temp_close_control_flow_is_not_masked",
+        )
+        for index in (0, 1)
+    ),
+    "tests/test_campaign_union.py::TestTheUnionCarriesItsOwnTrust::"
+    "test_an_interrupted_swap_leaves_the_PREVIOUS_generation_readable",
+    "tests/test_campaign_union.py::TestTheUnionCarriesItsOwnTrust::"
+    "test_a_CANCELLED_publication_leaves_the_object_holding_what_the_DISK_holds",
+    "tests/test_campaign_union.py::TestTheUnionCarriesItsOwnTrust::"
+    "test_a_cancelled_ABSORB_re_raises_and_settles",
+    "tests/test_campaign_union.py::TestTheUnionCarriesItsOwnTrust::"
+    "test_a_publication_that_LANDED_before_the_interruption_is_adopted",
+)
+_FAULT_INTERRUPT_H0_NODEIDS = (
+    _FAULT_INTERRUPT_ATTEMPT_NODEIDS
+    + _FAULT_INTERRUPT_ACQUISITION_NODEIDS
+    + _FAULT_INTERRUPT_TRANSITION_NODEIDS
+)
+_FAULT_INTERRUPT_H1_NODEIDS = (
+    "tests/test_runner_cancel.py::test_cancel_all_terminates_a_running_child_within_a_bound",
+    "tests/test_runner_cancel.py::test_cancel_all_terminates_every_concurrent_child",
+    "tests/test_runner_cancel.py::test_no_process_survives_cancellation",
+    "tests/test_runner_cancel.py::test_a_failed_launch_does_not_poison_later_cpu_measurement",
+    "tests/test_runner_cancel.py::test_an_unexpected_exception_never_orphans_a_running_child",
+    "tests/test_runner_cancel.py::test_an_exited_leader_does_not_leave_its_process_group_alive",
+    "tests/test_runner_cancel.py::test_cleanup_never_masks_the_exception_in_flight",
+    "tests/test_runner_cancel.py::test_group_teardown_happens_exactly_once_per_path",
+    "tests/test_runner_cancel.py::test_group_teardown_is_scoped_to_exceptional_exits",
+    "tests/test_runner_cancel.py::test_an_in_flight_exception_does_not_poison_later_cpu_measurement",
+    "tests/test_runner_cancel.py::test_arjun_lane_cancellation_is_bounded",
+    "tests/test_runner_cancel.py::test_stubborn_children_share_one_grace_deadline",
+    "tests/test_runner_cancel.py::test_completed_work_is_harvested_before_the_kill",
+    "tests/test_runner_cancel.py::test_post_kill_reaping_uses_one_shared_deadline",
+    "tests/test_runner_cancel.py::test_work_finishing_during_the_kill_race_is_still_harvested",
+    "tests/test_runner_cancel.py::test_lane_returns_even_when_termination_fails",
+    "tests/test_runner_cancel.py::test_concurrent_runs_report_cpu_unmeasured_not_fabricated",
+)
+_FAULT_INTERRUPT_NODEIDS = _FAULT_INTERRUPT_H0_NODEIDS + _FAULT_INTERRUPT_H1_NODEIDS
 _PRIVATE_FILES_INPUT_NAMES = (
     "private-files-case-roster",
     "private-files-case-roster-schema",
@@ -7392,6 +7553,109 @@ def _semantic_archive_fetch(
     )
 
 
+def _semantic_fault_interrupt(
+    gate: dict, bodies: Mapping[str, bytes], **context: object,
+) -> None:
+    """Reconcile exhaustive H0 transition cancellation with real H1 teardown."""
+    if gate["gate_id"] != "C-FAULT-INTERRUPT":  # pragma: no cover - registry invariant
+        raise evidence.EvidenceError("fault-interrupt verifier received the wrong gate")
+    identity = context["identity"]
+    report = context["report"]
+    resolver = context["resolver"]
+    scope = context["scope"]
+    inputs = context["input_bodies"]
+    if (not isinstance(identity, dict) or not isinstance(report, dict) or
+            not isinstance(resolver, ArtifactResolver) or not isinstance(scope, dict) or
+            not isinstance(inputs, Mapping)):
+        raise evidence.EvidenceError(
+            "fault-interrupt verifier requires accepted aggregate context"
+        )
+
+    scope_bindings = {row["name"]: row for row in scope["input_bindings"]}
+    for name, path in _FAULT_INTERRUPT_INPUTS.items():
+        binding = scope_bindings.get(name)
+        body = inputs.get(name)
+        if (binding is None or binding["path"] != path or type(body) is not bytes or
+                raw_sha256(body) != binding["digest"]):
+            raise evidence.EvidenceError(
+                "fault-interrupt source input is absent, redirected or drifted"
+            )
+
+    if (len(_FAULT_INTERRUPT_H0_NODEIDS) != 107 or
+            len(_FAULT_INTERRUPT_H1_NODEIDS) != 17 or
+            len(set(_FAULT_INTERRUPT_NODEIDS)) != 124 or
+            set(_FAULT_INTERRUPT_H0_NODEIDS) & set(_FAULT_INTERRUPT_H1_NODEIDS)):
+        raise evidence.EvidenceError("fault-interrupt frozen lane partition is inconsistent")
+
+    matrix_body = bodies.get("fault-matrix")
+    matrix_record = next(
+        (row for row in gate["artifacts"] if row["name"] == "fault-matrix"), None,
+    )
+    if (type(matrix_body) is not bytes or matrix_record is None or
+            matrix_record["media_type"] != "application/json" or
+            matrix_record["digest"] != raw_sha256(matrix_body)):
+        raise evidence.EvidenceError(
+            "fault-interrupt matrix does not match its signed gate record"
+        )
+    expected_matrix = _machine_report_document(
+        gate_id="C-FAULT-INTERRUPT",
+        name="fault-matrix",
+        identity=identity,
+        subjects=_FAULT_INTERRUPT_NODEIDS,
+    )
+    if (_artifact_document(matrix_body, "C-FAULT-INTERRUPT", "fault-matrix") !=
+            expected_matrix):
+        raise evidence.EvidenceError(
+            "C-FAULT-INTERRUPT matrix is not the exact frozen mixed-lane roster"
+        )
+
+    instances = report["instances"]
+    if [row["lane"] for row in instances] != [
+        "H0-hermetic", "H1-tool-integration",
+    ]:
+        raise evidence.EvidenceError(
+            "fault-interrupt evidence requires one exact signed H0 and H1 instance"
+        )
+    h0, h1 = instances
+
+    def selection(count: int) -> dict[str, int]:
+        return {
+            "collected": count,
+            "deselected": 0,
+            "failed": 0,
+            "passed": count,
+            "selected": count,
+            "skipped": 0,
+            "xfailed": 0,
+            "xpassed": 0,
+        }
+
+    expected_h0 = selection(len(_FAULT_INTERRUPT_H0_NODEIDS))
+    expected_h1 = selection(len(_FAULT_INTERRUPT_H1_NODEIDS))
+    expected_total = {
+        key: expected_h0[key] + expected_h1[key] for key in expected_h0
+    }
+    if (h0["selection"] != expected_h0 or h1["selection"] != expected_h1 or
+            gate["selection"] != expected_total):
+        raise evidence.EvidenceError(
+            "fault-interrupt signed records do not select the exact H0/H1 partition"
+        )
+    expected_owner = [{
+        "digest": raw_sha256(matrix_body), "name": "fault-matrix",
+    }]
+    if h0["artifacts"] or h1["artifacts"] != expected_owner:
+        raise evidence.EvidenceError(
+            "fault-interrupt matrix is not owned by the exact signed H1 instance"
+        )
+    _reconcile_h0_node_subset(
+        resolver=resolver,
+        identity=identity,
+        instance=h0,
+        nodeids=_FAULT_INTERRUPT_H0_NODEIDS,
+        label="fault-interrupt",
+    )
+
+
 def _semantic_manifest(
     gate: dict, bodies: Mapping[str, bytes], **context: object,
 ) -> None:
@@ -8199,6 +8463,7 @@ SEMANTIC_VERIFIERS = MappingProxyType({
     "C-FAULT-FINALIZE": _semantic_fault_h0_matrix,
     "C-FAULT-CAMPAIGN": _semantic_fault_h0_matrix,
     "C-FAULT-RUNNER": _semantic_fault_runner,
+    "C-FAULT-INTERRUPT": _semantic_fault_interrupt,
     "C-PACKAGE-BUILD": _semantic_package_build,
     "C-PYTHON-MATRIX": _semantic_python_matrix,
     "C-NETWORK-BOUNDARY": _semantic_network_boundary,

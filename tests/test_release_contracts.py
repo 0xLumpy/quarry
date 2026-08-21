@@ -370,6 +370,7 @@ def _h0_collection_nodes() -> list[str]:
     nodes.extend(contracts._FAULT_CAMPAIGN_NODEIDS)
     nodes.extend(contracts._FAULT_RUNNER_H0_NODEIDS)
     nodes.extend(contracts._ARCHIVE_FETCH_H0_NODEIDS)
+    nodes.extend(contracts._FAULT_INTERRUPT_H0_NODEIDS)
     return sorted(set(nodes), key=lambda value: value.encode("utf-8"))
 
 
@@ -656,6 +657,15 @@ def _supporting_bodies(
                 name="fault-matrix",
                 identity=identity,
                 subjects=contracts._FAULT_RUNNER_NODEIDS,
+            )
+        )
+    elif gate_id == "C-FAULT-INTERRUPT":
+        bodies["fault-matrix"] = contracts.canonical_json_line(
+            contracts._machine_report_document(
+                gate_id=gate_id,
+                name="fault-matrix",
+                identity=identity,
+                subjects=contracts._FAULT_INTERRUPT_NODEIDS,
             )
         )
     elif gate_id == "B-SCHEMA":
@@ -2074,6 +2084,17 @@ def _scenario(tmp_path: Path, *, approved_at: str = "2026-08-01T00:00:00Z"):
                         "passed": count, "selected": count, "skipped": 0,
                         "xfailed": 0, "xpassed": 0,
                     }
+                if gate_id == "C-FAULT-INTERRUPT":
+                    count = len(
+                        contracts._FAULT_INTERRUPT_H0_NODEIDS
+                        if environment["lane"] == "H0-hermetic"
+                        else contracts._FAULT_INTERRUPT_H1_NODEIDS
+                    )
+                    selection = {
+                        "collected": count, "deselected": 0, "failed": 0,
+                        "passed": count, "selected": count, "skipped": 0,
+                        "xfailed": 0, "xpassed": 0,
+                    }
                 if gate_id == "C-PRIVATE-FILES":
                     selection = {
                         "collected": 3, "deselected": 0, "failed": 0,
@@ -2223,6 +2244,11 @@ def _scenario(tmp_path: Path, *, approved_at: str = "2026-08-01T00:00:00Z"):
                         instance for instance in instances
                         if instance["lane"] == "H1-tool-integration"
                     )
+                if gate_id == "C-FAULT-INTERRUPT":
+                    target_instance = next(
+                        instance for instance in instances
+                        if instance["lane"] == "H1-tool-integration"
+                    )
                 if gate_id == "C-ARCHIVE-FETCH":
                     target_lane = (
                         "H1-tool-integration" if artifact_name == "activation-trace"
@@ -2313,6 +2339,11 @@ def _scenario(tmp_path: Path, *, approved_at: str = "2026-08-01T00:00:00Z"):
                 for name in selection
             }
         if gate_id == "C-ARCHIVE-FETCH":
+            selection = {
+                name: sum(instance["selection"][name] for instance in instances)
+                for name in selection
+            }
+        if gate_id == "C-FAULT-INTERRUPT":
             selection = {
                 name: sum(instance["selection"][name] for instance in instances)
                 for name in selection
@@ -2945,7 +2976,7 @@ class TestIncompleteSemanticRegistry:
             | {
                 "A-IDENTITY", "A-EVIDENCE-SCHEMA", "A-TAXONOMY", "A-CORPUS", "A-THRESHOLDS", "A-SUPPORT",
                 "B-HERMETIC-ALL", "B-SCHEMA", "B-DOCS-POLICY", "B-MANIFEST", "B-QUALITY", "B-COVERAGE", "B-STATIC-SECURITY", "B-DETERMINISM",
-                "C-PACKAGE-BUILD", "C-PACKAGE-INSTALL", "C-PYTHON-MATRIX", "C-SBOM", "C-VULNERABILITY", "C-PROVENANCE", "C-SOURCE-REGISTRY", "C-CORPUS-SYNTHETIC", "C-PRIVATE-FILES", "C-PATH-IDENTITY", "C-ARCHIVE-FETCH", "C-FAULT-STORE", "C-FAULT-REVISION", "C-FAULT-FINALIZE", "C-FAULT-CAMPAIGN", "C-FAULT-RUNNER", "C-NETWORK-BOUNDARY", "C-NET-DENY",
+                "C-PACKAGE-BUILD", "C-PACKAGE-INSTALL", "C-PYTHON-MATRIX", "C-SBOM", "C-VULNERABILITY", "C-PROVENANCE", "C-SOURCE-REGISTRY", "C-CORPUS-SYNTHETIC", "C-PRIVATE-FILES", "C-PATH-IDENTITY", "C-ARCHIVE-FETCH", "C-FAULT-STORE", "C-FAULT-REVISION", "C-FAULT-FINALIZE", "C-FAULT-CAMPAIGN", "C-FAULT-RUNNER", "C-FAULT-INTERRUPT", "C-NETWORK-BOUNDARY", "C-NET-DENY",
                 "E-DOCS", "E-PROJECT-HYGIENE", "E-ARTIFACTS",
                 *contracts.V310_05_SEMANTIC_GATES,
             }
@@ -3322,6 +3353,64 @@ class TestArchiveFetchSemanticEvidence:
         ] = digest
         report["instances"][1]["artifacts"][0]["digest"] = digest
         with pytest.raises(evidence.EvidenceError, match="exact frozen case roster"):
+            self._verify(arguments, gate, bodies, report)
+
+
+class TestFaultInterruptSemanticEvidence:
+    @staticmethod
+    def _case(tmp_path):
+        arguments = _scenario(tmp_path)
+        gate = _gate(arguments, "C-FAULT-INTERRUPT")
+        indexed = {
+            row["name"]: row for row in arguments["artifact_index"]["artifacts"]
+            if row["gate_id"] == "C-FAULT-INTERRUPT"
+        }
+        bodies = {
+            "fault-matrix": (
+                arguments["artifact_root"] / indexed["fault-matrix"]["path"]
+            ).read_bytes(),
+        }
+        report = contracts.read_evidence_report(
+            (arguments["artifact_root"] / indexed["gate-evidence"]["path"]).read_bytes(),
+            identity=arguments["identity"],
+            gate_id="C-FAULT-INTERRUPT",
+        )
+        return arguments, gate, bodies, report
+
+    @staticmethod
+    def _verify(arguments, gate, bodies, report):
+        with contracts.ArtifactResolver(
+            arguments["artifact_root"], arguments["artifact_index"],
+            identity=arguments["identity"],
+        ) as resolver:
+            contracts._semantic_fault_interrupt(
+                gate,
+                bodies,
+                identity=arguments["identity"],
+                input_bodies=arguments["input_bodies"],
+                report=report,
+                resolver=resolver,
+                scope=arguments["scope"],
+            )
+
+    def test_exact_transition_matrix_reuses_h0_and_owns_h1(self, tmp_path):
+        arguments, gate, bodies, report = self._case(tmp_path)
+        self._verify(arguments, gate, bodies, report)
+
+    def test_node_substitution_fails_after_digest_rebinding(self, tmp_path):
+        arguments, gate, bodies, report = self._case(tmp_path)
+        document = json.loads(bodies["fault-matrix"])
+        document["records"][-1]["result"]["subject"] = "tests/substituted.py::test_case"
+        document["records"][-1]["result_digest"] = evidence.canonical_digest(
+            document["records"][-1]["result"]
+        )
+        bodies["fault-matrix"] = contracts.canonical_json_line(document)
+        digest = contracts.raw_sha256(bodies["fault-matrix"])
+        next(row for row in gate["artifacts"] if row["name"] == "fault-matrix")[
+            "digest"
+        ] = digest
+        report["instances"][1]["artifacts"][0]["digest"] = digest
+        with pytest.raises(evidence.EvidenceError, match="exact frozen mixed-lane roster"):
             self._verify(arguments, gate, bodies, report)
 
 
