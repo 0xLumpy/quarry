@@ -846,6 +846,15 @@ def binds_broker_free_launch_to_repository(door: TransportDoor | None, argv,
     return bundle != root and scratch != root
 
 
+def _network_text(network) -> str:
+    """Render IPv4-mapped IPv6 CIDRs consistently across supported Python minors."""
+    if network.version == 6 and network.prefixlen >= 96:
+        mapped = network.network_address.ipv4_mapped
+        if mapped is not None:
+            return f"::ffff:{mapped}/{network.prefixlen}"
+    return str(network)
+
+
 def _canonical_network(value, *, require_canonical: bool = True):
     if type(value) is not str or not value or value != value.strip() or "\x00" in value:
         raise NetworkPolicyError("protected network must be canonical CIDR text")
@@ -853,7 +862,7 @@ def _canonical_network(value, *, require_canonical: bool = True):
         network = ipaddress.ip_network(value, strict=True)
     except ValueError as exc:
         raise NetworkPolicyError("protected network must be canonical CIDR text") from exc
-    if require_canonical and str(network) != value.lower():
+    if require_canonical and _network_text(network) != value.lower():
         raise NetworkPolicyError("protected network must be canonical CIDR text")
     return network
 
@@ -871,7 +880,7 @@ def canonical_control_plane_cidrs(values) -> tuple[str, ...]:
     }
     if len(identities) != len(networks):
         raise NetworkPolicyError("control-plane destination list contains duplicates")
-    return tuple(str(network) for network in sorted(
+    return tuple(_network_text(network) for network in sorted(
         networks,
         key=lambda item: (item.version, int(item.network_address), item.prefixlen),
     ))
@@ -914,7 +923,7 @@ def subtract_protected_cidrs(cidrs, protected_cidrs) -> tuple[str, ...]:
             item for item in result if item.version == version
         )
     ]
-    return tuple(str(network) for network in sorted(
+    return tuple(_network_text(network) for network in sorted(
         collapsed,
         key=lambda item: (item.version, int(item.network_address), item.prefixlen),
     ))
@@ -1121,7 +1130,7 @@ class NetworkPolicyScope:
             block_private=block_private_targets,
         )
         self.requested_cidrs = tuple(
-            str(_canonical_network(value, require_canonical=False))
+            _network_text(_canonical_network(value, require_canonical=False))
             for value in requested_cidrs
         )
         self.effective_cidrs = subtract_protected_cidrs(
