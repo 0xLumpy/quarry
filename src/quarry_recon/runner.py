@@ -18,6 +18,7 @@ import tempfile
 import threading
 import time
 from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 
@@ -82,6 +83,13 @@ def _proc_mem_kb(pid: int) -> int:
 # Some tools write stray files to the current directory (gowitness's sqlite, github-subdomains'
 # <domain>.txt, …), so tools run in a per-run scratch dir; all real tool I/O uses absolute paths.
 _TOOL_CWD: str | None = None
+
+
+def _execution_timestamp() -> str:
+    """Return the parent runner's precise, timezone-aware observation time."""
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace(
+        "+00:00", "Z",
+    )
 
 
 def set_tool_cwd(path) -> None:
@@ -349,6 +357,71 @@ class RunResult:
         """Ran acceptably. LIMITED belongs here: the execution was clean and something external cut it
         short."""
         return self.status in (Status.SUCCESS, Status.PARTIAL, Status.LIMITED)
+
+
+_REPOSITORY_TESTIMONY_AUTHORITY = object()
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _RepositoryExecutionTestimony:
+    """Opaque snapshot made only after repository execution has settled."""
+
+    result_identity: int
+    repository_identity: int
+    document_json: bytes = field(repr=False)
+    authority: object = field(repr=False, compare=False)
+
+
+def _seal_repository_execution_testimony(result: RunResult, repository) -> None:
+    """Freeze collector inputs after all publication/native cleanup is complete."""
+    meta = result.meta
+    fields = {
+        "execution_finished_at", "execution_request_id", "execution_settlement",
+        "execution_started_at", "execution_terminal",
+        "native_outputs", "repository_ownership_settled", "repository_publication",
+        "process_group_settled", "process_tree_settled",
+        "repository_stderr_path", "repository_stdout_path",
+        "runtime_identity", "runtime_identity_ref", "runtime_source_argv",
+        "runtime_source_argv_indexes", "streams",
+    }
+    if not fields.issubset(meta):
+        return
+    document = {field: meta[field] for field in sorted(fields)}
+    encoded = json.dumps(
+        document, ensure_ascii=False, allow_nan=False, sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8", "strict")
+    meta["_repository_execution_testimony"] = _RepositoryExecutionTestimony(
+        result_identity=id(result), repository_identity=id(repository),
+        document_json=encoded, authority=_REPOSITORY_TESTIMONY_AUTHORITY,
+    )
+
+
+def repository_execution_testimony(result: RunResult, *, repository) -> dict:
+    """Return the runner-sealed source facts for one exact repository result.
+
+    This is deliberately not a serialization of mutable ``RunResult.meta``.
+    A collector may read the returned copy, but cannot synthesize an authority
+    object or transplant one onto another result/repository pair.
+    """
+    if type(result) is not RunResult:
+        raise TypeError("repository testimony requires an exact RunResult")
+    sealed = result.meta.get("_repository_execution_testimony")
+    if (type(sealed) is not _RepositoryExecutionTestimony
+            or sealed.authority is not _REPOSITORY_TESTIMONY_AUTHORITY
+            or sealed.result_identity != id(result)
+            or sealed.repository_identity != id(repository)):
+        raise ValueError("result has no sealed testimony for this repository")
+    try:
+        document = json.loads(sealed.document_json)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:  # pragma: no cover - private bytes
+        raise ValueError("sealed repository testimony is malformed") from exc
+    if sealed.document_json != json.dumps(
+        document, ensure_ascii=False, allow_nan=False, sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8", "strict"):
+        raise ValueError("sealed repository testimony lost canonical form")
+    return document
 
 
 def _preflight_argv(cmd) -> "tuple[list[str] | None, str | None]":
@@ -1593,9 +1666,23 @@ def _repository_run_result(
         meta["process_tree_settled"] = settlement.process_tree_settled
         meta["execution_request_id"] = settlement.request_id
         meta["execution_detail"] = settlement.detail
+        # Keep the complete parent-validated settlement available to bounded
+        # release collectors.  The flattened compatibility fields above remain
+        # for existing callers; collectors reconcile both views rather than
+        # reconstructing process truth from a result classification.
+        meta["execution_settlement"] = settlement.to_dict()
         meta["streams"] = {
             stream.role.value: stream.to_dict() for stream in settlement.streams
         }
+    # These paths are derived only from the repository output policy after
+    # publication.  Collectors use the sealed values (not RunResult.raw_path)
+    # to reopen an exact managed artifact and recompute its retained digest.
+    # Keep explicit ``None`` values so the sealed testimony distinguishes a
+    # fenced/discarded stream from a caller-added path after return.
+    meta["repository_stdout_path"] = None if raw is None else str(raw)
+    meta["repository_stderr_path"] = (
+        None if stderr_final is None else str(stderr_final)
+    )
     if faults:
         meta["faults"] = faults
     return RunResult(
@@ -1698,6 +1785,24 @@ def _mark_native_outputs_unavailable(
         result.meta["repository_ownership_settled"] = bool(
             result.meta["repository_ownership_settled"] and ownership_settled
         )
+    return result
+
+
+def _attach_empty_native_output_receipt(result: RunResult) -> RunResult:
+    """State explicitly that one repository execution declared no native sinks."""
+    result.meta["native_outputs"] = {
+        "clean": True,
+        "policy_count": 0,
+        "committed": [],
+        "uncertain": [],
+        "unpublished": [],
+        "current_paths": [],
+        "cleanup_settled": True,
+        "claim_retained": False,
+        "fault_operation": None,
+        "fault_type": None,
+    }
+    result.meta["native_output_ownership_settled"] = True
     return result
 
 
@@ -2094,9 +2199,14 @@ def _run_with_repository(
         # The execution collector needs the same source-to-runtime argv mapping
         # that admission used; it must not infer it from rewritten paths.
         "runtime_source_argv_indexes": list(prepared.source_argv_indexes),
+        # The original, admission-validated argv is evidence only.  Consumers
+        # must bind it through the source-to-runtime mapping and the prepared
+        # launch record; they must never resolve argv[0] through ambient PATH.
+        "runtime_source_argv": list(safe_cmd),
     }
 
     started_at = time.monotonic()
+    execution_started_at = _execution_timestamp()
     deadline = ((1 << 53) - 1 if invocation.worker.timeout == 0
                 else started_at + float(invocation.worker.timeout) + 5.0)
     def supervise(current_invocation):
@@ -2124,7 +2234,17 @@ def _run_with_repository(
             },
         )
         failed.meta.update(runtime_meta)
+        failed.meta["execution_started_at"] = execution_started_at
+        failed.meta["execution_finished_at"] = _execution_timestamp()
         return failed
+
+    def attach_runtime_testimony(result: RunResult) -> RunResult:
+        """Attach immutable admission facts and parent-observed timing once."""
+        result.meta.update(runtime_meta)
+        result.meta["execution_started_at"] = execution_started_at
+        result.meta["execution_finished_at"] = _execution_timestamp()
+        _seal_repository_execution_testimony(result, repository)
+        return result
 
     if not native_outputs:
         outcome = None
@@ -2165,8 +2285,7 @@ def _run_with_repository(
             stderr_path=stderr_path,
             duration=time.monotonic() - started_at,
         )
-        result.meta.update(runtime_meta)
-        return result
+        return attach_runtime_testimony(_attach_empty_native_output_receipt(result))
 
     owner = _NativeFacadeOwner(runner_native.NativeOutputAdoption())
     result = None
@@ -2294,7 +2413,7 @@ def _run_with_repository(
             result.note = (result.note + "; " if result.note else "") + detail
     if fault is not None and not isinstance(fault, Exception):
         raise fault
-    return result
+    return attach_runtime_testimony(result)
 
 
 def run(

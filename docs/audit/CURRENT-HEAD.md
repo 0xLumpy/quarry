@@ -199,9 +199,10 @@ regressions cover the former reproduced failures.
 publication no longer returns an authoritative current artifact. Prior committed evidence is preserved
 without being reported as this attempt's output.
 
-**Residual release work.** `V310-01` remains `OPEN`: the accepted candidate-wide hermetic selection,
-output-contract matrix, fault record, performance thresholds and machine evidence for
-`B-HERMETIC-ALL`, `C-OUTPUT-CONTRACT`, `C-FAULT-RUNNER` and `C-PERF-RUNNER` do not exist. Resource
+**Residual release work.** `V310-01` remains `OPEN`: no accepted candidate-wide hermetic selection,
+resolver-indexed output-contract matrix/raw receipt, fault record, performance threshold, or machine
+evidence for `B-HERMETIC-ALL`, `C-OUTPUT-CONTRACT`, `C-FAULT-RUNNER` and `C-PERF-RUNNER` exists. The
+in-tree C-OUTPUT source substrate is non-promoting and is not a release verifier or gate record. Resource
 envelope interactions remain in `HEAD-06`.
 
 ### `HEAD-02` — repository boundary, object identity and sealed-run immutability

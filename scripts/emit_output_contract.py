@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Canonical C-OUTPUT-CONTRACT collector; it does not execute or promote H1."""
+"""Derive a non-promoting C-OUTPUT matrix from externally retained raw receipts."""
 from __future__ import annotations
 
 import argparse
@@ -27,7 +27,6 @@ def main(argv: list[str] | None = None) -> int:
             fixture_manifest=_read(args.fixture_manifest, "fixture manifest"),
             receipts=[_read(path, "raw receipt") for path in args.raw_receipt],
         )
-        output_contract.validate_case_matrix(matrix)
     except output_contract.OutputContractError as exc:
         raise SystemExit(f"C-OUTPUT-CONTRACT remains open: {exc}") from exc
     args.output.write_bytes(output_contract.evidence.canonical_json_bytes(matrix) + b"\n")

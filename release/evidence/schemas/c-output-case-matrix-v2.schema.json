@@ -1,0 +1,41 @@
+{
+  "$id": "urn:quarry:schema:c-output-case-matrix:v2",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Quarry C-OUTPUT non-promoting case matrix v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["candidate", "cases", "fixture_manifest_digest", "observation", "run", "schema_version"],
+  "properties": {
+    "schema_version": {"const": "quarry.c-output-case-matrix.v2"},
+    "fixture_manifest_digest": {"$ref": "#/$defs/evidence_digest"},
+    "observation": {"const": "h1-attestation-required"},
+    "candidate": {"$ref": "#/$defs/candidate"},
+    "run": {"$ref": "#/$defs/run"},
+    "cases": {
+      "type": "array", "minItems": 9, "maxItems": 9, "items": false,
+      "prefixItems": [
+        {"$ref": "#/$defs/empty"}, {"$ref": "#/$defs/non_empty"}, {"$ref": "#/$defs/malformed"},
+        {"$ref": "#/$defs/truncated"}, {"$ref": "#/$defs/non_utf8"}, {"$ref": "#/$defs/partial"},
+        {"$ref": "#/$defs/timeout"}, {"$ref": "#/$defs/signal"}, {"$ref": "#/$defs/tool_specific_exit"}
+      ]
+    }
+  },
+  "$defs": {
+    "evidence_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "timestamp": {"type": "string", "maxLength": 32, "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,6})?(?:Z|[+-]\\d{2}:\\d{2})$"},
+    "candidate": {"type": "object", "additionalProperties": false, "required": ["dirty", "git_commit", "git_tree", "identity_digest", "package_version", "source_tree_digest"], "properties": {"dirty": {"const": false}, "git_commit": {"type": "string", "pattern": "^[0-9a-f]{40,64}$"}, "git_tree": {"type": "string", "pattern": "^[0-9a-f]{40,64}$"}, "identity_digest": {"$ref": "#/$defs/evidence_digest"}, "package_version": {"type": "string", "minLength": 1, "maxLength": 128}, "source_tree_digest": {"$ref": "#/$defs/evidence_digest"}}},
+    "run": {"type": "object", "additionalProperties": false, "required": ["directory_device", "directory_inode", "run_id", "started_at", "target"], "properties": {"directory_device": {"type": "integer", "minimum": 0, "maximum": 9223372036854775807}, "directory_inode": {"type": "integer", "minimum": 0, "maximum": 9223372036854775807}, "run_id": {"type": "string", "minLength": 1, "maxLength": 128}, "started_at": {"$ref": "#/$defs/timestamp"}, "target": {"type": "string", "minLength": 1, "maxLength": 1024}}},
+    "parser_input": {"type": "object", "additionalProperties": false, "required": ["bytes", "sha256", "stream"], "properties": {"bytes": {"type": "integer", "minimum": 0, "maximum": 16777216}, "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "stream": {"enum": ["stdout", "native"]}}},
+    "parser": {"type": "object", "additionalProperties": false, "required": ["complete", "input", "outcome", "parser", "records"], "properties": {"complete": {"type": "boolean"}, "input": {"oneOf": [{"$ref": "#/$defs/parser_input"}, {"type": "null"}]}, "outcome": {"enum": ["empty", "non_empty", "malformed", "truncated", "non_utf8", "unavailable"]}, "parser": {"enum": ["json-array", "gitleaks-json"]}, "records": {"type": ["integer", "null"], "minimum": 0, "maximum": 16777216}}},
+    "row": {"type": "object", "additionalProperties": false, "required": ["effective_status", "id", "parser", "receipt_digest"], "properties": {"effective_status": {"enum": ["success", "empty", "partial", "failed", "timed_out"]}, "id": {"type": "string", "maxLength": 32}, "parser": {"$ref": "#/$defs/parser"}, "receipt_digest": {"$ref": "#/$defs/evidence_digest"}}},
+    "empty": {"allOf": [{"$ref": "#/$defs/row"}, {"properties": {"id": {"const": "empty"}, "effective_status": {"const": "empty"}, "parser": {"properties": {"complete": {"const": true}, "outcome": {"const": "empty"}, "records": {"const": 0}}}}}]},
+    "non_empty": {"allOf": [{"$ref": "#/$defs/row"}, {"properties": {"id": {"const": "non_empty"}, "effective_status": {"const": "success"}, "parser": {"properties": {"complete": {"const": true}, "outcome": {"const": "non_empty"}, "records": {"const": 1}}}}}]},
+    "malformed": {"allOf": [{"$ref": "#/$defs/row"}, {"properties": {"id": {"const": "malformed"}, "effective_status": {"const": "partial"}, "parser": {"properties": {"complete": {"const": false}, "outcome": {"const": "malformed"}, "records": {"type": "null"}}}}}]},
+    "truncated": {"allOf": [{"$ref": "#/$defs/row"}, {"properties": {"id": {"const": "truncated"}, "effective_status": {"const": "partial"}, "parser": {"properties": {"complete": {"const": false}, "outcome": {"const": "truncated"}, "records": {"type": "null"}}}}}]},
+    "non_utf8": {"allOf": [{"$ref": "#/$defs/row"}, {"properties": {"id": {"const": "non_utf8"}, "effective_status": {"const": "partial"}, "parser": {"properties": {"complete": {"const": false}, "outcome": {"const": "non_utf8"}, "records": {"type": "null"}}}}}]},
+    "partial": {"allOf": [{"$ref": "#/$defs/row"}, {"properties": {"id": {"const": "partial"}, "effective_status": {"const": "partial"}, "parser": {"properties": {"complete": {"const": true}, "outcome": {"const": "empty"}, "records": {"const": 0}}}}}]},
+    "timeout": {"allOf": [{"$ref": "#/$defs/row"}, {"properties": {"id": {"const": "timeout"}, "effective_status": {"const": "timed_out"}, "parser": {"properties": {"complete": {"const": false}, "outcome": {"const": "unavailable"}, "records": {"type": "null"}}}}}]},
+    "signal": {"allOf": [{"$ref": "#/$defs/row"}, {"properties": {"id": {"const": "signal"}, "effective_status": {"const": "failed"}, "parser": {"properties": {"complete": {"const": false}, "outcome": {"const": "unavailable"}, "records": {"type": "null"}}}}}]},
+    "tool_specific_exit": {"allOf": [{"$ref": "#/$defs/row"}, {"properties": {"id": {"const": "tool_specific_exit"}, "effective_status": {"const": "success"}, "parser": {"properties": {"complete": {"const": true}, "outcome": {"const": "non_empty"}, "records": {"const": 1}}}}}]}
+  }
+}

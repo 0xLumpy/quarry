@@ -258,7 +258,7 @@ attestation, this gate and `RG02` remain `OPEN`.
 | Gate | Lane | Requirement | Machine evidence |
 |---|---|---|---|
 | `C-TOOLS` | `H1` | Every required adapter runs against a synthetic fixture with its attested supported binary/payload identity; optional absence is reported honestly | Adapter/tool matrix, raw/result classification, identities |
-| `C-OUTPUT-CONTRACT` | `H1` | Empty, non-empty, malformed, truncated, non-UTF-8, partial, timeout, signal, and tool-specific exit cases map to the documented result contract | Case matrix and typed result records. The in-tree v1 substrate freezes this exact nine-case inventory and validates only repository-runner authenticated raw receipts; it is not an accepted H1 execution or gate record. |
+| `C-OUTPUT-CONTRACT` | `H1` | Empty, non-empty, malformed, truncated, non-UTF-8, partial, timeout, signal, and tool-specific exit cases map to the documented result contract | Case matrix and typed result records. The in-tree non-promoting substrate freezes this exact nine-case inventory and validates only repository-runner authenticated raw receipts; it is not an accepted H1 execution, resolver-indexed raw receipt, release verifier, or gate record. |
 | `C-NETWORK-BOUNDARY` | `H1` | Scope, IDNA, redirect, DNS rebinding, proxy, private-reach, scanner-self, and metadata exclusions hold at connect time | Namespace trace plus allow/deny decision records |
 | `C-SOURCE-REGISTRY` | `H0`/`H1` | Every acquisition lane and emitted source ID is registered with ownership, policy, input/output schema, and coverage semantics | Static/runtime registry reconciliation report; accepted external H0/H1 collector evidence remains `OPEN` |
 
