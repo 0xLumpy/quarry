@@ -1,18 +1,21 @@
-"""Focused authenticated C-OUTPUT source-contract regressions.
+"""Focused non-promoting C-OUTPUT source-contract regressions.
 
 The helper rows below deliberately use the real repository runner and its
 private-stage publication seam.  The low-level supervisor is a faithful test
 builder: it settles the same descriptor claims and artifact proofs as the
 production supervisor, but supplies bytes only from the candidate-bound frozen
-fixtures.  It never fabricates a serialized receipt.
+fixtures.  It never fabricates an external record: serialized receipt JSON is
+validated only as an explicitly unauthenticated shape diagnostic.
 """
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
 import shutil
 import subprocess
+from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -20,7 +23,7 @@ import pytest
 
 from quarry_recon import output_contract as contract
 from quarry_recon import privfs, release_evidence as evidence, runner
-from quarry_recon import runner_native, runner_protocol as protocol
+from quarry_recon import runner_protocol as protocol
 from quarry_recon import runner_repository, runner_supervisor as supervisor, store
 
 
@@ -228,7 +231,7 @@ def _faithful_helper_supervisor(root: Path, case: dict):
     exit_code: int | None = 0
     complete = True
     if case["id"] == "truncated":
-        stdout_retained = stdout[:16]
+        stdout_retained = stdout[:contract.RETAINED_STREAM_CAP_BYTES]
         stdout_terminal = protocol.StreamTerminal.CAPPED
         complete = False
     elif case["id"] == "timeout":
@@ -289,7 +292,7 @@ def _run_helper_case(
             "raw", "c-output-contract", case_id, "stderr.log",
         ),
         timeout=5,
-        max_output_bytes=16 if case_id == "truncated" else None,
+        max_output_bytes=contract.RETAINED_STREAM_CAP_BYTES if case_id == "truncated" else None,
     )
 
 
@@ -332,6 +335,16 @@ def test_faithful_repository_fixture_builder_produces_all_helper_receipts(tmp_pa
 
     assert receipts[0]["parser"]["input"]["bytes"] == 0
     assert receipts[0]["parser"]["outcome"] == "empty"
+    truncated_case = next(item for item in manifest["cases"] if item["id"] == "truncated")
+    truncated_payload = _fixture_payload(root, truncated_case["fixture"])
+    assert receipts[2]["parser"] == {
+        "complete": False, "input": None, "outcome": "unavailable",
+        "parser": "json-array", "records": None,
+    }
+    assert receipts[2]["streams"][1]["retained_bytes"] == contract.RETAINED_STREAM_CAP_BYTES
+    assert receipts[2]["streams"][1]["retained_sha256"] == _digest(
+        truncated_payload[:contract.RETAINED_STREAM_CAP_BYTES],
+    )
     assert receipts[-2]["parser"]["outcome"] == "unavailable"
     assert receipts[-1]["execution"]["exit_code"] < 0
     assert receipts[4]["effective_status"] == "partial"
@@ -347,7 +360,7 @@ def test_faithful_repository_fixture_builder_produces_all_helper_receipts(tmp_pa
         validator = Draft202012Validator(raw_schema)
         for receipt in receipts:
             assert list(validator.iter_errors(receipt)) == []
-    with pytest.raises(contract.OutputContractError, match="exactly nine"):
+    with pytest.raises(contract.OutputContractError, match="C-OUTPUT remains open"):
         contract.collect_case_matrix(fixture_manifest=manifest, receipts=receipts)
     assert runner.repository_execution_testimony(results["partial"], repository=run)[
         "execution_settlement"
@@ -357,11 +370,93 @@ def test_faithful_repository_fixture_builder_produces_all_helper_receipts(tmp_pa
 @pytest.mark.integration
 @pytest.mark.requires_tool("git")
 @pytest.mark.skipif(GIT is None, reason="Git is required")
+def test_serialized_shape_schema_and_manual_reject_stream_and_case_mutations(tmp_path, monkeypatch):
+    """Raw JSON is strict diagnostic shape only, including frozen stream facts."""
+    Draft202012Validator = pytest.importorskip("jsonschema").Draft202012Validator
+    manifest = _manifest()
+    root, identity = _candidate_repository(tmp_path, manifest)
+    run = _running_run(tmp_path, "c-output-shape-parity")
+    truncated_result = _run_helper_case(
+        monkeypatch, root=root, run=run, manifest=manifest, case_id="truncated",
+    )
+    truncated = contract.receipt_from_runner(
+        fixture_manifest=manifest, case_id="truncated", run=run,
+        candidate_identity=identity, candidate_root=root, result=truncated_result,
+    )
+    malformed_result = _run_helper_case(
+        monkeypatch, root=root, run=run, manifest=manifest, case_id="malformed",
+    )
+    malformed = contract.receipt_from_runner(
+        fixture_manifest=manifest, case_id="malformed", run=run,
+        candidate_identity=identity, candidate_root=root, result=malformed_result,
+    )
+    schema = json.loads(
+        (ROOT / "release/evidence/schemas/c-output-raw-receipt-v2.schema.json").read_bytes(),
+    )
+    validator = Draft202012Validator(schema)
+
+    def mutate_stream(document: dict, index: int, **fields) -> None:
+        # The serialized execution projection and root projection must agree.
+        document["streams"][index].update(fields)
+        document["execution"]["streams"][index].update(fields)
+
+    def rejected(document: dict) -> None:
+        assert list(validator.iter_errors(document))
+        with pytest.raises(contract.OutputContractError):
+            contract.validate_raw_receipt(document, fixture_manifest=manifest)
+
+    with pytest.raises(contract.OutputContractError, match="no authenticated accepting resolver"):
+        contract.validate_raw_receipt(truncated, fixture_manifest=manifest, accepting=True)
+
+    old_capped = copy.deepcopy(truncated)
+    mutate_stream(old_capped, 1, retained_bytes=1, retained_sha256=_digest(b"["))
+    rejected(old_capped)
+
+    old_eof = copy.deepcopy(malformed)
+    mutate_stream(old_eof, 1, retained_bytes=1, retained_sha256=_digest(b"["))
+    rejected(old_eof)
+
+    wrong_status = copy.deepcopy(malformed)
+    wrong_status["effective_status"] = "empty"
+    rejected(wrong_status)
+
+    wrong_terminal = copy.deepcopy(malformed)
+    wrong_terminal["execution"]["terminal"] = "timed_out"
+    rejected(wrong_terminal)
+
+    wrong_publication = copy.deepcopy(malformed)
+    wrong_publication["repository_publication"] = "fenced"
+    rejected(wrong_publication)
+
+    wrong_parser = copy.deepcopy(malformed)
+    wrong_parser["parser"]["outcome"] = "empty"
+    wrong_parser["parser"]["complete"] = True
+    wrong_parser["parser"]["records"] = 0
+    rejected(wrong_parser)
+
+    identity_extra = copy.deepcopy(malformed)
+    identity_extra["launch"]["runtime_identity"]["unexpected"] = True
+    rejected(identity_extra)
+
+    identity_row_extra = copy.deepcopy(malformed)
+    identity_row_extra["launch"]["runtime_identity"]["identities"][0]["unexpected"] = True
+    rejected(identity_row_extra)
+
+
+@pytest.mark.integration
+@pytest.mark.requires_tool("git")
+@pytest.mark.skipif(GIT is None, reason="Git is required")
 def test_empty_native_receipt_and_final_timestamp_are_attached_once(tmp_path, monkeypatch):
     manifest = _manifest()
     root, identity = _candidate_repository(tmp_path, manifest)
     run = _running_run(tmp_path, "c-output-empty-timestamp")
-    timestamps = iter(("2026-08-21T12:00:00Z", "2026-08-21T12:00:01Z", "unused"))
+    run_started = contract._canonical_utc_timestamp(run.started, "test Run.started")
+    base = contract._timestamp_value(run_started)
+    timestamps = iter((
+        (base + timedelta(microseconds=1)).isoformat().replace("+00:00", "Z"),
+        (base + timedelta(microseconds=2)).isoformat().replace("+00:00", "Z"),
+        "unused",
+    ))
     calls = []
 
     def stamp():
@@ -374,8 +469,12 @@ def test_empty_native_receipt_and_final_timestamp_are_attached_once(tmp_path, mo
     )
     testimony = runner.repository_execution_testimony(result, repository=run)
     assert len(calls) == 2
-    assert testimony["execution_started_at"] == "2026-08-21T12:00:00Z"
-    assert testimony["execution_finished_at"] == "2026-08-21T12:00:01Z"
+    assert testimony["execution_started_at"] == (base + timedelta(microseconds=1)).isoformat().replace(
+        "+00:00", "Z",
+    )
+    assert testimony["execution_finished_at"] == (base + timedelta(microseconds=2)).isoformat().replace(
+        "+00:00", "Z",
+    )
     assert testimony["native_outputs"] == {
         "clean": True, "policy_count": 0, "committed": [], "uncertain": [],
         "unpublished": [], "current_paths": [], "cleanup_settled": True,
@@ -385,9 +484,22 @@ def test_empty_native_receipt_and_final_timestamp_are_attached_once(tmp_path, mo
         fixture_manifest=manifest, case_id="empty", run=run,
         candidate_identity=identity, candidate_root=root, result=result,
     )
+    assert receipt["run"]["started_at"] == run_started
+    assert receipt["run"]["started_at"].endswith("Z")
     assert receipt["timestamps"] == {
-        "started_at": "2026-08-21T12:00:00Z", "finished_at": "2026-08-21T12:00:01Z",
+        "started_at": testimony["execution_started_at"],
+        "finished_at": testimony["execution_finished_at"],
     }
+    malformed_offset = copy.deepcopy(receipt)
+    malformed_offset["timestamps"]["started_at"] = receipt["timestamps"]["started_at"].replace(
+        "Z", "-00:00",
+    )
+    with pytest.raises(contract.OutputContractError, match="canonical UTC"):
+        contract.validate_raw_receipt(malformed_offset, fixture_manifest=manifest)
+    before_run = copy.deepcopy(receipt)
+    before_run["timestamps"]["started_at"] = "2000-01-01T00:00:00Z"
+    with pytest.raises(contract.OutputContractError, match="does not bracket"):
+        contract.validate_raw_receipt(before_run, fixture_manifest=manifest)
 
 
 @pytest.mark.integration
@@ -443,64 +555,25 @@ def test_helper_receipt_rejects_an_admitted_argv_that_misstates_fixture_encoding
         )
 
 
-@pytest.mark.integration
-@pytest.mark.requires_tool("git")
-@pytest.mark.requires_tool("gitleaks")
-@pytest.mark.skipif(GIT is None or shutil.which("gitleaks") is None,
-                    reason="Git and gitleaks are required")
-def test_real_gitleaks_rows_are_distinct_and_require_an_attested_version(tmp_path):
-    """Only a real runner/gitleaks execution may exercise the two native rows."""
+@pytest.mark.offline
+def test_native_gitleaks_rows_are_explicitly_open_and_cannot_produce_receipts():
+    """AKIA-looking fixture text is not treated as a verified native finding."""
     manifest = _manifest()
-    root, identity = _candidate_repository(tmp_path, manifest)
-    run = _running_run(tmp_path, "c-output-real-gitleaks")
-    version = runner.run(
-        "gitleaks", ["gitleaks", "version"], repository=run,
-        stdout=runner_repository.RepositoryOutput.publish(
-            "raw", "c-output-contract", "version", "stdout.txt",
-        ),
-        stderr=runner_repository.RepositoryOutput.publish(
-            "raw", "c-output-contract", "version", "stderr.log",
-        ),
-        timeout=20,
-    )
-    try:
-        attestation = contract.attest_gitleaks_version(
-            run=run, candidate_identity=identity, result=version,
-        )
-    except contract.OutputContractError as exc:
-        pytest.skip(f"real H1 runner/tool attestation unavailable: {exc}")
-    if attestation["version"] != "v8.30.1":
-        pytest.skip("real H1 gitleaks version is not the frozen v8.30.1 prerequisite")
-
-    receipts = []
     for case_id in ("non_empty", "tool_specific_exit"):
         case = next(item for item in manifest["cases"] if item["id"] == case_id)
-        fixture = root / case["fixture"]["path"]
-        native = run.dir / "raw" / "c-output-contract" / case_id / "gitleaks.json"
-        result = runner.run(
-            "gitleaks",
-            ["gitleaks", "dir", "--no-banner", "--report-path", str(native),
-             "--report-format", "json", str(fixture)],
-            repository=run,
-            stdout=runner_repository.RepositoryOutput.publish(
-                "raw", "c-output-contract", case_id, "stdout.txt",
-            ),
-            stderr=runner_repository.RepositoryOutput.publish(
-                "raw", "c-output-contract", case_id, "stderr.log",
-            ),
-            native_outputs=(runner_native.RepositoryNativeOutput.file(
-                4, "raw", "c-output-contract", case_id, "gitleaks.json",
-            ),),
-            timeout=20,
-            ok_codes=(0, 1),
-        )
-        receipts.append(contract.receipt_from_runner(
-            fixture_manifest=manifest, case_id=case_id, run=run,
-            candidate_identity=identity, candidate_root=root, result=result,
-            gitleaks_version_result=version,
-        ))
-    assert receipts[0]["tool"]["fixture_candidate_input"] != receipts[1]["tool"]["fixture_candidate_input"]
-    assert receipts[0]["launch"]["source_argv"][-1] != receipts[1]["launch"]["source_argv"][-1]
+        assert case["availability"] == "unavailable-source-substrate"
+        assert case["expected"] == {
+            "effective_status": "unavailable", "execution_terminal": "not_started", "exit": "none",
+            "native": "unavailable",
+            "parser": {"complete": False, "outcome": "unavailable", "records": None},
+            "repository_publication": "not_requested", "stderr_terminal": "not_started",
+            "stdout_terminal": "not_started",
+        }
+        with pytest.raises(contract.OutputContractError, match="explicitly unavailable"):
+            contract.receipt_from_runner(
+                fixture_manifest=manifest, case_id=case_id, run=None, candidate_identity=None,
+                candidate_root=".", result=None,
+            )
 
 
 @pytest.mark.offline
@@ -517,4 +590,15 @@ def test_v2_schemas_are_syntactically_strict_about_the_frozen_manifest():
     manifest_schema = json.loads(
         (ROOT / "release/evidence/schemas/c-output-fixture-manifest-v2.schema.json").read_bytes(),
     )
-    assert list(Draft202012Validator(manifest_schema).iter_errors(manifest)) == []
+    validator = Draft202012Validator(manifest_schema)
+    assert list(validator.iter_errors(manifest)) == []
+    wrong_cap = copy.deepcopy(manifest)
+    wrong_cap["retained_stream_cap_bytes"] = 15
+    assert list(validator.iter_errors(wrong_cap))
+    with pytest.raises(contract.OutputContractError, match="retained stream cap"):
+        contract.validate_fixture_manifest(wrong_cap)
+    false_native_claim = copy.deepcopy(manifest)
+    false_native_claim["cases"][1]["expected"]["effective_status"] = "success"
+    assert list(validator.iter_errors(false_native_claim))
+    with pytest.raises(contract.OutputContractError):
+        contract.validate_fixture_manifest(false_native_claim)

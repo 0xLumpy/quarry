@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Derive a non-promoting C-OUTPUT matrix from externally retained raw receipts."""
+"""Validate C-OUTPUT serialized receipt *shapes* without emitting evidence.
+
+Raw JSON has no authenticated envelope or resolver.  This source-substrate
+utility can diagnose its strict shape only; it intentionally cannot produce a
+matrix, release record, or accepting C-OUTPUT result.
+"""
 from __future__ import annotations
 
 import argparse
@@ -19,18 +24,23 @@ def _read(path: Path, label: str):
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--fixture-manifest", type=Path, required=True)
-    parser.add_argument("--raw-receipt", type=Path, action="append", required=True)
-    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--raw-receipt", type=Path, action="append", required=True,
+                        help="serialized shape-only diagnostic (never authenticated evidence)")
+    parser.add_argument("--output", type=Path,
+                        help="unsupported: this source substrate never emits a matrix")
     args = parser.parse_args(argv)
     try:
-        matrix = output_contract.collect_case_matrix(
-            fixture_manifest=_read(args.fixture_manifest, "fixture manifest"),
-            receipts=[_read(path, "raw receipt") for path in args.raw_receipt],
-        )
+        manifest = _read(args.fixture_manifest, "fixture manifest")
+        for path in args.raw_receipt:
+            output_contract.validate_raw_receipt(
+                _read(path, "raw receipt"), fixture_manifest=manifest, accepting=False,
+            )
     except output_contract.OutputContractError as exc:
         raise SystemExit(f"C-OUTPUT-CONTRACT remains open: {exc}") from exc
-    args.output.write_bytes(output_contract.evidence.canonical_json_bytes(matrix) + b"\n")
-    return 0
+    raise SystemExit(
+        "C-OUTPUT-CONTRACT remains open: serialized raw receipts are shape-only diagnostics; "
+        "no authenticated resolver or accepting matrix producer is registered",
+    )
 
 
 if __name__ == "__main__":
