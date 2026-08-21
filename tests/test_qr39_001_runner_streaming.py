@@ -164,6 +164,19 @@ def test_ok_empty_false_makes_a_clean_empty_run_a_failure(tmp_path):
     assert runner.run("true", ["true"], timeout=10, ok_empty=True).status == Status.EMPTY
 
 
+def test_a_signaled_child_is_explicit_partial_and_keeps_current_bytes(tmp_path):
+    from quarry_recon import runner
+    raw = tmp_path / "out.bin"
+    result = runner.run(
+        "sh", ["sh", "-c", "printf before-signal; kill -TERM $$"],
+        raw_path=raw, timeout=10,
+    )
+    assert result.status == Status.PARTIAL and result.exit_code == -15
+    assert result.raw_path == raw and raw.read_bytes() == b"before-signal"
+    assert result.meta["stdout_observed_bytes"] == len(b"before-signal")
+    assert result.meta["stdout_sha256"] == hashlib.sha256(b"before-signal").hexdigest()
+
+
 def test_output_is_atomically_published_from_private_staging(tmp_path):
     from quarry_recon import runner
     raw = tmp_path / "out.bin"
