@@ -2819,7 +2819,9 @@ def validate_python_matrix_report(document: object, *, identity: object) -> dict
         })
         if row["lane"] not in _PYTHON_MATRIX_LANES:
             raise evidence.EvidenceError("python matrix report has an unsupported lane")
-        environment = _matrix_environment(row["environment"], f"python matrix report.rows[{index}].environment")
+        _matrix_environment(
+            row["environment"], f"python matrix report.rows[{index}].environment",
+        )
         if (row["candidate_identity_digest"] != doc["candidate_identity_digest"] or
                 row["support_matrix_digest"] != doc["support_matrix_digest"] or
                 row["package_metadata_digest"] != doc["package_metadata_digest"]):
@@ -2864,10 +2866,12 @@ def validate_python_matrix_report(document: object, *, identity: object) -> dict
                 if tuple(observed) != expected_names:
                     raise evidence.EvidenceError("python matrix P0 source artifact roster is not exact and sorted")
         parsed.append(row)
-    sort_key = lambda row: (
-        LANE_ORDER.index(row["lane"]), row["environment"]["os"], row["environment"]["architecture"],
-        row["environment"]["python"], row["environment"]["runner_image"], row["environment"]["isolation_profile"],
-    )
+    def sort_key(row: dict) -> tuple:
+        return (
+            LANE_ORDER.index(row["lane"]), row["environment"]["os"],
+            row["environment"]["architecture"], row["environment"]["python"],
+            row["environment"]["runner_image"], row["environment"]["isolation_profile"],
+        )
     if parsed != sorted(parsed, key=sort_key) or len({
         (row["lane"], *(row["environment"][field] for field in (
             "architecture", "isolation_profile", "os", "python", "runner_image",
@@ -3424,11 +3428,14 @@ def _validate_wheel(body: bytes) -> None:
             wheel_names = [name for name in names if name.endswith(".dist-info/WHEEL")]
             record_names = [name for name in names if name.endswith(".dist-info/RECORD")]
             entry_names = [name for name in names if name.endswith(".dist-info/entry_points.txt")]
-            license_names = [name for name in names if ".dist-info/licenses/" in name]
+            license_names = [name for name in names if name.endswith(".dist-info/licenses/LICENSE")]
+            notice_names = [name for name in names if name.endswith(".dist-info/licenses/NOTICE")]
             if not all(len(group) == 1 for group in (
-                metadata_names, wheel_names, record_names, entry_names, license_names,
+                metadata_names, wheel_names, record_names, entry_names, license_names, notice_names,
             )):
-                raise evidence.EvidenceError("wheel omits unique metadata, record, entry point or license data")
+                raise evidence.EvidenceError(
+                    "wheel omits unique metadata, record, entry point, license or notice data"
+                )
             metadata = archive.read(metadata_names[0])
             if (_metadata_value(metadata, "Name", "wheel") != "quarry-recon" or
                     _metadata_value(metadata, "Version", "wheel") != RELEASE):
@@ -3723,21 +3730,43 @@ def _validate_package_install_artifacts(
     try:
         with zipfile.ZipFile(io.BytesIO(wheel)) as archive:
             source_files = {}
+            seen_members = set()
+            dist_info_member = record_suffix[1:].rsplit("/", 1)[0]
+            data_root = dist_info_member.removesuffix(".dist-info") + ".data"
             for info in archive.infolist():
                 if info.is_dir():
                     raise evidence.EvidenceError("source wheel contains a directory member")
                 member = _path(info.filename, "source wheel member")
-                if member in source_files:
+                if member in seen_members:
                     raise evidence.EvidenceError("source wheel contains duplicate file members")
+                seen_members.add(member)
                 if member == record_suffix[1:]:
                     continue
                 body = archive.read(info)
-                source_files[member] = {"digest": raw_sha256(body), "size": len(body)}
+                member_parts = PurePosixPath(member).parts
+                if member_parts[0].endswith(".data"):
+                    if (member_parts[0] != data_root or len(member_parts) < 3 or
+                            member_parts[1] != "data"):
+                        raise evidence.EvidenceError(
+                            "source wheel contains an unsupported or ambiguous .data scheme"
+                        )
+                    installed_path = "/".join((prefix, *member_parts[2:]))
+                    if not _is_within_path(installed_path, prefix):
+                        raise evidence.EvidenceError(
+                            "source wheel .data member resolves outside the install prefix"
+                        )
+                else:
+                    installed_path = f"{site_root}/{member}"
+                if installed_path in source_files:
+                    raise evidence.EvidenceError(
+                        "source wheel members collide after PEP 427 installation mapping"
+                    )
+                source_files[installed_path] = {
+                    "digest": raw_sha256(body), "size": len(body),
+                }
     except (OSError, zipfile.BadZipFile) as exc:
         raise evidence.EvidenceError(f"source wheel cannot be reopened for install reconciliation: {exc}") from exc
-    expected_files = {
-        f"{site_root}/{member}": fact for member, fact in source_files.items()
-    }
+    expected_files = source_files
     allowed_generated = {
         record_path,
         f"{prefix}/bin/quarry",

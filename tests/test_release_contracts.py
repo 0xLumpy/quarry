@@ -10,7 +10,7 @@ import json
 import re
 import tarfile
 import zipfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import pytest
 from jsonschema import Draft202012Validator
@@ -144,10 +144,11 @@ def _synthetic_wheel() -> bytes:
         f"{dist}/WHEEL": b"Wheel-Version: 1.0\nGenerator: quarry-test\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
         f"{dist}/entry_points.txt": b"[console_scripts]\nquarry=quarry_recon.cli:cli\n",
         f"{dist}/licenses/LICENSE": b"Synthetic MIT license fixture\n",
+        f"{dist}/licenses/NOTICE": b"Synthetic release fixture; no third-party bundled bytes.\n",
         "quarry_recon/__init__.py": b"__version__ = '0.3.10'\n",
         "quarry_recon/data/default.yaml": b"fixture: true\n",
         "quarry_recon/data/target.template.yaml": b"fixture: target\n",
-        "quarry_recon/data/release-scope-v1.schema.json": b"{}\n",
+        f"{dist.removesuffix('.dist-info')}.data/data/share/quarry-recon/schemas/release-scope-v1.schema.json": b"{}\n",
     }
     record_name = f"{dist}/RECORD"
     record_rows = []
@@ -920,7 +921,18 @@ def _supporting_bodies(
         }
         with zipfile.ZipFile(io.BytesIO(_synthetic_wheel())) as archive:
             for member in archive.namelist():
-                installed[f"{prefix}/lib/python3.12/site-packages/{member}"] = archive.read(member)
+                if member.endswith(".dist-info/RECORD"):
+                    installed[f"{prefix}/lib/python3.12/site-packages/{member}"] = archive.read(member)
+                    continue
+                parts = PurePosixPath(member).parts
+                if parts[0].endswith(".data"):
+                    assert parts[1] == "data"
+                    path = PurePosixPath(prefix, *parts[2:])
+                else:
+                    path = PurePosixPath(
+                        prefix, "lib", "python3.12", "site-packages", *parts,
+                    )
+                installed[str(path)] = archive.read(member)
         installed.update({
             f"{dist}/INSTALLER": b"pip\n",
             f"{dist}/REQUESTED": b"",

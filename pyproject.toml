@@ -9,7 +9,7 @@ description = "Quarry — methodology-driven reconnaissance automation framework
 readme = "README.md"
 requires-python = ">=3.10,<3.13"
 license = "MIT"
-license-files = ["LICENSE"]
+license-files = ["LICENSE", "NOTICE"]
 authors = [{ name = "0xlumpy" }]
 dependencies = [
     "click>=8.2",
@@ -44,6 +44,9 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 quarry_recon = ["data/*.yaml", "data/*.txt"]
+
+[tool.setuptools.data-files]
+"share/quarry-recon/schemas" = ["release/evidence/schemas/*.schema.json"]
 
 [tool.pytest.ini_options]
 # Every collected test is assigned one primary lane by tests/conftest.py before

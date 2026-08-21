@@ -59,9 +59,10 @@ def test_candidate_archives_are_bounded_and_path_safe():
         paths = [_safe_member(member.name) for member in members]
         assert all(member.isfile() or member.isdir() for member in members)
         relative = {pathlib.PurePosixPath(*path.parts[1:]).as_posix() for path in paths}
-        assert {"LICENSE", "README.md", "pyproject.toml"} <= relative
+        assert {"LICENSE", "NOTICE", "README.md", "pyproject.toml"} <= relative
         assert "src/quarry_recon/data/target.template.yaml" in relative
         assert "src/quarry_recon/data/tools.yaml" in relative
+        assert "release/evidence/schemas/release-scope-v1.schema.json" in relative
 
 
 def test_wheel_carries_spdx_license_and_runtime_data():
@@ -71,8 +72,16 @@ def test_wheel_carries_spdx_license_and_runtime_data():
         metadata_name = next(name for name in names if name.endswith(".dist-info/METADATA"))
         metadata = archive.read(metadata_name).decode("utf-8", "strict")
         assert "License-Expression: MIT\n" in metadata
-        assert "Requires-Python: >=3.10,<3.13\n" in metadata
+        requires_python = next(
+            line.removeprefix("Requires-Python: ")
+            for line in metadata.splitlines()
+            if line.startswith("Requires-Python: ")
+        )
+        assert set(requires_python.split(",")) == {">=3.10", "<3.13"}
         assert any(name.endswith(".dist-info/licenses/LICENSE") for name in names)
+        assert any(name.endswith(".dist-info/licenses/NOTICE") for name in names)
+        assert any(name.endswith(".data/data/share/quarry-recon/schemas/release-scope-v1.schema.json")
+                   for name in names)
         assert "quarry_recon/data/target.template.yaml" in names
         assert "quarry_recon/data/tools.yaml" in names
 
@@ -95,6 +104,7 @@ def test_installed_candidate_comes_from_the_wheel_and_exposes_the_cli():
         assert prefix.is_dir()
         assert (prefix / "bin" / "python").is_file()
         assert (prefix / "bin" / "quarry").is_file()
+        assert any((prefix / "share" / "quarry-recon" / "schemas").glob("*.schema.json"))
 
 
 def test_dependency_audit_emits_a_vulnerability_free_cyclonedx_document():

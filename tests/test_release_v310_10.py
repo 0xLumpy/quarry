@@ -32,6 +32,9 @@ def test_public_project_integrity_files_are_committed_in_shape():
     assert "Permission is hereby granted, free of charge" in license_text
     assert "THE SOFTWARE IS PROVIDED \"AS IS\"" in license_text
 
+    notice = _text("NOTICE")
+    assert "release-evidence schemas" in notice
+
     security = _text("SECURITY.md")
     assert "/security/advisories/new" in security
     assert "Do not include credentials" in security
@@ -55,7 +58,7 @@ def test_package_metadata_uses_spdx_and_pinned_ci_tools():
     project = tomllib.loads(_text("pyproject.toml"))
     assert project["project"]["version"] == "0.3.9"
     assert project["project"]["license"] == "MIT"
-    assert project["project"]["license-files"] == ["LICENSE"]
+    assert project["project"]["license-files"] == ["LICENSE", "NOTICE"]
     assert project["build-system"]["requires"] == ["setuptools==80.9.0"]
     ci = project["project"]["optional-dependencies"]["ci"]
     expected = {

@@ -1,0 +1,2 @@
+include NOTICE
+recursive-include release/evidence/schemas *.schema.json
