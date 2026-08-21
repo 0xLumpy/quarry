@@ -468,6 +468,18 @@ def _supporting_bodies(
                 candidate_identity_digest=evidence.canonical_digest(identity), input_bodies=source_inputs,
             )
         )
+    elif gate_id == "C-CORPUS-SYNTHETIC":
+        disclosure = emitted[("A-CORPUS", "corpus-disclosure-report")]
+        attestation = contracts._read_synthetic_corpus_disclosure_attestation(disclosure)
+        bodies["disclosure-report"] = disclosure
+        bodies["derivation-diff"] = contracts.canonical_json_line(
+            contracts._machine_report_document(
+                gate_id=gate_id,
+                name="derivation-diff",
+                identity=identity,
+                subjects=contracts._synthetic_corpus_diff_subjects(attestation),
+            )
+        )
     elif gate_id == "C-PATH-IDENTITY":
         candidate_digest = evidence.canonical_digest(identity)
         path_inputs = {
@@ -1889,6 +1901,11 @@ def _scenario(tmp_path: Path, *, approved_at: str = "2026-08-01T00:00:00Z"):
                         "selected": fault_store_evidence.NODE_COUNT,
                         "skipped": 0, "xfailed": 0, "xpassed": 0,
                     }
+                if gate_id == "C-CORPUS-SYNTHETIC":
+                    selection = {
+                        "collected": 4, "deselected": 0, "failed": 0, "passed": 4,
+                        "selected": 4, "skipped": 0, "xfailed": 0, "xpassed": 0,
+                    }
                 if gate_id == "C-FAULT-REVISION":
                     count = len(contracts._FAULT_REVISION_NODEIDS)
                     selection = {
@@ -2106,6 +2123,8 @@ def _scenario(tmp_path: Path, *, approved_at: str = "2026-08-01T00:00:00Z"):
         if gate_id in {
             "C-FAULT-STORE", "C-FAULT-REVISION", *contracts._FAULT_H0_MATRIX_CONTRACTS,
         }:
+            selection = copy.deepcopy(instances[0]["selection"])
+        if gate_id == "C-CORPUS-SYNTHETIC":
             selection = copy.deepcopy(instances[0]["selection"])
         rule = None
         reason = None
@@ -2728,7 +2747,7 @@ class TestIncompleteSemanticRegistry:
             | {
                 "A-IDENTITY", "A-EVIDENCE-SCHEMA", "A-TAXONOMY", "A-CORPUS", "A-THRESHOLDS", "A-SUPPORT",
                 "B-HERMETIC-ALL", "B-SCHEMA", "B-DOCS-POLICY", "B-MANIFEST", "B-QUALITY", "B-COVERAGE", "B-STATIC-SECURITY", "B-DETERMINISM",
-                "C-PACKAGE-BUILD", "C-PACKAGE-INSTALL", "C-PYTHON-MATRIX", "C-SBOM", "C-VULNERABILITY", "C-PROVENANCE", "C-SOURCE-REGISTRY", "C-PATH-IDENTITY", "C-FAULT-STORE", "C-FAULT-REVISION", "C-FAULT-FINALIZE", "C-FAULT-CAMPAIGN", "C-NETWORK-BOUNDARY", "C-NET-DENY",
+                "C-PACKAGE-BUILD", "C-PACKAGE-INSTALL", "C-PYTHON-MATRIX", "C-SBOM", "C-VULNERABILITY", "C-PROVENANCE", "C-SOURCE-REGISTRY", "C-CORPUS-SYNTHETIC", "C-PATH-IDENTITY", "C-FAULT-STORE", "C-FAULT-REVISION", "C-FAULT-FINALIZE", "C-FAULT-CAMPAIGN", "C-NETWORK-BOUNDARY", "C-NET-DENY",
                 *contracts.V310_05_SEMANTIC_GATES,
             }
         )
@@ -2817,6 +2836,60 @@ class TestPathIdentitySemanticEvidence:
         context["report"]["instances"][0]["artifacts"][0]["digest"] = digest
         with pytest.raises(evidence.EvidenceError, match="contradicts its expected disposition"):
             contracts._semantic_path_identity(gate, bodies, **context)
+
+
+class TestSyntheticCorpusSemanticEvidence:
+    @staticmethod
+    def _case(tmp_path):
+        arguments = _scenario(tmp_path)
+        gate = _gate(arguments, "C-CORPUS-SYNTHETIC")
+        indexed = {
+            row["name"]: row for row in arguments["artifact_index"]["artifacts"]
+            if row["gate_id"] == "C-CORPUS-SYNTHETIC"
+        }
+        bodies = {
+            name: (arguments["artifact_root"] / indexed[name]["path"]).read_bytes()
+            for name in ("derivation-diff", "disclosure-report")
+        }
+        report = contracts.read_evidence_report(
+            (arguments["artifact_root"] / indexed["gate-evidence"]["path"]).read_bytes(),
+            identity=arguments["identity"],
+            gate_id="C-CORPUS-SYNTHETIC",
+        )
+        return arguments, gate, bodies, report
+
+    @staticmethod
+    def _verify(arguments, gate, bodies, report):
+        with contracts.ArtifactResolver(
+            arguments["artifact_root"], arguments["artifact_index"],
+            identity=arguments["identity"],
+        ) as resolver:
+            contracts._semantic_synthetic_corpus(
+                gate,
+                bodies,
+                corpus=arguments["corpus_manifest"],
+                identity=arguments["identity"],
+                report=report,
+                resolver=resolver,
+            )
+
+    def test_c_gate_reuses_the_selected_public_disclosure_attestation(self, tmp_path):
+        arguments, gate, bodies, report = self._case(tmp_path)
+        self._verify(arguments, gate, bodies, report)
+
+    def test_derivation_projection_substitution_fails_after_digest_rebinding(self, tmp_path):
+        arguments, gate, bodies, report = self._case(tmp_path)
+        document = json.loads(bodies["derivation-diff"])
+        document["records"][0]["result"]["subject"] = f"derivation-1:{_digest('0')}"
+        document["records"][0]["result_digest"] = evidence.canonical_digest(
+            document["records"][0]["result"]
+        )
+        bodies["derivation-diff"] = contracts.canonical_json_line(document)
+        digest = contracts.raw_sha256(bodies["derivation-diff"])
+        next(row for row in gate["artifacts"] if row["name"] == "derivation-diff")["digest"] = digest
+        report["instances"][0]["artifacts"][0]["digest"] = digest
+        with pytest.raises(evidence.EvidenceError, match="derivation projection is substituted"):
+            self._verify(arguments, gate, bodies, report)
 
 
 class TestFaultStoreSemanticEvidence:

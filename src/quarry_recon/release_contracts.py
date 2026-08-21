@@ -3157,20 +3157,20 @@ def _validate_generic_supporting_artifact(
     return doc
 
 
-def _h0_fault_matrix_document(
-    *, gate_id: str, identity: dict, nodeids: Sequence[str],
+def _machine_report_document(
+    *, gate_id: str, name: str, identity: dict, subjects: Sequence[str],
 ) -> dict:
-    """Build the compact exact-node projection for an already retained H0 run."""
+    """Build one exact candidate-bound projection over fixed subjects."""
     return {
         "artifact_type": "machine-report",
         "assertion": {
-            "id": f"{required_assertion_id(gate_id)}.fault-matrix",
+            "id": f"{required_assertion_id(gate_id)}.{name}",
             "reason": None,
             "status": "pass",
         },
         "candidate_identity_digest": evidence.canonical_digest(identity),
         "gate_id": gate_id,
-        "name": "fault-matrix",
+        "name": name,
         "records": [
             {
                 "id": f"case-{index:03d}",
@@ -3180,11 +3180,20 @@ def _h0_fault_matrix_document(
                 }),
                 "status": "pass",
             }
-            for index, nodeid in enumerate(nodeids)
+            for index, nodeid in enumerate(subjects)
         ],
         "release": RELEASE,
         "schema_version": GATE_ARTIFACT_SCHEMA,
     }
+
+
+def _h0_fault_matrix_document(
+    *, gate_id: str, identity: dict, nodeids: Sequence[str],
+) -> dict:
+    """Build the compact exact-node projection for an already retained H0 run."""
+    return _machine_report_document(
+        gate_id=gate_id, name="fault-matrix", identity=identity, subjects=nodeids,
+    )
 
 
 def _validate_h0_fault_matrix(
@@ -5574,6 +5583,15 @@ def _read_synthetic_corpus_disclosure_attestation(body: bytes) -> dict:
     return doc
 
 
+def _synthetic_corpus_diff_subjects(attestation: dict) -> tuple[str, ...]:
+    return (
+        f"derivation-1:{attestation['derivation_tree_digests'][0]}",
+        f"derivation-2:{attestation['derivation_tree_digests'][1]}",
+        f"fixture-schema:{attestation['fixture_schema_digest']}",
+        f"synthetic-inventory:{attestation['synthetic_value_inventory_digest']}",
+    )
+
+
 def _semantic_corpus(
     gate: dict, bodies: Mapping[str, bytes], **context: object,
 ) -> None:
@@ -5599,6 +5617,67 @@ def _semantic_corpus(
         raise evidence.EvidenceError(
             "synthetic corpus disclosure attestation names a different fixture identity"
         )
+
+
+def _semantic_synthetic_corpus(
+    gate: dict, bodies: Mapping[str, bytes], **context: object,
+) -> None:
+    """Bind the C gate to the already validated public corpus attestation."""
+    identity = context["identity"]
+    report = context["report"]
+    resolver = context["resolver"]
+    corpus = context["corpus"]
+    if (gate["gate_id"] != "C-CORPUS-SYNTHETIC" or not isinstance(identity, dict) or
+            not isinstance(report, dict) or not isinstance(resolver, ArtifactResolver) or
+            not isinstance(corpus, dict)):
+        raise evidence.EvidenceError("synthetic corpus verifier requires accepted aggregate context")
+    selected = [row for row in corpus["sources"] if row["selected"]]
+    if (len(selected) != 1 or selected[0]["gate_id"] != "C-CORPUS-SYNTHETIC" or
+            selected[0]["kind"] != "synthetic"):
+        raise evidence.EvidenceError("synthetic corpus gate has no unique selected source")
+
+    disclosure_body = bodies.get("disclosure-report")
+    derivation_body = bodies.get("derivation-diff")
+    source_record = resolver.record("A-CORPUS", "corpus-disclosure-report")
+    source_body = resolver.read("A-CORPUS", "corpus-disclosure-report")
+    if (type(disclosure_body) is not bytes or type(derivation_body) is not bytes or
+            source_record["digest"] != raw_sha256(source_body) or
+            source_record["size"] != len(source_body) or disclosure_body != source_body or
+            selected[0]["attestation_digest"] != raw_sha256(disclosure_body)):
+        raise evidence.EvidenceError("synthetic corpus gate does not reuse the accepted disclosure attestation")
+    attestation = _read_synthetic_corpus_disclosure_attestation(disclosure_body)
+    if attestation["fixture_digest"] != selected[0]["fixture_digest"]:
+        raise evidence.EvidenceError("synthetic corpus gate names another fixture identity")
+    expected_diff = _machine_report_document(
+        gate_id="C-CORPUS-SYNTHETIC",
+        name="derivation-diff",
+        identity=identity,
+        subjects=_synthetic_corpus_diff_subjects(attestation),
+    )
+    if _artifact_document(
+        derivation_body, "C-CORPUS-SYNTHETIC", "derivation-diff",
+    ) != expected_diff:
+        raise evidence.EvidenceError("synthetic corpus derivation projection is substituted")
+
+    signed = {row["name"]: row for row in gate["artifacts"]}
+    for name, body in (("derivation-diff", derivation_body), ("disclosure-report", disclosure_body)):
+        record = signed.get(name)
+        if (record is None or record["media_type"] != "application/json" or
+                record["digest"] != raw_sha256(body)):
+            raise evidence.EvidenceError("synthetic corpus artifact does not match its signed gate record")
+    instances = report["instances"]
+    selection = {
+        "collected": 4, "deselected": 0, "failed": 0, "passed": 4,
+        "selected": 4, "skipped": 0, "xfailed": 0, "xpassed": 0,
+    }
+    expected_artifacts = [
+        {"digest": raw_sha256(derivation_body), "name": "derivation-diff"},
+        {"digest": raw_sha256(disclosure_body), "name": "disclosure-report"},
+    ]
+    if (len(instances) != 1 or instances[0]["lane"] != "H0-hermetic" or
+            instances[0]["selection"] != selection or gate["selection"] != selection or
+            instances[0]["artifacts"] != expected_artifacts):
+        raise evidence.EvidenceError("synthetic corpus signed H0 record is not the exact four-check proof")
 
 
 def _semantic_taxonomy(
@@ -7572,6 +7651,7 @@ SEMANTIC_VERIFIERS = MappingProxyType({
     "B-STATIC-SECURITY": _semantic_static_security,
     "B-DETERMINISM": _semantic_determinism,
     "C-SOURCE-REGISTRY": _semantic_source_registry,
+    "C-CORPUS-SYNTHETIC": _semantic_synthetic_corpus,
     "C-PATH-IDENTITY": _semantic_path_identity,
     "C-FAULT-STORE": _semantic_fault_store,
     "C-FAULT-REVISION": _semantic_fault_revision,
