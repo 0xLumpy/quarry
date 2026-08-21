@@ -433,7 +433,7 @@
     },
     "provenance": {
       "additionalProperties": false,
-      "properties": {"artifact_type": {"const": "provenance"}, "builder": {"$ref": "#/$defs/builder"}, "candidate_identity_digest": {"$ref": "#/$defs/digest"}, "gate_id": {"const": "C-PROVENANCE"}, "materials": {"items": {"$ref": "#/$defs/named_digest"}, "maxItems": 131, "minItems": 131, "type": "array", "uniqueItems": true}, "release": {"const": "0.3.10"}, "schema_version": {"const": "quarry.gate-artifact.v1"}, "subjects": {"items": {"$ref": "#/$defs/named_digest"}, "maxItems": 2, "minItems": 2, "type": "array", "uniqueItems": true}},
+      "properties": {"artifact_type": {"const": "provenance"}, "builder": {"$ref": "#/$defs/builder"}, "candidate_identity_digest": {"$ref": "#/$defs/digest"}, "gate_id": {"const": "C-PROVENANCE"}, "materials": {"items": {"$ref": "#/$defs/named_digest"}, "maxItems": 1024, "minItems": 5, "type": "array", "uniqueItems": true}, "release": {"const": "0.3.10"}, "schema_version": {"const": "quarry.gate-artifact.v1"}, "subjects": {"items": {"$ref": "#/$defs/named_digest"}, "maxItems": 2, "minItems": 2, "type": "array", "uniqueItems": true}},
       "required": ["artifact_type", "builder", "candidate_identity_digest", "gate_id", "materials", "release", "schema_version", "subjects"],
       "type": "object"
     },

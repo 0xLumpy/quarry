@@ -3253,8 +3253,8 @@ class TestProvenanceSemanticEvidence:
         ]
         assert provenance["properties"]["subjects"]["minItems"] == 2
         assert provenance["properties"]["subjects"]["maxItems"] == 2
-        assert provenance["properties"]["materials"]["minItems"] == \
-            provenance["properties"]["materials"]["maxItems"] == 131
+        assert provenance["properties"]["materials"]["minItems"] == 5
+        assert provenance["properties"]["materials"]["maxItems"] == 1024
         assert len(contracts._PROVENANCE_MATERIAL_ARTIFACTS) == 4
         assert "C-PROVENANCE" in contracts.SEMANTIC_VERIFIERS
         assert "C-PROVENANCE" not in contracts.PROVISIONAL_SEMANTIC_VERIFIERS
@@ -3267,6 +3267,7 @@ class TestProvenanceSemanticEvidence:
         assert list(validator.iter_errors(document)) == []
         assert len(document["materials"]) == 1 + len(arguments["identity"]["inputs"]) + \
             len(contracts._PROVENANCE_MATERIAL_ARTIFACTS)
+        assert len(document["materials"]) <= provenance["properties"]["materials"]["maxItems"]
         assert [row["name"] for row in document["subjects"]] == ["sdist", "wheel"]
         expected_names = {"candidate-identity"}
         expected_names.update(f"{gate}/{name}" for gate, name in contracts._PROVENANCE_MATERIAL_ARTIFACTS)
@@ -3297,6 +3298,7 @@ class TestProvenanceSemanticEvidence:
         [
             (lambda document: document["subjects"][0].update(digest=_digest("e")), "release evidence graph"),
             (lambda document: document["builder"].update(evidence_instance_id="forged-instance"), "release evidence graph"),
+            (lambda document: document["materials"].pop(), "release evidence graph"),
         ],
     )
     def test_subject_and_execution_identity_substitutions_fail_after_resigning(self, tmp_path, mutate, match):
