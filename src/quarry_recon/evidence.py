@@ -523,10 +523,11 @@ def _ownership_ok(ctx, source: str, url: str, dest, acq) -> None:
     """The healthy counterpart of `_refused`/`_durability`, on the same units, so a repaired path clears the
     gap. The operator row is written only when the last state was a problem.
     """
-    events.coverage_partial(source, kind=events.COVERAGE_OWNERSHIP, measure="evidence_ownership",
+    event_source = _canonical_source_id(source)
+    events.coverage_partial(event_source, kind=events.COVERAGE_OWNERSHIP, measure="evidence_ownership",
                             unit=f"{source}.url:{url}", eligible=1, tested=1, omitted=0,
                             reason=f"acquisition owned and readable ({acq.disposition})")
-    events.coverage_partial(source, kind=events.COVERAGE_OWNERSHIP, measure="evidence_durability",
+    events.coverage_partial(event_source, kind=events.COVERAGE_OWNERSHIP, measure="evidence_durability",
                             unit=f"{source}.artifact:{Path(dest).name}", eligible=1, tested=1,
                             omitted=0, reason=f"ownership receipt in place ({acq.disposition})")
     # …and the operator row, only when the last state was a problem

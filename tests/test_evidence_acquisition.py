@@ -1870,6 +1870,7 @@ class TestAnOwnershipGapCanBeCLEARED:
         gaps = [json.loads(x) for x in (tmp_path / "events.jsonl").read_text().splitlines()
                 if json.loads(x).get("measure") == "evidence_ownership"]
         assert gaps and gaps[-1]["omitted"] == 1
+        assert gaps[-1]["source_id"] == "evidence.exposed_fetch"
         unit = gaps[-1]["unit"]
 
         dest.unlink()                                  # the operator resolves it
@@ -1878,7 +1879,12 @@ class TestAnOwnershipGapCanBeCLEARED:
         after = [json.loads(x) for x in (tmp_path / "events.jsonl").read_text().splitlines()
                  if json.loads(x).get("measure") == "evidence_ownership"]
         assert after[-1]["unit"] == unit, "the healthy record must land on the SAME unit"
+        assert after[-1]["source_id"] == gaps[-1]["source_id"], \
+            "latest coverage reconciles by canonical source id and display unit"
         assert after[-1]["omitted"] == 0 and after[-1]["tested"] == 1
+        durability = [json.loads(x) for x in (tmp_path / "events.jsonl").read_text().splitlines()
+                      if json.loads(x).get("measure") == "evidence_durability"]
+        assert durability[-1]["source_id"] == "evidence.exposed_fetch"
         events.reset()
 
     def test_a_repaired_durability_failure_clears_too(self, tmp_path, monkeypatch):

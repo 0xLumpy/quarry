@@ -137,12 +137,16 @@ def get_any(source_id: str) -> dict | None:
     return dict(s) if isinstance(s, dict) else None
 
 
-def by_tier(tier: str) -> list[str]:
-    return sorted(sid for sid, s in all_contracts().items() if isinstance(s, dict) and s.get("tier") == tier)
+def by_tier(tier: str, *, include_auxiliary: bool = False) -> list[str]:
+    """Source IDs in `tier`; phase-planned contracts only unless explicitly requested."""
+    entries = all_contracts() if include_auxiliary else all_sources()
+    return sorted(sid for sid, s in entries.items() if isinstance(s, dict) and s.get("tier") == tier)
 
 
-def by_class(cls: str) -> list[str]:
-    return sorted(sid for sid, s in all_contracts().items() if isinstance(s, dict) and s.get("class") == cls)
+def by_class(cls: str, *, include_auxiliary: bool = False) -> list[str]:
+    """Source IDs in `cls`; phase-planned contracts only unless explicitly requested."""
+    entries = all_contracts() if include_auxiliary else all_sources()
+    return sorted(sid for sid, s in entries.items() if isinstance(s, dict) and s.get("class") == cls)
 
 
 def by_phase(phase: str) -> list[str]:

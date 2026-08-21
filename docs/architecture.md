@@ -51,11 +51,12 @@ Five separations carry most of the design:
 
 Two registries describe much of what runs. `data/tools.yaml` (the [tool index](tools.md)) is the
 install/version registry. `data/sources.yaml` records adopted `phase.source` lanes, carrying tier, class,
-default state and a reason for anything off by default. It is not yet an enforced complete runtime
-boundary: several native evidence lanes and direct tool calls remain outside its lifecycle. Those gaps are
-listed in the [current-HEAD audit](audit/CURRENT-HEAD.md) and must close before an external plugin contract
-is claimed. Most external tools use the central runner; long-lived OOB and selected native/legacy paths are
-explicit exceptions today.
+default state and a reason for anything off by default. Its separate `auxiliary_sources` section records
+non-planned native evidence, OSINT, local-classification and control-plane identities with the same source
+contract plus ownership and transport semantics. Auxiliary contracts do not enter phase plans, but they are
+still canonical lifecycle/effect identities; display provenance labels resolve to those IDs when they emit
+coverage. Most external tools use the central runner; long-lived OOB and selected native paths have their
+own declared transport doors rather than ambient lifecycle exceptions.
 
 Coverage and provenance are first-class: most entities record which source produced them (a few, like
 `wildcard_zone`, do not), and a lane that falls short records why where it emits structured coverage (see

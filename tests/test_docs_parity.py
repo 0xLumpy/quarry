@@ -138,6 +138,18 @@ def test_auxiliary_source_contracts_are_complete_without_expanding_phase_plans()
         assert set(sources.FULL_CONTRACT_FIELDS) <= set(contract)
 
 
+def test_tier_and_class_queries_remain_phase_only_unless_auxiliary_is_requested():
+    from quarry_recon import sources
+
+    planned = set(sources.all_sources())
+    optional = set(sources.by_tier("optional"))
+    passive = set(sources.by_class("passive"))
+    assert optional <= planned and passive <= planned
+    assert "osint.whoxy" not in optional and "osint.whoxy" not in passive
+    assert "osint.whoxy" in sources.by_tier("optional", include_auxiliary=True)
+    assert "osint.whoxy" in sources.by_class("passive", include_auxiliary=True)
+
+
 def test_nuclei_policy_label_is_exact_in_registry_and_generated_docs():
     from quarry_recon import nuclei_policy, sources
 
