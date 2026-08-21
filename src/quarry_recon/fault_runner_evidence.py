@@ -119,7 +119,7 @@ CASES = (
         "escaped-output-boundary",
         "escaped-output-holders",
         ("H1-tool-integration",),
-        "escaped stdout and stderr holders are bounded, digested, and never called complete",
+        "escaped stdout drain is bounded and digested; incomplete stdout and stderr drains are explicitly flagged rather than silently complete",
         "tests/test_qr39_001_runner_streaming.py::"
         "test_an_incomplete_stderr_drain_is_not_authoritative",
         "tests/test_qr39_001_runner_streaming.py::"
@@ -131,7 +131,7 @@ CASES = (
         "sink-failure-boundary",
         "sink-write-and-disk-full",
         ("H1-tool-integration",),
-        "stdout and stderr sink faults preserve prior evidence and report exact partial ownership",
+        "stdout sink faults retain an owned partial, stderr faults use a distinct terminal field, and prior stderr stays non-current",
         "tests/test_qr39_001_runner_streaming.py::"
         "test_a_publication_write_failure_is_partial_and_owns_a_unique_partial",
         "tests/test_qr39_001_runner_streaming.py::"
@@ -210,7 +210,7 @@ CASES = (
         "cancellation-boundary",
         "cancellation",
         ("H1-tool-integration",),
-        "cancellation and exceptional teardown kill process trees within shared bounded deadlines",
+        "successful cancellation and exceptional teardown leave no reachable process tree; stubborn children share one grace deadline and caller lanes return when termination fails",
         "tests/test_runner_cancel.py::test_cancel_all_terminates_a_running_child_within_a_bound",
         "tests/test_runner_cancel.py::test_no_process_survives_cancellation",
         "tests/test_runner_cancel.py::test_an_unexpected_exception_never_orphans_a_running_child",
