@@ -17,6 +17,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import weakref
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
@@ -364,10 +365,15 @@ _REPOSITORY_TESTIMONY_AUTHORITY = object()
 
 @dataclass(frozen=True, slots=True, repr=False)
 class _RepositoryExecutionTestimony:
-    """Opaque snapshot made only after repository execution has settled."""
+    """Module-internal snapshot made after repository execution has settled.
 
-    result_identity: int
-    repository_identity: int
+    The weak references bind the snapshot to the exact live objects without
+    relying on recyclable numeric object IDs.  ``authority`` is an internal
+    provenance sentinel, not a cryptographic or hostile-in-process boundary.
+    """
+
+    result_reference: weakref.ReferenceType
+    repository_reference: weakref.ReferenceType
     document_json: bytes = field(repr=False)
     authority: object = field(repr=False, compare=False)
 
@@ -392,25 +398,31 @@ def _seal_repository_execution_testimony(result: RunResult, repository) -> None:
         separators=(",", ":"),
     ).encode("utf-8", "strict")
     meta["_repository_execution_testimony"] = _RepositoryExecutionTestimony(
-        result_identity=id(result), repository_identity=id(repository),
+        result_reference=weakref.ref(result),
+        repository_reference=weakref.ref(repository),
         document_json=encoded, authority=_REPOSITORY_TESTIMONY_AUTHORITY,
     )
 
 
 def repository_execution_testimony(result: RunResult, *, repository) -> dict:
-    """Return the runner-sealed source facts for one exact repository result.
+    """Return snapshotted source facts for one exact live repository result.
 
     This is deliberately not a serialization of mutable ``RunResult.meta``.
-    A collector may read the returned copy, but cannot synthesize an authority
-    object or transplant one onto another result/repository pair.
+    Exact weak-reference identity prevents transplantation after numeric object
+    ID reuse.  The module-private class and sentinel catch accidental misuse;
+    Python code that deliberately accesses private module state can construct a
+    matching value, so this is not an unforgeable attestation or security
+    boundary.
     """
     if type(result) is not RunResult:
         raise TypeError("repository testimony requires an exact RunResult")
     sealed = result.meta.get("_repository_execution_testimony")
     if (type(sealed) is not _RepositoryExecutionTestimony
             or sealed.authority is not _REPOSITORY_TESTIMONY_AUTHORITY
-            or sealed.result_identity != id(result)
-            or sealed.repository_identity != id(repository)):
+            or type(sealed.result_reference) is not weakref.ReferenceType
+            or type(sealed.repository_reference) is not weakref.ReferenceType
+            or sealed.result_reference() is not result
+            or sealed.repository_reference() is not repository):
         raise ValueError("result has no sealed testimony for this repository")
     try:
         document = json.loads(sealed.document_json)
@@ -1659,8 +1671,9 @@ def _repository_run_result(
     if stderr.disposition is ArtifactDisposition.PUBLISH:
         meta["stderr_published"] = stderr_final is not None
     if settlement is not None:
-        # Public, authenticated execution testimony for release collectors.  This
-        # is a projection of the supervisor settlement, never collector input.
+        # Public parent-validated settlement facts for bounded collectors.  This
+        # is a projection of the supervisor settlement, never collector input or
+        # a cryptographic/unforgeable attestation.
         meta["execution_terminal"] = settlement.terminal.value
         meta["process_group_settled"] = settlement.process_group_settled
         meta["process_tree_settled"] = settlement.process_tree_settled

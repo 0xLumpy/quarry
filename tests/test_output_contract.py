@@ -15,6 +15,7 @@ import json
 import os
 import shutil
 import subprocess
+import weakref
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -434,6 +435,14 @@ def test_serialized_shape_schema_and_manual_reject_stream_and_case_mutations(tmp
     wrong_parser["parser"]["records"] = 0
     rejected(wrong_parser)
 
+    missing_parser_input = copy.deepcopy(malformed)
+    missing_parser_input["parser"]["input"] = None
+    rejected(missing_parser_input)
+
+    missing_worker_pid = copy.deepcopy(malformed)
+    missing_worker_pid["execution"]["worker_pid"] = None
+    rejected(missing_worker_pid)
+
     identity_extra = copy.deepcopy(malformed)
     identity_extra["launch"]["runtime_identity"]["unexpected"] = True
     rejected(identity_extra)
@@ -441,6 +450,29 @@ def test_serialized_shape_schema_and_manual_reject_stream_and_case_mutations(tmp
     identity_row_extra = copy.deepcopy(malformed)
     identity_row_extra["launch"]["runtime_identity"]["identities"][0]["unexpected"] = True
     rejected(identity_row_extra)
+
+    short_identity = copy.deepcopy(malformed)
+    short_identity["launch"]["runtime_identity"]["identities"][0]["identity"] = "sha256:0"
+    short_identity["launch"]["runtime_identity_digest"] = evidence.canonical_digest(
+        short_identity["launch"]["runtime_identity"],
+    )
+    rejected(short_identity)
+
+    heterogeneous_row = copy.deepcopy(malformed)
+    heterogeneous_row["launch"]["runtime_identity"]["dynamic_closure"] = [1]
+    heterogeneous_row["launch"]["runtime_identity_digest"] = evidence.canonical_digest(
+        heterogeneous_row["launch"]["runtime_identity"],
+    )
+    rejected(heterogeneous_row)
+
+    false_browser_row = copy.deepcopy(malformed)
+    row = false_browser_row["launch"]["runtime_identity"]["identities"][0]
+    row.pop("attestation")
+    row["closure"] = None
+    false_browser_row["launch"]["runtime_identity_digest"] = evidence.canonical_digest(
+        false_browser_row["launch"]["runtime_identity"],
+    )
+    rejected(false_browser_row)
 
 
 @pytest.mark.integration
@@ -468,6 +500,14 @@ def test_empty_native_receipt_and_final_timestamp_are_attached_once(tmp_path, mo
         monkeypatch, root=root, run=run, manifest=manifest, case_id="empty",
     )
     testimony = runner.repository_execution_testimony(result, repository=run)
+    sealed = result.meta["_repository_execution_testimony"]
+    assert type(sealed.result_reference) is weakref.ReferenceType
+    assert type(sealed.repository_reference) is weakref.ReferenceType
+    assert sealed.result_reference() is result
+    assert sealed.repository_reference() is run
+    transplanted = copy.copy(result)
+    with pytest.raises(ValueError, match="no sealed testimony"):
+        runner.repository_execution_testimony(transplanted, repository=run)
     assert len(calls) == 2
     assert testimony["execution_started_at"] == (base + timedelta(microseconds=1)).isoformat().replace(
         "+00:00", "Z",
@@ -602,3 +642,58 @@ def test_v2_schemas_are_syntactically_strict_about_the_frozen_manifest():
     assert list(validator.iter_errors(false_native_claim))
     with pytest.raises(contract.OutputContractError):
         contract.validate_fixture_manifest(false_native_claim)
+
+
+@pytest.mark.offline
+def test_case_matrix_schema_and_manual_parser_shape_are_in_parity():
+    Draft202012Validator = pytest.importorskip("jsonschema").Draft202012Validator
+    manifest = _manifest()
+    digest = "sha256:" + "0" * 64
+    matrix = {
+        "schema_version": contract.CASE_MATRIX_SCHEMA,
+        "fixture_manifest_digest": evidence.canonical_digest(manifest),
+        "candidate": {
+            "dirty": False, "git_commit": "0" * 40, "git_tree": "1" * 40,
+            "identity_digest": digest, "package_version": "0.3.10",
+            "source_tree_digest": digest,
+        },
+        "run": {
+            "directory_device": 1, "directory_inode": 2, "run_id": "shape-only",
+            "started_at": "2026-08-21T00:00:00Z", "target": "fixture.example",
+        },
+        "disposition": contract.SOURCE_SUBSTRATE_DISPOSITION,
+        "observation": contract.SOURCE_SUBSTRATE_OBSERVATION,
+        "cases": [],
+    }
+    for case in manifest["cases"]:
+        measured = case["availability"] == "measured-helper"
+        matrix["cases"].append({
+            "id": case["id"],
+            "availability": case["availability"],
+            "diagnostic_digest": digest if measured else None,
+            "open_reason": None if measured else "native-gitleaks-fixture-unavailable",
+            "effective_status": case["expected"]["effective_status"],
+            "parser": {
+                "complete": case["expected"]["parser"]["complete"],
+                "input": None,
+                "outcome": case["expected"]["parser"]["outcome"],
+                "parser": (
+                    "json-array" if case["executor"] == "candidate-python-helper"
+                    else "gitleaks-json"
+                ),
+                "records": case["expected"]["parser"]["records"],
+            },
+        })
+    schema = json.loads(
+        (ROOT / "release/evidence/schemas/c-output-case-matrix-v2.schema.json").read_bytes(),
+    )
+    validator = Draft202012Validator(schema)
+    assert list(validator.iter_errors(matrix)) == []
+    assert contract.validate_case_matrix(matrix, fixture_manifest=manifest) == matrix
+
+    for field, value in (("parser", "not-a-parser"), ("input", 1)):
+        malformed = copy.deepcopy(matrix)
+        malformed["cases"][0]["parser"][field] = value
+        assert list(validator.iter_errors(malformed))
+        with pytest.raises(contract.OutputContractError):
+            contract.validate_case_matrix(malformed, fixture_manifest=manifest)

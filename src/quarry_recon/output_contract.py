@@ -1,10 +1,12 @@
 """Bounded, non-promoting C-OUTPUT-CONTRACT source substrate.
 
-Only the in-process producer consumes runner-sealed repository testimony.  A
-serialized raw receipt is deliberately a *shape-only diagnostic*: it has no
-authenticated envelope or resolver and must never be treated as evidence or
-an accepting release input.  The native Gitleaks rows remain explicitly open
-until a pinned, attested fixture execution proves their claimed semantics.
+Only the in-process producer consumes an exact-object-bound runner snapshot.
+That snapshot is a module-internal integrity mechanism, not a cryptographic or
+hostile-in-process attestation.  A serialized raw receipt is deliberately a
+*shape-only diagnostic*: it has no authenticated envelope or resolver and must
+never be treated as evidence or an accepting release input.  The native
+Gitleaks rows remain explicitly open until a pinned, attested fixture execution
+proves their claimed semantics.
 """
 from __future__ import annotations
 
@@ -398,7 +400,7 @@ def _sealed_testimony(result: runner.RunResult, run: store.Run) -> dict:
     try:
         return runner.repository_execution_testimony(result, repository=run)
     except (TypeError, ValueError) as exc:
-        raise OutputContractError("receipt producer refuses unsealed repository testimony") from exc
+        raise OutputContractError("receipt producer refuses unbound repository testimony") from exc
 
 
 def _runtime_file(value: object, name: str) -> dict:
@@ -443,6 +445,8 @@ def _runtime_identity_row(value: object, name: str) -> dict:
         _text(value["declared_identity"], f"{name}.declared_identity", maximum=512)
     elif keys == browser:
         _runtime_closure(value["closure"], f"{name}.closure")
+        if value["role"] != "browser":
+            raise OutputContractError(f"{name} browser role is invalid")
     else:
         raise OutputContractError(f"{name} has unknown identity fields")
     if value["role"] not in {
@@ -451,8 +455,14 @@ def _runtime_identity_row(value: object, name: str) -> dict:
     executable = _runtime_file(value["executable"], f"{name}.executable")
     if executable["role"] not in {"executable", "browser"}:
         raise OutputContractError(f"{name}.executable.role is invalid")
+    if keys == browser and executable["role"] != "browser":
+        raise OutputContractError(f"{name} browser executable role is invalid")
     identity = _text(value["identity"], f"{name}.identity", maximum=512)
-    if not (identity.startswith("sha256:") or identity.startswith("distro@sha256:")):
+    identity_pattern = (
+        r"sha256:[0-9a-f]{64}" if keys == browser
+        else r"(?:sha256:|distro@sha256:)[0-9a-f]{64}"
+    )
+    if re.fullmatch(identity_pattern, identity) is None:
         raise OutputContractError(f"{name}.identity is invalid")
     _text(value["runtime"], f"{name}.runtime", maximum=128)
     _text(value["runtime_root"], f"{name}.runtime_root", maximum=4096)
@@ -498,7 +508,9 @@ def _runtime_identity_record(value: object, name: str) -> dict:
     # These collections have heterogeneous rows owned by runtime_identity;
     # their top-level presence stays closed while the C-OUTPUT helper admits none.
     for field in ("payload_anchors", "private_inputs", "dynamic_closure"):
-        _array(item[field], f"{name}.{field}", maximum=64)
+        values = _array(item[field], f"{name}.{field}", maximum=64)
+        if any(type(value) is not dict for value in values):
+            raise OutputContractError(f"{name}.{field} contains a non-object row")
     return item
 
 
@@ -605,6 +617,8 @@ def _execution_document(value: object, name: str) -> tuple[dict, list[dict]]:
             _count(settlement[field], f"{name}.{field}", maximum=(1 << 31) - 1)
             if settlement[field] == 0:
                 raise OutputContractError(f"{name}.{field} is invalid")
+    if settlement["worker_pid"] is None:
+        raise OutputContractError(f"{name}.worker_pid is absent")
     if settlement["launched"] != (settlement["tool_pid"] is not None):
         raise OutputContractError(f"{name} launch identity disagrees")
     if settlement["terminal"] == "complete" and settlement["exit_code"] is None:
@@ -627,7 +641,7 @@ def _settlement(testimony: Mapping[str, object]) -> tuple[dict, list[dict], str]
         "repository_ownership_settled", "repository_publication",
     }
     if not required.issubset(testimony):
-        raise OutputContractError("result lacks authenticated repository settlement")
+        raise OutputContractError("result lacks parent-validated repository settlement")
     settlement, streams = _execution_document(testimony["execution_settlement"], "execution settlement")
     if (settlement["request_id"] != testimony["execution_request_id"]
             or settlement["terminal"] != testimony["execution_terminal"]
@@ -641,7 +655,7 @@ def _settlement(testimony: Mapping[str, object]) -> tuple[dict, list[dict], str]
         raise OutputContractError("repository publication is not terminal")
     projected = testimony["streams"]
     if type(projected) is not dict or [projected.get(role) for role in ("stdin", "stdout", "stderr")] != streams:
-        raise OutputContractError("stream projection disagrees with authenticated settlement")
+        raise OutputContractError("stream projection disagrees with parent-validated settlement")
     return settlement, streams, publication
 
 
@@ -790,8 +804,9 @@ def parse_stdout_json(*, run: store.Run, testimony: Mapping[str, object]) -> dic
             label="capped stdout",
         )
         return {
-            # The retained prefix is authenticated in-process, but it cannot
-            # prove a complete JSON document.  Do not feed a cap to json.loads.
+            # The retained prefix is matched to parent-validated in-process
+            # facts, but it cannot prove a complete JSON document.  Do not feed
+            # a cap to json.loads.
             "complete": False,
             "input": {"bytes": len(body), "sha256": hashlib.sha256(body).hexdigest(),
                       "stream": "stdout"},
@@ -1318,7 +1333,7 @@ def _verified_stderr(case: dict, *, run: store.Run, testimony: Mapping[str, obje
 def _derive_effective_status(
     *, case: dict, settlement: dict, streams: list[dict], parser: dict, stderr_body: bytes,
 ) -> str:
-    """Derive status from sealed facts, never from mutable RunResult.status."""
+    """Derive status from snapshotted facts, never from mutable RunResult.status."""
     if settlement["terminal"] == "timed_out":
         return "timed_out"
     exit_code = settlement["exit_code"]
@@ -1382,6 +1397,9 @@ def _case_invariants(case: dict, receipt: dict, *, fixture_payload: bytes | None
         raise OutputContractError("case stream terminal does not match frozen contract")
     if {key: parser[key] for key in ("complete", "outcome", "records")} != expected["parser"]:
         raise OutputContractError("case parser fact does not match frozen contract")
+    parser_input_required = parser["outcome"] != "unavailable"
+    if parser_input_required != (parser["input"] is not None):
+        raise OutputContractError("case parser input availability does not match frozen contract")
     native = receipt["native_outputs"]
     if expected["native"] == "none":
         if not (native["clean"] is True and native["policy_count"] == 0
@@ -1418,7 +1436,7 @@ def receipt_from_runner(
     candidate_identity: object, candidate_root: str | os.PathLike[str],
     result: runner.RunResult, gitleaks_version_result: runner.RunResult | None = None,
 ) -> dict:
-    """Produce one raw receipt solely from sealed repository execution facts."""
+    """Produce one raw receipt solely from snapshotted repository execution facts."""
     manifest = validate_fixture_manifest(fixture_manifest)
     if case_id not in CASES:
         raise OutputContractError("receipt producer received an unknown case")
@@ -1519,9 +1537,9 @@ def validate_raw_receipt(
 ) -> dict:
     """Validate a serialized *shape-only diagnostic*, never authenticated evidence.
 
-    Raw JSON cannot carry the runner's sealed authority.  Callers asking this
-    path to accept evidence fail closed; only ``receipt_from_runner`` has
-    access to in-process repository testimony and descriptor-pinned bytes.
+    Raw JSON cannot carry the runner's exact-object binding.  Callers asking
+    this path to accept evidence fail closed; only ``receipt_from_runner`` has
+    access to the in-process snapshot and descriptor-pinned bytes.
     """
     if accepting is not False:
         raise OutputContractError("serialized raw receipts have no authenticated accepting resolver")
@@ -1687,6 +1705,25 @@ def validate_case_matrix(
             "complete", "input", "outcome", "parser", "records",
         })
         expected = expected_case_document["expected"]
+        expected_parser = (
+            "json-array" if expected_case_document["executor"] == "candidate-python-helper"
+            else "gitleaks-json"
+        )
+        if parser["parser"] != expected_parser:
+            raise OutputContractError("case matrix parser does not match its executor")
+        if type(parser["complete"]) is not bool:
+            raise OutputContractError("case matrix parser completeness is invalid")
+        if parser["records"] is not None:
+            _count(parser["records"], "case matrix parser records")
+        parser_input = parser["input"]
+        if parser_input is not None:
+            parser_input = _object(parser_input, "case matrix parser input", {
+                "bytes", "sha256", "stream",
+            })
+            _count(parser_input["bytes"], "case matrix parser input bytes")
+            _bare_digest(parser_input["sha256"], "case matrix parser input sha256")
+            if parser_input["stream"] not in {"stdout", "native"}:
+                raise OutputContractError("case matrix parser input stream is invalid")
         if (item["effective_status"] != expected["effective_status"]
                 or {key: parser[key] for key in ("complete", "outcome", "records")}
                 != expected["parser"]):
