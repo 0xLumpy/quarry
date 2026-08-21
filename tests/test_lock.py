@@ -301,6 +301,7 @@ class TestInstalledIdentity:
     def test_go_uses_module_metadata_not_cli_banner(self, monkeypatch):
         # review-C08.2#3: identity from `go version -m`, NOT the tool's -version (which lagged for dnsx/ffuf/…)
         t = _tool(bin="ffuf", runtime="go", install="go install github.com/ffuf/ffuf/v2@latest")
+        monkeypatch.setattr(registry, "managed_runtime_receipt", lambda _tool: None)
         monkeypatch.setattr(Tool, "installed", property(lambda self: True))
         monkeypatch.setattr(registry.shutil, "which", lambda b: "/bin/ffuf")
         monkeypatch.setattr(registry, "_go_mod_and_version", lambda p: ("github.com/ffuf/ffuf/v2", "v2.2.1"))
@@ -416,6 +417,47 @@ class TestInstallOne:
         # review-C08.2r3#1: a TIMED-OUT / not-executed probe (_PROBE_NOT_RUN) is NOT accepted, even by [0,1]
         self._patch_go(monkeypatch, cap=(registry._PROBE_NOT_RUN, ""))
         assert registry.install_one(self._go(cap_codes=[0, 1]), lambda m: None) is False
+
+    def test_candidate_probe_separates_writable_state_from_immutable_pipx_identity(
+            self, tmp_path, monkeypatch):
+        candidate = tmp_path / "candidate"
+        executable = candidate / "pipx" / "venvs" / "waymore" / "bin" / "waymore"
+        environment = {
+            "HOME": str(candidate / "home"),
+            "PIPX_BIN_DIR": str(candidate / "home" / ".local" / "bin"),
+            "PIPX_HOME": str(candidate / "pipx"),
+            "XDG_CACHE_HOME": str(candidate / "cache"),
+        }
+        observed = {}
+
+        def probe(_command, *, env):
+            for variable in (
+                    "HOME", "TMPDIR", "XDG_CACHE_HOME", "XDG_CONFIG_HOME",
+                    "XDG_DATA_HOME", "PIPX_LOG_DIR"):
+                location = Path(env[variable])
+                assert location.is_dir() and location.stat().st_mode & 0o200
+            observed["temporary_root"] = Path(env["HOME"]).parent
+            return 0, "usage"
+
+        def metadata(_package, *, env):
+            assert env["PIPX_HOME"] == environment["PIPX_HOME"]
+            assert Path(env["PIPX_LOG_DIR"]).parent == observed["temporary_root"]
+            return "8.9", [str(executable)]
+
+        monkeypatch.setattr(registry, "_probe", probe)
+        monkeypatch.setattr(registry, "_pipx_meta", metadata)
+        tool = _tool(
+            bin="waymore", runtime="pipx", pin="8.9",
+            install="pipx install waymore", version_cmd="waymore -h",
+        )
+        assert registry._probe_candidate(tool, executable, environment) is True
+        assert environment == {
+            "HOME": str(candidate / "home"),
+            "PIPX_BIN_DIR": str(candidate / "home" / ".local" / "bin"),
+            "PIPX_HOME": str(candidate / "pipx"),
+            "XDG_CACHE_HOME": str(candidate / "cache"),
+        }
+        assert not observed["temporary_root"].exists()
 
     def test_shadowed_managed_binary_fails(self, monkeypatch, tmp_path):
         # review-C08.2r3#2: after activation, an older PATH copy that shadows the managed binary is a failure
@@ -795,6 +837,7 @@ class TestIdentityR5:
     def test_pipx_resolved_to_app_path_ok(self, monkeypatch):
         t = _tool(bin="arjun", runtime="pipx", install="pipx install arjun")
         app = "/home/u/.local/pipx/venvs/arjun/bin/arjun"
+        monkeypatch.setattr(registry, "managed_runtime_receipt", lambda _tool: None)
         monkeypatch.setattr(Tool, "installed", property(lambda self: True))
         monkeypatch.setattr(registry.shutil, "which", lambda b: app)
         monkeypatch.setattr(registry, "_pipx_meta", lambda pkg: ("2.2.7", [app]))

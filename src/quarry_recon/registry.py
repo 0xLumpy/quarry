@@ -10,6 +10,7 @@ import re
 import shutil
 import stat
 import subprocess
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
@@ -787,24 +788,38 @@ def _installer_environment(candidate: Path, t: "Tool") -> dict[str, str]:
 def _probe_candidate(t: "Tool", executable: Path, environment: dict[str, str]) -> bool:
     accepted = set(t.cap_codes) if t.cap_codes else None
     probe = t.capability or t.version_cmd
-    if probe:
-        command = probe.replace(t.bin, shlex_quote(str(executable)), 1)
-        if not _capability_ok(_probe(command, env=environment)[0], accepted):
-            return False
-    if t.pin and t.runtime == "binary" and t.version_cmd:
-        command = t.version_cmd.replace(t.bin, shlex_quote(str(executable)), 1)
-        rc, output = _probe(command, env=environment)
-        version = _parse_version(output) if _version_ok(rc, t.version_codes) else ""
-        if not version_eq(version, t.pin):
-            return False
+    with tempfile.TemporaryDirectory(prefix="quarry-tool-probe-") as temporary:
+        probe_environment = dict(environment)
+        probe_root = Path(temporary)
+        for variable, relative in (
+            ("HOME", "home"),
+            ("TMPDIR", "tmp"),
+            ("XDG_CACHE_HOME", "xdg-cache"),
+            ("XDG_CONFIG_HOME", "xdg-config"),
+            ("XDG_DATA_HOME", "xdg-data"),
+            ("PIPX_LOG_DIR", "pipx-log"),
+        ):
+            directory = probe_root / relative
+            directory.mkdir(mode=0o700)
+            probe_environment[variable] = str(directory)
+        if probe:
+            command = probe.replace(t.bin, shlex_quote(str(executable)), 1)
+            if not _capability_ok(_probe(command, env=probe_environment)[0], accepted):
+                return False
+        if t.pin and t.runtime == "binary" and t.version_cmd:
+            command = t.version_cmd.replace(t.bin, shlex_quote(str(executable)), 1)
+            rc, output = _probe(command, env=probe_environment)
+            version = _parse_version(output) if _version_ok(rc, t.version_codes) else ""
+            if not version_eq(version, t.pin):
+                return False
+        if t.runtime == "pipx":
+            version, app_paths = _pipx_meta(_pipx_pkg(t), env=probe_environment)
+            admitted = {Path(path).resolve() for path in app_paths}
+            if not version_eq(version, t.pin) or executable.resolve() not in admitted:
+                return False
     if t.runtime == "go":
         module, version = _go_mod_and_version(str(executable))
         if module != _expected_go_module(t) or not version_eq(version, t.pin):
-            return False
-    if t.runtime == "pipx":
-        version, app_paths = _pipx_meta(_pipx_pkg(t), env=environment)
-        admitted = {Path(path).resolve() for path in app_paths}
-        if not version_eq(version, t.pin) or executable.resolve() not in admitted:
             return False
     return True
 
