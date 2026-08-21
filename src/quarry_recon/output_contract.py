@@ -16,6 +16,7 @@ import os
 import re
 import stat
 from collections.abc import Mapping, Sequence
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
@@ -736,48 +737,65 @@ def _sealed_artifact_path(
     return path, components
 
 
+@contextmanager
+def _owned_run_anchor(run: store.Run):
+    """Keep the exact repository anchor owned while retained bytes are read."""
+    owner = store._OwnedDescriptor(run._run_directory_identity)
+    settlement = store._SettlementOwner(
+        lambda: store._settle_descriptor_owners(
+            (owner,), "output contract retained artifact anchor",
+        ),
+    )
+    with store._SettlementFence(settlement):
+        with store._SettlementFence(settlement):
+            store._open_run_fd_into(
+                owner,
+                run.project_dir,
+                run.run_id,
+                expected_identity=run._run_directory_identity,
+            )
+            yield owner.fd
+
+
 def _verified_artifact_bytes(
     run: store.Run, components: tuple[str, ...], *, size: int, digest: str, label: str,
 ) -> bytes:
     """Hash a retained run artifact through the run's strict descriptor authority."""
-    run_fd = artifact_fd = -1
-    try:
-        run_fd = store._open_run_fd(
-            run.project_dir, run.run_id, expected_identity=run._run_directory_identity,
-        )
-        artifact_fd = privfs.open_strict_file_at(run_fd, components)
-        before = os.fstat(artifact_fd)
-        if before.st_size > MAX_STREAM_BYTES or before.st_size != size:
-            raise OutputContractError(f"retained {label} size does not match runner settlement")
-        chunks: list[bytes] = []
-        total = 0
-        digest_state = hashlib.sha256()
-        while True:
-            chunk = os.read(artifact_fd, min(1024 * 1024, size - total + 1))
-            if not chunk:
-                break
-            total += len(chunk)
-            if total > size:
-                raise OutputContractError(f"retained {label} exceeds runner settlement")
-            digest_state.update(chunk)
-            chunks.append(chunk)
-        after = os.fstat(artifact_fd)
-        if ((before.st_dev, before.st_ino, before.st_mode, before.st_nlink, before.st_size,
-             before.st_mtime_ns, before.st_ctime_ns)
-                != (after.st_dev, after.st_ino, after.st_mode, after.st_nlink, after.st_size,
-                    after.st_mtime_ns, after.st_ctime_ns)
-                or total != size or digest_state.hexdigest() != digest):
-            raise OutputContractError(f"retained {label} bytes do not match runner settlement")
-        body = b"".join(chunks)
-    except OutputContractError:
-        raise
-    except Exception as exc:
-        raise OutputContractError(f"cannot open retained {label} through run authority") from exc
-    finally:
-        for descriptor in (artifact_fd, run_fd):
-            if descriptor >= 0:
+    artifact_fd = -1
+    with _owned_run_anchor(run) as run_fd:
+        try:
+            artifact_fd = privfs.open_strict_file_at(run_fd, components)
+            before = os.fstat(artifact_fd)
+            if before.st_size > MAX_STREAM_BYTES or before.st_size != size:
+                raise OutputContractError(f"retained {label} size does not match runner settlement")
+            chunks: list[bytes] = []
+            total = 0
+            digest_state = hashlib.sha256()
+            while True:
+                chunk = os.read(artifact_fd, min(1024 * 1024, size - total + 1))
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > size:
+                    raise OutputContractError(f"retained {label} exceeds runner settlement")
+                digest_state.update(chunk)
+                chunks.append(chunk)
+            after = os.fstat(artifact_fd)
+            if ((before.st_dev, before.st_ino, before.st_mode, before.st_nlink, before.st_size,
+                 before.st_mtime_ns, before.st_ctime_ns)
+                    != (after.st_dev, after.st_ino, after.st_mode, after.st_nlink, after.st_size,
+                        after.st_mtime_ns, after.st_ctime_ns)
+                    or total != size or digest_state.hexdigest() != digest):
+                raise OutputContractError(f"retained {label} bytes do not match runner settlement")
+            body = b"".join(chunks)
+        except OutputContractError:
+            raise
+        except Exception as exc:
+            raise OutputContractError(f"cannot open retained {label} through run authority") from exc
+        finally:
+            if artifact_fd >= 0:
                 try:
-                    os.close(descriptor)
+                    os.close(artifact_fd)
                 except OSError:
                     pass
     return body
