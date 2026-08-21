@@ -93,8 +93,10 @@ def test_pull_request_ci_selects_every_public_nonlive_lane_separately():
         assert all("verify-quarry-live.sh" not in step.get("run", "") for step in job["steps"])
         actions = [step["uses"] for step in job["steps"] if "uses" in step]
         expected_actions = [CHECKOUT, SETUP_PYTHON]
-        if name in {"offline", "package"}:
+        if name == "offline":
             expected_actions.append(UPLOAD_ARTIFACT)
+        elif name == "package":
+            expected_actions.extend([UPLOAD_ARTIFACT, UPLOAD_ARTIFACT])
         assert actions == expected_actions
         assert job["timeout-minutes"] <= 45
     assert jobs["offline"]["strategy"]["matrix"]["python-version"] == ["3.10", "3.11", "3.12"]
@@ -119,6 +121,20 @@ def test_pull_request_ci_selects_every_public_nonlive_lane_separately():
     assert 'zipfile.ZipFile(os.environ["WHEEL"])' in install_smoke["run"]
     assert 'importlib.metadata' not in install_smoke["run"]
     assert '"$wheel"' in install_smoke["run"]
+    sbom_observe = [step for step in package_steps if step.get("name") == "Observe installed runtime C-SBOM closure"]
+    sbom_upload = [step for step in package_steps if step.get("name") == "Upload raw C-SBOM observation"]
+    assert len(sbom_observe) == len(sbom_upload) == 1
+    observe = sbom_observe[0]
+    assert 'env -u PYTHONPATH "$install_prefix/bin/python" scripts/emit_sbom_observation.py' in observe["run"]
+    assert '--wheel "${wheels[0]}"' in observe["run"]
+    assert '--output "$RUNNER_TEMP/sbom-observation-${{ matrix.python-version }}.json"' in observe["run"]
+    upload = sbom_upload[0]
+    assert upload["uses"] == UPLOAD_ARTIFACT
+    assert upload["with"] == {
+        "name": "sbom-observation-${{ matrix.python-version }}",
+        "path": "${{ runner.temp }}/sbom-observation-${{ matrix.python-version }}.json",
+        "if-no-files-found": "error",
+    }
 
 
 def test_offline_and_authorized_live_diagnostics_are_separate():

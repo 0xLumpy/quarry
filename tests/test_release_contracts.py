@@ -1170,51 +1170,149 @@ def _supporting_bodies(
             ),
         })
     elif gate_id == "C-SBOM":
-        components = [{
-            "content_digest": identity["source_tree_digest"],
-            "declared_requirement": None,
-            "license": "MIT",
-            "name": "quarry-recon",
-            "relationship": "project",
-            "version": "0.3.10",
-        }]
+        wheel = next(row for row in indexed if row["gate_id"] == "C-PACKAGE-BUILD" and row["name"] == "wheel")
+
+        def observation_component(name, version, license_value, requirements):
+            files = [{
+                "digest": contracts.raw_sha256(f"synthetic {name} {version}\n".encode()),
+                "path": f"site-packages/{name}/__init__.py",
+                "size": len(f"synthetic {name} {version}\n".encode()),
+            }]
+            requirements = [{
+                "active": active, "name": dependency, "raw": raw,
+            } for dependency, raw, active in requirements]
+            requirements.sort(key=lambda row: row["raw"])
+            dependencies = sorted(row["name"] for row in requirements if row["active"])
+            return {
+                "active_dependencies": dependencies,
+                "content_digest": contracts.raw_sha256(contracts.canonical_json_line(files)),
+                "files": files,
+                "license": license_value,
+                "name": name,
+                "raw_requirements": requirements,
+                "version": version,
+            }
+
+        observations = []
+        for expected_environment, artifact_name in zip(
+            sorted(({
+                key: row[key] for key in ("architecture", "isolation_profile", "os", "python", "runner_image")
+            } for row in support["environments"] if row["lane"] == "P0-package-supply"), key=lambda row: row["python"]),
+            contracts._SBOM_OBSERVATION_NAMES,
+            strict=True,
+        ):
+            python_version = expected_environment["python"]
+            minor = ".".join(python_version.split(".")[:2])
+            root_requirements = []
+            for raw in (
+                "click>=8.2", "pyyaml>=6.0", "idna>=3.4",
+                "tomli>=2.0; python_version < '3.11'",
+            ):
+                dependency = raw.split(">", 1)[0].split(";", 1)[0]
+                active = not dependency == "tomli" or minor == "3.10"
+                root_requirements.append((dependency, raw, active))
+            components = [
+                observation_component("quarry-recon", "0.3.10", "MIT", root_requirements),
+                observation_component("click", "8.2.1", "BSD-3-Clause", [
+                    ("colorama", "colorama; platform_system == 'Windows'", False),
+                ]),
+                observation_component("idna", "3.10", "BSD-3-Clause", [
+                    ("ruff", "ruff; extra == 'all'", False),
+                ]),
+                observation_component("pyyaml", "6.0.2", "MIT", []),
+            ]
+            if minor == "3.10":
+                components.append(observation_component("tomli", "2.0.2", "MIT", []))
+            components.sort(key=lambda row: row["name"])
+            graph = [{
+                "dependencies": row["active_dependencies"], "name": row["name"], "version": row["version"],
+            } for row in components]
+            marker_environment = {
+                "extra": "", "implementation_name": "cpython", "os_name": "posix",
+                "platform_system": "Linux", "python_full_version": python_version,
+                "python_version": minor, "sys_platform": "linux",
+            }
+            raw_environment = {**expected_environment, "isolation_profile": None, "runner_image": None}
+            raw = contracts.canonical_json_line({
+                "artifact_type": "sbom-observation",
+                "components": components,
+                "dependency_graph_digest": contracts.raw_sha256(contracts.canonical_json_line(graph)),
+                "environment": raw_environment,
+                "interpreter": {
+                    "base_prefix": "/opt/python", "executable": "/tmp/prefix/bin/python",
+                    "implementation": "cpython", "prefix": "/tmp/prefix", "version": python_version + " synthetic",
+                },
+                "marker_environment": marker_environment,
+                "marker_evaluator": {"implementation": "pip._vendor.packaging", "version": "24.0"},
+                "package": {"name": "quarry-recon", "version": "0.3.10"},
+                "producer": {
+                    "digest": next(
+                        row["digest"] for row in scope["input_bindings"]
+                        if row["name"] == "sbom-observation-producer"
+                    ),
+                    "name": "sbom-observation-producer",
+                },
+                "schema_version": contracts.GATE_ARTIFACT_SCHEMA,
+                "source_wheel": {"digest": wheel["digest"], "size": wheel["size"]},
+            })
+            bodies[artifact_name] = raw
+            observations.append({
+                "digest": contracts.raw_sha256(raw), "environment": expected_environment,
+                "evidence_instance_id": f"instance-{len(observations):02d}", "name": artifact_name,
+            })
+        direct = {
+            "click": "click>=8.2", "pyyaml": "pyyaml>=6.0", "idna": "idna>=3.4",
+            "tomli": "tomli>=2.0; python_version < '3.11'",
+        }
+        grouped = {}
+        for observation in observations:
+            for component in json.loads(bodies[observation["name"]])["components"]:
+                grouped.setdefault(component["name"], []).append((observation, component))
+        components = []
+        for name, rows in grouped.items():
+            environments = [{
+                "active_dependencies": component["active_dependencies"],
+                "content_digest": component["content_digest"], "environment": observation["environment"],
+                "raw_requirements": component["raw_requirements"],
+            } for observation, component in rows]
+            environments.sort(key=lambda row: row["environment"]["python"])
+            component = rows[0][1]
+            components.append({
+                "content_digest": contracts.raw_sha256(contracts.canonical_json_line(environments)),
+                "declared_requirement": direct.get(name),
+                "environments": environments,
+                "license": component["license"],
+                "name": name,
+                "relationship": "project" if name == "quarry-recon" else "dependency",
+                "version": component["version"],
+            })
         components.extend({
             "content_digest": row["digest"],
             "declared_requirement": None,
-            "license": "TEST-ONLY",
+            "environments": [],
+            "license": row["license"],
             "name": row["name"],
             "relationship": relationship,
             "version": row["version"],
         } for relationship, rows in (
             ("template", support["template_sets"]), ("tool", support["tools"]),
         ) for row in rows)
-        requirements = {
-            "click": "click>=8.2",
-            "idna": "idna>=3.4",
-            "pyyaml": "pyyaml>=6.0",
-            "tomli": "tomli>=2.0; python_version < '3.11'",
-        }
-        components.extend({
-            "content_digest": "sha256:" + hashlib.sha256(name.encode()).hexdigest(),
-            "declared_requirement": requirement,
-            "license": "SYNTHETIC-RESOLVED-LICENSE",
-            "name": name,
-            "relationship": "dependency",
-            "version": "synthetic-resolved-1",
-        } for name, requirement in requirements.items())
         components.sort(key=lambda row: (row["relationship"], row["name"]))
-        bodies["sbom"] = contracts.canonical_json_line({
+        sbom = {
             "artifact_type": "sbom",
             "candidate_identity_digest": evidence.canonical_digest(identity),
             "components": components,
-            "dependency_graph_digest": "sha256:" + hashlib.sha256(
-                contracts.canonical_json_line(components)
-            ).hexdigest(),
+            "dependency_graph_digest": contracts.raw_sha256(contracts.canonical_json_line([
+                {"digest": row["digest"], "environment": row["environment"]} for row in observations
+            ])),
             "gate_id": gate_id,
+            "observations": observations,
             "package": {"name": "quarry-recon", "version": "0.3.10"},
             "release": "0.3.10",
             "schema_version": contracts.GATE_ARTIFACT_SCHEMA,
-        })
+        }
+        sbom["sbom_digest"] = contracts.raw_sha256(contracts.canonical_json_line(sbom))
+        bodies["sbom"] = contracts.canonical_json_line(sbom)
     elif gate_id == "C-PROVENANCE":
         by_key = {(row["gate_id"], row["name"]): row for row in indexed}
         subjects = [{
@@ -1368,15 +1466,15 @@ def _ready_contracts(
     corpus = _read("release/evidence/corpus-selection-v1.json", contracts.read_corpus_manifest)
     no_live = _read("release/evidence/no-live-rule-v1.json", contracts.read_no_live_rule)
     support["tools"] = [
-        {"digest": _digest("e"), "name": "bandit", "version": "1.9.4"},
-        {"digest": _digest("d"), "name": "coverage", "version": "7.15.4"},
-        {"digest": _digest("f"), "name": "detect-secrets", "version": "1.5.0"},
-        {"digest": _digest("b"), "name": "mypy", "version": "2.3.1"},
-        {"digest": _digest("a"), "name": "pytest", "version": "9.1.1"},
-        {"digest": _digest("c"), "name": "ruff", "version": "0.16.3"},
+        {"digest": _digest("e"), "license": "TEST-ONLY", "name": "bandit", "version": "1.9.4"},
+        {"digest": _digest("d"), "license": "TEST-ONLY", "name": "coverage", "version": "7.15.4"},
+        {"digest": _digest("f"), "license": "TEST-ONLY", "name": "detect-secrets", "version": "1.5.0"},
+        {"digest": _digest("b"), "license": "TEST-ONLY", "name": "mypy", "version": "2.3.1"},
+        {"digest": _digest("a"), "license": "TEST-ONLY", "name": "pytest", "version": "9.1.1"},
+        {"digest": _digest("c"), "license": "TEST-ONLY", "name": "ruff", "version": "0.16.3"},
     ]
     support["template_sets"] = [
-        {"digest": _digest("b"), "name": "synthetic-templates", "version": "1"},
+        {"digest": _digest("b"), "license": "TEST-ONLY", "name": "synthetic-templates", "version": "1"},
     ]
     for row in support["environments"]:
         row["isolation_profile"] = _digest("1")
@@ -1572,7 +1670,7 @@ def _scenario(tmp_path: Path, *, approved_at: str = "2026-08-01T00:00:00Z"):
                     environment for environment in supported_environments
                     if environment["lane"] == "H0-hermetic"
                 ]
-            elif gate_id in {"C-PACKAGE-BUILD", "C-PACKAGE-INSTALL"}:
+            elif gate_id in {"C-PACKAGE-BUILD", "C-PACKAGE-INSTALL", "C-SBOM"}:
                 instance_specs = [
                     environment for environment in supported_environments
                     if environment["lane"] == "P0-package-supply"
@@ -1745,7 +1843,14 @@ def _scenario(tmp_path: Path, *, approved_at: str = "2026-08-01T00:00:00Z"):
                 artifacts.append({
                     key: artifact[key] for key in ("digest", "media_type", "name")
                 })
-                instances[0]["artifacts"].append({
+                target_instance = instances[0]
+                if gate_id == "C-SBOM" and artifact_name.startswith("sbom-observation-"):
+                    minor = artifact_name.removeprefix("sbom-observation-")
+                    target_instance = next(
+                        instance for instance in instances
+                        if instance["environment"]["python"].startswith(minor + ".")
+                    )
+                target_instance["artifacts"].append({
                     "digest": artifact["digest"],
                     "name": artifact_name,
                 })
@@ -2106,6 +2211,12 @@ class TestCommittedContracts:
         assert bindings["minItems"] == bindings["maxItems"] == len(contracts.SCOPE_INPUT_PATHS)
         assert record_inputs["minItems"] == record_inputs["maxItems"] == \
             len(contracts.SCOPE_INPUT_PATHS) + 3
+        support_schema = json.loads(
+            (ROOT / contracts.SCHEMA_PATHS["support-matrix-schema"]).read_bytes()
+        )
+        assert set(support_schema["$defs"]["versioned"]["required"]) == {
+            "digest", "license", "name", "version",
+        }
 
     def test_gate_artifact_schema_variants_are_disjoint_and_fail_closed_on_unknown_fields(self):
         schema = json.loads(
@@ -2116,7 +2227,8 @@ class TestCommittedContracts:
             "machine_report", "clean_build_log", "package_inventory",
             "package_install_inventory", "package_install_smoke_results",
             "benchmark_baseline", "benchmark_trials", "benchmark_invalidations",
-            "benchmark_report", "sbom", "provenance", "publication_subjects",
+            "benchmark_report", "sbom_observation", "sbom", "provenance",
+            "publication_subjects",
             "synthetic_corpus_disclosure_attestation", "aggregator_conformance_report",
             "h0_test_report", "h0_isolation_self_test", "schema_validation_report",
             "docs_policy_parity_report",
@@ -2143,6 +2255,23 @@ class TestCommittedContracts:
         assert install_files["minItems"] == 1 and install_files["maxItems"] == 2_000
         install_cases = schema["$defs"]["package_install_smoke_results"]["properties"]["cases"]
         assert install_cases["minItems"] == install_cases["maxItems"] == 4
+        assert "producer" in schema["$defs"]["sbom_observation"]["required"]
+        assert schema["$defs"]["sbom_producer"]["properties"]["name"] == {
+            "const": "sbom-observation-producer",
+        }
+        sbom_path = re.compile(
+            schema["$defs"]["sbom_file"]["properties"]["path"]["pattern"]
+        )
+        for value in ("a", "a/b", "C:foo"):
+            assert sbom_path.fullmatch(value)
+            assert contracts._path(value, "SBOM path") == value
+        for value in (
+            "C:/foo", "1:/foo", "é:/foo", "_:/foo", ".:/a", "::/a",
+            "a//b", "a/", ".", "../a", "a\\b",
+        ):
+            assert sbom_path.fullmatch(value) is None
+            with pytest.raises(evidence.EvidenceError, match="relative POSIX path"):
+                contracts._path(value, "SBOM path")
         assert schema["$defs"]["install_checkout_isolation_details"]["properties"][
             "checkout_on_sys_path"
         ] == {"const": False}
@@ -2361,16 +2490,13 @@ class TestIncompleteSemanticRegistry:
             | {
                 "A-IDENTITY", "A-EVIDENCE-SCHEMA", "A-TAXONOMY", "A-CORPUS", "A-THRESHOLDS", "A-SUPPORT",
                 "B-HERMETIC-ALL", "B-SCHEMA", "B-DOCS-POLICY", "B-MANIFEST", "B-QUALITY", "B-COVERAGE", "B-STATIC-SECURITY", "B-DETERMINISM",
-                "C-PACKAGE-BUILD", "C-PACKAGE-INSTALL", "C-PYTHON-MATRIX", "C-NETWORK-BOUNDARY", "C-NET-DENY",
+                "C-PACKAGE-BUILD", "C-PACKAGE-INSTALL", "C-PYTHON-MATRIX", "C-SBOM", "C-NETWORK-BOUNDARY", "C-NET-DENY",
                 *contracts.V310_05_SEMANTIC_GATES,
             }
         )
         assert "C-PERF-PHASE-FAIRNESS" not in contracts.SEMANTIC_VERIFIERS
         arguments = _scenario(tmp_path)
-        with pytest.raises(
-            evidence.EvidenceError,
-            match="C-SBOM has no registered obligation-specific semantic verifier",
-        ):
+        with pytest.raises(evidence.EvidenceError, match="gate C-VULNERABILITY"):
             contracts.aggregate_records(**arguments)
 
 
@@ -3593,7 +3719,7 @@ class TestArtifactsAndAggregation:
                 "C-PACKAGE-BUILD", "build-log", "wrong-build-subject-order",
                 "reconcile the sdist and wheel bytes",
             ),
-            ("C-SBOM", "sbom", "missing-dependency", "declared direct dependency"),
+            ("C-SBOM", "sbom", "missing-dependency", "support inventory"),
             (
                 "C-PROVENANCE",
                 "signature-verification",
@@ -3951,6 +4077,121 @@ class TestArtifactsAndAggregation:
         _resign_gate(gate, arguments["identity"], arguments["trust_policy"])
         with pytest.raises(evidence.EvidenceError, match="zero execution, tools"):
             contracts.aggregate_records(**arguments)
+
+
+class TestSBOMSemanticEvidence:
+    @staticmethod
+    def _document(arguments: dict, name: str) -> dict:
+        indexed = next(
+            row for row in arguments["artifact_index"]["artifacts"]
+            if row["gate_id"] == "C-SBOM" and row["name"] == name
+        )
+        return json.loads((arguments["artifact_root"] / indexed["path"]).read_bytes())
+
+    @classmethod
+    def _rewrite_observation(cls, arguments: dict, name: str, mutate) -> None:
+        observation = cls._document(arguments, name)
+        mutate(observation)
+        observation_body = contracts.canonical_json_line(observation)
+        _rewrite_supporting_artifact(arguments, "C-SBOM", name, observation_body)
+
+        sbom = cls._document(arguments, "sbom")
+        next(row for row in sbom["observations"] if row["name"] == name)[
+            "digest"
+        ] = contracts.raw_sha256(observation_body)
+        sbom["dependency_graph_digest"] = contracts.raw_sha256(
+            contracts.canonical_json_line([
+                {"digest": row["digest"], "environment": row["environment"]}
+                for row in sbom["observations"]
+            ])
+        )
+        sbom.pop("sbom_digest")
+        sbom["sbom_digest"] = contracts.raw_sha256(
+            contracts.canonical_json_line(sbom)
+        )
+        _rewrite_supporting_artifact(
+            arguments, "C-SBOM", "sbom", contracts.canonical_json_line(sbom),
+        )
+
+    def test_raw_and_merged_documents_validate_through_the_committed_schema(
+        self, tmp_path,
+    ):
+        jsonschema = pytest.importorskip("jsonschema")
+        arguments = _scenario(tmp_path)
+        schema = json.loads(
+            (ROOT / contracts.SCHEMA_PATHS["gate-artifact-schema"]).read_bytes()
+        )
+        jsonschema.Draft202012Validator.check_schema(schema)
+        validator = jsonschema.Draft202012Validator(schema)
+        for name in ("sbom-observation-3.10", "sbom"):
+            assert list(validator.iter_errors(self._document(arguments, name))) == []
+
+    @pytest.mark.parametrize(
+        ("mutation", "expected"),
+        [
+            ("producer", "unbound producer"),
+            ("missing-dependency", "omits an active reachable dependency"),
+            ("graph", "dependency graph digest does not recompute"),
+            ("content", "content digest does not recompute"),
+        ],
+    )
+    def test_raw_observation_claims_are_recomputed_after_full_rebinding(
+        self, tmp_path, mutation, expected,
+    ):
+        arguments = _scenario(tmp_path)
+
+        def mutate(document):
+            if mutation == "producer":
+                document["producer"]["digest"] = _digest("9")
+            elif mutation == "missing-dependency":
+                document["components"] = [
+                    row for row in document["components"] if row["name"] != "click"
+                ]
+            elif mutation == "graph":
+                document["dependency_graph_digest"] = _digest("8")
+            else:
+                document["components"][0]["files"][0]["digest"] = _digest("7")
+
+        self._rewrite_observation(
+            arguments, "sbom-observation-3.10", mutate,
+        )
+        with pytest.raises(evidence.EvidenceError, match=expected):
+            contracts.aggregate_records(**arguments)
+
+    def test_merged_sbom_binds_exact_instance_and_support_license(self, tmp_path):
+        wrong_instance = _scenario(tmp_path / "instance")
+        sbom = self._document(wrong_instance, "sbom")
+        sbom["observations"][0]["evidence_instance_id"] = "invented-instance"
+        sbom.pop("sbom_digest")
+        sbom["sbom_digest"] = contracts.raw_sha256(
+            contracts.canonical_json_line(sbom)
+        )
+        _rewrite_supporting_artifact(
+            wrong_instance,
+            "C-SBOM",
+            "sbom",
+            contracts.canonical_json_line(sbom),
+        )
+        with pytest.raises(evidence.EvidenceError, match="one exact signed P0"):
+            contracts.aggregate_records(**wrong_instance)
+
+        wrong_license = _scenario(tmp_path / "license")
+        sbom = self._document(wrong_license, "sbom")
+        next(
+            row for row in sbom["components"] if row["relationship"] == "tool"
+        )["license"] = "invented-license"
+        sbom.pop("sbom_digest")
+        sbom["sbom_digest"] = contracts.raw_sha256(
+            contracts.canonical_json_line(sbom)
+        )
+        _rewrite_supporting_artifact(
+            wrong_license,
+            "C-SBOM",
+            "sbom",
+            contracts.canonical_json_line(sbom),
+        )
+        with pytest.raises(evidence.EvidenceError, match="support inventory"):
+            contracts.aggregate_records(**wrong_license)
 
 
 class TestCoverageSemanticEvidence:

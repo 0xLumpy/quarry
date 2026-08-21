@@ -195,6 +195,20 @@ jobs:
               env -u PYTHONPATH "$install_prefix/bin/python" -c 'import importlib.resources as r, os, pathlib, quarry_recon, sys; checkout=pathlib.Path(os.environ["CHECKOUT_ROOT"]).resolve(); prefix=pathlib.Path(os.environ["INSTALL_PREFIX"]).resolve(); under=lambda path: path.resolve().is_relative_to(prefix); assert quarry_recon.__version__ == os.environ["EXPECTED_VERSION"]; assert under(pathlib.Path(quarry_recon.__file__)); resource=pathlib.Path(r.files("quarry_recon").joinpath("data/target.template.yaml")); assert resource.is_file() and under(resource); schema=prefix / "share" / "quarry-recon" / "schemas" / "release-scope-v1.schema.json"; assert schema.is_file() and under(schema); cli=prefix / "bin" / "quarry"; assert cli.is_file() and under(cli); assert all((entry_path := pathlib.Path(entry or ".").resolve()) != checkout and checkout not in entry_path.parents for entry in sys.path)'
             env -u PYTHONPATH "$install_prefix/bin/quarry" --help >/dev/null
           )
+      - name: Observe installed runtime C-SBOM closure
+        run: |
+          install_prefix="$RUNNER_TEMP/quarry-install-prefix"
+          wheels=("$RUNNER_TEMP"/quarry-build-a/dist/*.whl)
+          test "${#wheels[@]}" -eq 1
+          env -u PYTHONPATH "$install_prefix/bin/python" scripts/emit_sbom_observation.py \
+            --wheel "${wheels[0]}" \
+            --output "$RUNNER_TEMP/sbom-observation-${{ matrix.python-version }}.json"
+      - name: Upload raw C-SBOM observation
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sbom-observation-${{ matrix.python-version }}
+          path: ${{ runner.temp }}/sbom-observation-${{ matrix.python-version }}.json
+          if-no-files-found: error
       - name: Audit declared dependencies and emit dependency SBOM
         run: >-
           pip-audit --strict . --format cyclonedx-json

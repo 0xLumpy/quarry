@@ -340,7 +340,12 @@ REQUIRED_ARTIFACTS = {
         ("smoke-results", "application/json"),
     ),
     "C-PYTHON-MATRIX": (("python-matrix-report", "application/json"),),
-    "C-SBOM": (("sbom", "application/json"),),
+    "C-SBOM": (
+        ("sbom", "application/json"),
+        ("sbom-observation-3.10", "application/json"),
+        ("sbom-observation-3.11", "application/json"),
+        ("sbom-observation-3.12", "application/json"),
+    ),
     "C-VULNERABILITY": (("vulnerability-findings", "application/json"),),
     "C-PROVENANCE": (
         ("provenance", "application/json"),
@@ -522,6 +527,9 @@ SCOPE_INPUT_PATHS = {
     "determinism-release-evidence": "src/quarry_recon/release_evidence.py",
     "determinism-run-manifest": "src/quarry_recon/run_manifest.py",
     "determinism-report-truth": "src/quarry_recon/report_truth.py",
+    "sbom-observation-producer": "scripts/emit_sbom_observation.py",
+    "sbom-observation-tests": "tests/test_emit_sbom_observation.py",
+    "release-v310-10-tests": "tests/test_release_v310_10.py",
     "package-metadata": "pyproject.toml",
     "docs-parity-tests": "tests/test_docs_parity.py",
     "docs-policy-readme": "README.md",
@@ -1169,7 +1177,8 @@ def _path(value: object, name: str) -> str:
     if "\\" in text or PureWindowsPath(text).is_absolute():
         raise evidence.EvidenceError(f"{name} must be a normalized relative POSIX path")
     pure = PurePosixPath(text)
-    if pure.is_absolute() or text != pure.as_posix() or any(part in {"", ".", ".."} for part in pure.parts):
+    if (pure.is_absolute() or not pure.parts or text != pure.as_posix() or
+            any(part in {"", ".", ".."} for part in pure.parts)):
         raise evidence.EvidenceError(f"{name} must be a normalized relative POSIX path")
     return text
 
@@ -1651,8 +1660,13 @@ def validate_support_matrix(
     for field in ("tools", "template_sets"):
         records = _array(doc[field], f"support matrix.{field}")
         for index, record in enumerate(records):
-            item = _object(record, f"support matrix.{field}[{index}]", {"digest", "name", "version"})
+            item = _object(
+                record,
+                f"support matrix.{field}[{index}]",
+                {"digest", "license", "name", "version"},
+            )
             _token(item["name"], f"support matrix.{field}[{index}].name")
+            _string(item["license"], f"support matrix.{field}[{index}].license")
             _string(item["version"], f"support matrix.{field}[{index}].version")
             _digest(item["digest"], f"support matrix.{field}[{index}].digest")
         _unique(records, "name", f"support matrix.{field}")
@@ -4109,76 +4123,267 @@ def _validate_benchmark_artifacts(
         raise evidence.EvidenceError("benchmark report does not reconcile its retained trial artifacts")
 
 
+_SBOM_OBSERVATION_NAMES = (
+    "sbom-observation-3.10", "sbom-observation-3.11", "sbom-observation-3.12",
+)
+_SBOM_MAX_COMPONENTS = 128
+_SBOM_MAX_FILES = 4_000
+_SBOM_MAX_REQUIREMENTS = 256
+
+
+def _sbom_name(value: object, name: str) -> str:
+    text = _token(value, name)
+    return re.sub(r"[-_.]+", "-", text).lower()
+
+
+def _sbom_environment(value: object, name: str, *, raw: bool = False) -> dict:
+    environment = _object(value, name, {
+        "architecture", "isolation_profile", "os", "python", "runner_image",
+    })
+    for field in ("architecture", "os", "python"):
+        _string(environment[field], f"{name}.{field}")
+    for field in ("isolation_profile", "runner_image"):
+        if environment[field] is not None:
+            _digest(environment[field], f"{name}.{field}")
+    if raw and (environment["isolation_profile"] is not None or environment["runner_image"] is not None):
+        raise evidence.EvidenceError("C-SBOM raw observation must not invent signed runner identity fields")
+    return environment
+
+
+def _sbom_component(value: object, name: str, marker_environment: Mapping[str, str]) -> dict:
+    component = _object(value, name, {
+        "active_dependencies", "content_digest", "files", "license", "name", "raw_requirements",
+        "version",
+    })
+    normalized = _sbom_name(component["name"], f"{name}.name")
+    if component["name"] != normalized:
+        raise evidence.EvidenceError("C-SBOM component names must be canonical")
+    _string(component["version"], f"{name}.version")
+    _string(component["license"], f"{name}.license")
+    files = _array(component["files"], f"{name}.files")
+    if not files or len(files) > _SBOM_MAX_FILES:
+        raise evidence.EvidenceError("C-SBOM component files are empty or exceed the bound")
+    parsed_files = []
+    for index, value in enumerate(files):
+        row = _object(value, f"{name}.files[{index}]", {"digest", "path", "size"})
+        _digest(row["digest"], f"{name}.files[{index}].digest")
+        _path(row["path"], f"{name}.files[{index}].path")
+        _integer(row["size"], f"{name}.files[{index}].size")
+        parsed_files.append(row)
+    if [row["path"] for row in parsed_files] != sorted(row["path"] for row in parsed_files) or \
+            len({row["path"] for row in parsed_files}) != len(parsed_files):
+        raise evidence.EvidenceError("C-SBOM component files are not sorted and unique")
+    if component["content_digest"] != raw_sha256(canonical_json_line(parsed_files)):
+        raise evidence.EvidenceError("C-SBOM component content digest does not recompute from files")
+    requirements = _array(component["raw_requirements"], f"{name}.raw_requirements")
+    if len(requirements) > _SBOM_MAX_REQUIREMENTS:
+        raise evidence.EvidenceError("C-SBOM component requirements exceed the bound")
+    parsed_requirements = []
+    for index, value in enumerate(requirements):
+        row = _object(value, f"{name}.raw_requirements[{index}]", {"active", "name", "raw"})
+        _string(row["raw"], f"{name}.raw_requirements[{index}].raw")
+        dependency = _sbom_name(row["name"], f"{name}.raw_requirements[{index}].name")
+        if row["name"] != dependency or type(row["active"]) is not bool:
+            raise evidence.EvidenceError("C-SBOM raw requirement status is invalid")
+        parsed_requirements.append(row)
+    if [row["raw"] for row in parsed_requirements] != sorted(row["raw"] for row in parsed_requirements) or \
+            len({row["raw"] for row in parsed_requirements}) != len(parsed_requirements):
+        raise evidence.EvidenceError("C-SBOM raw requirement rows are not sorted and unique")
+    dependencies = _array(component["active_dependencies"], f"{name}.active_dependencies")
+    parsed_dependencies = [_sbom_name(value, f"{name}.active_dependencies") for value in dependencies]
+    if dependencies != parsed_dependencies or parsed_dependencies != sorted(parsed_dependencies) or \
+            len(set(parsed_dependencies)) != len(parsed_dependencies):
+        raise evidence.EvidenceError("C-SBOM active dependency edges are not canonical")
+    if parsed_dependencies != [row["name"] for row in parsed_requirements if row["active"]]:
+        raise evidence.EvidenceError("C-SBOM active dependency edges do not match raw requirements")
+    return component
+
+
+def _validate_sbom_observation(
+    body: bytes, *, name: str, expected_environment: dict, package_wheel: Mapping[str, object],
+    producer_digest: str,
+) -> dict:
+    doc = _object(_artifact_document(body, "C-SBOM", name), "C-SBOM observation", {
+        "artifact_type", "components", "dependency_graph_digest", "environment", "interpreter",
+        "marker_environment", "marker_evaluator", "package", "producer", "schema_version",
+        "source_wheel",
+    })
+    if doc["artifact_type"] != "sbom-observation" or doc["schema_version"] != GATE_ARTIFACT_SCHEMA:
+        raise evidence.EvidenceError("C-SBOM observation has the wrong schema variant")
+    observed_environment = _sbom_environment(doc["environment"], "C-SBOM observation.environment", raw=True)
+    if any(observed_environment[field] != expected_environment[field] for field in ("architecture", "os", "python")):
+        raise evidence.EvidenceError("C-SBOM observation identifies the wrong accepted P0 environment")
+    interpreter = _object(doc["interpreter"], "C-SBOM observation.interpreter", {
+        "base_prefix", "executable", "implementation", "prefix", "version",
+    })
+    for field in interpreter:
+        _string(interpreter[field], f"C-SBOM observation.interpreter.{field}")
+    if interpreter["implementation"] != "cpython" or not interpreter["version"].startswith(expected_environment["python"]):
+        raise evidence.EvidenceError("C-SBOM observation interpreter does not match its environment")
+    evaluator = _object(doc["marker_evaluator"], "C-SBOM observation.marker_evaluator", {
+        "implementation", "version",
+    })
+    if evaluator["implementation"] != "pip._vendor.packaging":
+        raise evidence.EvidenceError("C-SBOM observation used an unsupported marker evaluator")
+    _string(evaluator["version"], "C-SBOM observation.marker_evaluator.version")
+    if doc["producer"] != {
+        "digest": producer_digest,
+        "name": "sbom-observation-producer",
+    }:
+        raise evidence.EvidenceError("C-SBOM observation used an unbound producer")
+    marker_environment = doc["marker_environment"]
+    if type(marker_environment) is not dict or not marker_environment or len(marker_environment) > 32:
+        raise evidence.EvidenceError("C-SBOM observation marker environment is invalid")
+    for key, value in marker_environment.items():
+        _token(key, "C-SBOM observation marker environment key")
+        _string(value, "C-SBOM observation marker environment value", empty=True)
+    if marker_environment.get("extra") != "" or marker_environment.get("python_full_version") != expected_environment["python"] or \
+            marker_environment.get("python_version") != ".".join(expected_environment["python"].split(".")[:2]):
+        raise evidence.EvidenceError("C-SBOM observation marker environment does not bind its interpreter")
+    wheel = _object(doc["source_wheel"], "C-SBOM observation.source_wheel", {"digest", "size"})
+    _digest(wheel["digest"], "C-SBOM observation.source_wheel.digest")
+    _integer(wheel["size"], "C-SBOM observation.source_wheel.size")
+    if wheel != dict(package_wheel):
+        raise evidence.EvidenceError("C-SBOM observation is bound to the wrong nominated wheel")
+    components = _array(doc["components"], "C-SBOM observation.components")
+    if not components or len(components) > _SBOM_MAX_COMPONENTS:
+        raise evidence.EvidenceError("C-SBOM observation component closure exceeds bounds")
+    parsed = [_sbom_component(component, f"C-SBOM observation.components[{index}]", marker_environment)
+              for index, component in enumerate(components)]
+    names = [component["name"] for component in parsed]
+    if names != sorted(names) or len(names) != len(set(names)):
+        raise evidence.EvidenceError("C-SBOM observation components are not sorted and unique")
+    if doc["package"] != {"name": "quarry-recon", "version": RELEASE} or "quarry-recon" not in names:
+        raise evidence.EvidenceError("C-SBOM observation does not identify the nominated installed package")
+    if sum(row["size"] for component in parsed for row in component["files"]) > 256 * 1024 * 1024:
+        raise evidence.EvidenceError("C-SBOM observation claimed files exceed the global bound")
+    by_name = {component["name"]: component for component in parsed}
+    if any(dependency not in by_name for component in parsed for dependency in component["active_dependencies"]):
+        raise evidence.EvidenceError("C-SBOM observation omits an active reachable dependency")
+    reachable = {"quarry-recon"}
+    pending = ["quarry-recon"]
+    while pending:
+        current = pending.pop()
+        for dependency in by_name[current]["active_dependencies"]:
+            if dependency not in reachable:
+                reachable.add(dependency)
+                pending.append(dependency)
+    if reachable != set(by_name):
+        raise evidence.EvidenceError("C-SBOM observation contains a non-reachable component")
+    graph = [{"dependencies": component["active_dependencies"], "name": component["name"],
+              "version": component["version"]} for component in parsed]
+    if doc["dependency_graph_digest"] != raw_sha256(canonical_json_line(graph)):
+        raise evidence.EvidenceError("C-SBOM observation dependency graph digest does not recompute")
+    return doc
+
+
 def _validate_sbom(
     body: bytes, *, identity: dict, support: dict, package_wheel_body: bytes,
+    package_wheel: Mapping[str, object], producer_digest: str, report: dict,
+    bodies: Mapping[str, bytes],
 ) -> None:
-    doc = _object(
-        _artifact_document(body, "C-SBOM", "sbom"),
-        "SBOM",
-        {
-            "artifact_type", "candidate_identity_digest", "components",
-            "dependency_graph_digest", "gate_id", "package", "release", "schema_version",
-        },
-    )
-    if doc["artifact_type"] != "sbom" or \
-            doc["schema_version"] != GATE_ARTIFACT_SCHEMA or doc["release"] != RELEASE or \
-            doc["gate_id"] != "C-SBOM" or \
-            doc["candidate_identity_digest"] != evidence.canonical_digest(identity):
+    doc = _object(_artifact_document(body, "C-SBOM", "sbom"), "SBOM", {
+        "artifact_type", "candidate_identity_digest", "components", "dependency_graph_digest", "gate_id",
+        "observations", "package", "release", "sbom_digest", "schema_version",
+    })
+    if (doc["artifact_type"] != "sbom" or doc["schema_version"] != GATE_ARTIFACT_SCHEMA or
+            doc["release"] != RELEASE or doc["gate_id"] != "C-SBOM" or
+            doc["candidate_identity_digest"] != evidence.canonical_digest(identity) or
+            doc["package"] != {"name": "quarry-recon", "version": RELEASE}):
         raise evidence.EvidenceError("SBOM is bound to the wrong candidate or contract")
-    if doc["package"] != {"name": "quarry-recon", "version": RELEASE}:
-        raise evidence.EvidenceError("SBOM identifies the wrong nominated package")
-    _digest(doc["dependency_graph_digest"], "SBOM dependency graph digest")
-    requirements = _metadata_values(
-        _wheel_metadata(package_wheel_body), "Requires-Dist", "wheel",
-    )
-    if not requirements:
+    observations = _array(doc["observations"], "SBOM.observations")
+    expected_environments = [{key: row[key] for key in (
+        "architecture", "isolation_profile", "os", "python", "runner_image",
+    )} for row in support["environments"] if row["lane"] == "P0-package-supply"]
+    expected_environments.sort(key=lambda row: row["python"])
+    if len(observations) != len(_SBOM_OBSERVATION_NAMES) or len(expected_environments) != 3:
+        raise evidence.EvidenceError("C-SBOM has the wrong frozen P0 observation topology")
+    parsed_observations = []
+    for index, value in enumerate(observations):
+        row = _object(value, f"SBOM.observations[{index}]", {"digest", "environment", "evidence_instance_id", "name"})
+        _digest(row["digest"], f"SBOM.observations[{index}].digest")
+        _token(row["evidence_instance_id"], f"SBOM.observations[{index}].evidence_instance_id")
+        _sbom_environment(row["environment"], f"SBOM.observations[{index}].environment")
+        parsed_observations.append(row)
+    if [(row["environment"]["python"], row["name"]) for row in parsed_observations] != [
+            (environment["python"], name) for environment, name in zip(expected_environments, _SBOM_OBSERVATION_NAMES, strict=True)]:
+        raise evidence.EvidenceError("SBOM observations are not the exact sorted Python 3.10/3.11/3.12 roster")
+    if [row["environment"] for row in parsed_observations] != expected_environments:
+        raise evidence.EvidenceError("SBOM observations do not cover the exact accepted P0 environments")
+    raw_requirements = _metadata_values(_wheel_metadata(package_wheel_body), "Requires-Dist", "wheel")
+    if not raw_requirements:
         raise evidence.EvidenceError("candidate wheel metadata has no dependency set")
-    declared_dependencies = {}
-    for requirement in requirements:
+    observed_documents = []
+    for observation in parsed_observations:
+        name = observation["name"]
+        raw = bodies[name]
+        if raw_sha256(raw) != observation["digest"]:
+            raise evidence.EvidenceError("SBOM observation digest does not match retained raw bytes")
+        owners = [instance for instance in report["instances"] if instance["lane"] == "P0-package-supply" and
+                  instance["id"] == observation["evidence_instance_id"] and
+                  instance["environment"] == observation["environment"] and
+                  {"digest": observation["digest"], "name": name} in instance["artifacts"]]
+        if len(owners) != 1:
+            raise evidence.EvidenceError("SBOM raw observation does not bind one exact signed P0 evidence instance/environment")
+        observed = _validate_sbom_observation(
+            raw,
+            name=name,
+            expected_environment=observation["environment"],
+            package_wheel=package_wheel,
+            producer_digest=producer_digest,
+        )
+        root = next(component for component in observed["components"] if component["name"] == "quarry-recon")
+        if [row["raw"] for row in root["raw_requirements"]] != sorted(raw_requirements):
+            raise evidence.EvidenceError("C-SBOM direct roots do not exactly match nominated wheel metadata")
+        observed_documents.append((observation, observed))
+    components = _array(doc["components"], "SBOM.components")
+    direct_by_name: dict[str, list[str]] = {}
+    for requirement in raw_requirements:
         match = re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*", requirement)
         if match is None:
-            raise evidence.EvidenceError("candidate package dependency is not canonical")
-        normalized = match.group(0).lower().replace("_", "-").replace(".", "-")
-        if normalized in declared_dependencies:
-            raise evidence.EvidenceError("candidate package dependencies contain a duplicate name")
-        declared_dependencies[normalized] = requirement
-    components = _array(doc["components"], "SBOM.components")
-    observed: list[tuple[str, str]] = []
-    for index, component in enumerate(components):
-        item = _object(component, f"SBOM.components[{index}]", {
-            "content_digest", "declared_requirement", "license", "name", "relationship",
-            "version",
+            raise evidence.EvidenceError("candidate wheel dependency name is unsupported")
+        normalized = _sbom_name(match.group(0), "candidate wheel dependency name")
+        direct_by_name.setdefault(normalized, []).append(requirement)
+    installed_by_name: dict[tuple[str, str, str], list[tuple[dict, dict]]] = {}
+    for observation, observed in observed_documents:
+        for component in observed["components"]:
+            installed_by_name.setdefault(
+                (component["name"], component["version"], component["license"]), [],
+            ).append((observation, component))
+    expected_components = []
+    for (name, version, license_value), rows in installed_by_name.items():
+        environments = [{
+            "active_dependencies": component["active_dependencies"],
+            "content_digest": component["content_digest"], "environment": observation["environment"],
+            "raw_requirements": component["raw_requirements"],
+        } for observation, component in rows]
+        environments.sort(key=lambda row: row["environment"]["python"])
+        expected_components.append({
+            "content_digest": raw_sha256(canonical_json_line(environments)),
+            "declared_requirement": direct_by_name[name][0] if len(direct_by_name.get(name, ())) == 1 else None,
+            "environments": environments,
+            "license": license_value,
+            "name": name,
+            "relationship": "project" if name == "quarry-recon" else "dependency",
+            "version": version,
         })
-        _token(item["name"], "SBOM component name")
-        _string(item["version"], "SBOM component version")
-        _string(item["license"], "SBOM component license")
-        _digest(item["content_digest"], "SBOM component content digest")
-        if item["relationship"] not in {"dependency", "project", "template", "tool"}:
-            raise evidence.EvidenceError("SBOM component relationship is unsupported")
-        if item["declared_requirement"] is not None:
-            _string(item["declared_requirement"], "SBOM declared requirement")
-        observed.append((item["relationship"], item["name"]))
-    if not components or observed != sorted(observed) or len(observed) != len(set(observed)):
-        raise evidence.EvidenceError("SBOM components must be non-empty, sorted and unique")
-    required = {
-        ("project", "quarry-recon", RELEASE, identity["source_tree_digest"]),
-        *(("tool", row["name"], row["version"], row["digest"]) for row in support["tools"]),
-        *(("template", row["name"], row["version"], row["digest"])
-          for row in support["template_sets"]),
-    }
-    actual = {
-        (row["relationship"], row["name"], row["version"], row["content_digest"])
-        for row in components
-    }
-    if not required.issubset(actual):
-        raise evidence.EvidenceError("SBOM omits the project or accepted bundled tool/template inventory")
-    direct = {
-        row["name"].lower().replace("_", "-").replace(".", "-"): row["declared_requirement"]
-        for row in components if row["relationship"] == "dependency" and
-        row["declared_requirement"] is not None
-    }
-    if direct != declared_dependencies:
-        raise evidence.EvidenceError("SBOM does not reconcile every declared direct dependency")
+    expected_components.extend({
+        "content_digest": row["digest"], "declared_requirement": None, "environments": [],
+        "license": row["license"], "name": row["name"], "relationship": relationship,
+        "version": row["version"],
+    } for relationship, rows in (("template", support["template_sets"]), ("tool", support["tools"])) for row in rows)
+    expected_components.sort(key=lambda row: (row["relationship"], row["name"], row["version"], row["license"] or ""))
+    if len(components) != len(expected_components):
+        raise evidence.EvidenceError("SBOM final rows do not exactly reconcile support inventory and license assertions")
+    for actual, expected in zip(components, expected_components, strict=True):
+        if actual != expected:
+            raise evidence.EvidenceError("SBOM final rows do not exactly reconcile support inventory and license assertions")
+    graph = [{"digest": row["digest"], "environment": row["environment"]} for row in parsed_observations]
+    if doc["dependency_graph_digest"] != raw_sha256(canonical_json_line(graph)):
+        raise evidence.EvidenceError("SBOM dependency graph digest does not recompute from observations")
+    payload = {key: doc[key] for key in doc if key != "sbom_digest"}
+    if doc["sbom_digest"] != raw_sha256(canonical_json_line(payload)):
+        raise evidence.EvidenceError("SBOM top-level digest does not recompute")
 
 
 def _package_subjects(resolver: ArtifactResolver) -> list[dict]:
@@ -4589,6 +4794,12 @@ def _semantic_sbom(
         identity=context["identity"],
         support=context["support"],
         package_wheel_body=resolver.read("C-PACKAGE-BUILD", "wheel"),
+        package_wheel={key: resolver.record("C-PACKAGE-BUILD", "wheel")[key] for key in ("digest", "size")},
+        producer_digest=raw_sha256(
+            context["input_bodies"]["sbom-observation-producer"]
+        ),
+        report=context["report"],
+        bodies=bodies,
     )
 
 
@@ -4619,7 +4830,6 @@ def _semantic_publication_subjects(
 # sufficient to close its whole normative obligation yet (for example transitive
 # dependency closure belongs to later owners).
 PROVISIONAL_SEMANTIC_VERIFIERS = MappingProxyType({
-    "C-SBOM": _semantic_sbom,
     "C-PROVENANCE": _semantic_provenance,
     **{gate_id: _semantic_benchmark for gate_id in PERFORMANCE_OPERATIONS},
     "E-ARTIFACTS": _semantic_publication_subjects,
@@ -6335,6 +6545,7 @@ SEMANTIC_VERIFIERS = MappingProxyType({
     "C-NETWORK-BOUNDARY": _semantic_network_boundary,
     "C-NET-DENY": _semantic_network_denial,
     "C-PACKAGE-INSTALL": _semantic_package_install,
+    "C-SBOM": _semantic_sbom,
     "C-FAULT-DISK": _semantic_resource_fault,
     "C-FAULT-RESOLVER": _semantic_resource_fault,
     "C-PERF-INGEST": _semantic_resource_benchmark,

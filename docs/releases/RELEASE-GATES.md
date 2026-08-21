@@ -231,10 +231,17 @@ remain open; these checks do not close the release gate.
 | `C-PACKAGE-BUILD` | `P0` | Clean sdist/wheel build; package metadata and version agree; required data, license, notices, schemas, and entry points are present | Artifact inventory and digest, metadata validation, build log |
 | `C-PACKAGE-INSTALL` | `P0` | Install into a clean disposable prefix and exercise public imports/CLI from the installed artifact, never the checkout | Install inventory, import/CLI results, environment identity |
 | `C-PYTHON-MATRIX` | `P0`/`H0` | Oldest and every stable Python minor satisfying the published metadata pass required gates. Every accepted H0/P0 support environment binds its exact B-HERMETIC-ALL or C-PACKAGE-BUILD/C-PACKAGE-INSTALL evidence instance; the report separately rehashes the shared candidate package/install source artifacts | One candidate-bound `quarry.python-matrix-report.v1`, which binds and parses the exact package metadata range; any missing or substituted environment, run, source instance or artifact is `blocked` |
-| `C-SBOM` | `P0` | Complete direct/transitive dependency and bundled-tool/template inventory, with licenses and content identities | SBOM digest and inventory reconciliation report |
+| `C-SBOM` | `P0` | Three raw installed-runtime observations, one for each accepted P0 Python 3.10/3.11/3.12 environment, are merged into a candidate-bound direct/transitive dependency and bundled-tool/template inventory with licenses and content identities | Three raw observation records plus the merged candidate-bound SBOM digest and inventory reconciliation report |
 | `C-VULNERABILITY` | `P0` | Dependency/container/tool advisories meet the reviewed disposition policy; exceptions are explicit, owned, and time-bounded | Scanner DB timestamp, findings, signed dispositions |
 | `C-PROVENANCE` | `P0` | Release artifacts bind source candidate, builder identity, inputs, dependencies, and subjects; signatures/digests verify | Provenance and signature verification report |
 | `C-INSTALL-ROLLBACK` | `H1`/`P0` | Failure at every acquisition/verification/activation point preserves the last-known-good install and never exposes a partial active version | Fault matrix, before/after identities, filesystem trace |
+
+The CI package matrix emits one raw C-SBOM observation per P0 Python
+environment and uploads that observation once for the matrix job. A trusted
+release collector must bind all three raw observations to their exact accepted
+P0 evidence instances and merge them into the candidate-bound C-SBOM. The
+accepted P0 runtime and signing evidence remain `OPEN`; CI observations are
+inputs and do not close the gate.
 
 #### Tool integration and compatibility
 

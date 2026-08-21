@@ -42,7 +42,7 @@
     },
     "review": {"additionalProperties": false, "properties": {"approved_at": {"format": "date-time", "type": "string"}, "review_id": {"$ref": "#/$defs/token"}, "reviewer": {"$ref": "#/$defs/token"}, "signature": {"oneOf": [{"additionalProperties": false, "properties": {"algorithm": {"const": "ed25519"}, "key_id": {"$ref": "#/$defs/token"}, "value": {"pattern": "^base64:[A-Za-z0-9+/]{86}==$", "type": "string"}}, "required": ["algorithm", "key_id", "value"], "type": "object"}, {"type": "null"}]}}, "required": ["approved_at", "review_id", "reviewer", "signature"], "type": "object"},
     "token": {"pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$", "type": "string"},
-    "versioned": {"additionalProperties": false, "properties": {"digest": {"$ref": "#/$defs/digest"}, "name": {"$ref": "#/$defs/token"}, "version": {"minLength": 1, "type": "string"}}, "required": ["digest", "name", "version"], "type": "object"}
+    "versioned": {"additionalProperties": false, "properties": {"digest": {"$ref": "#/$defs/digest"}, "license": {"minLength": 1, "type": "string"}, "name": {"$ref": "#/$defs/token"}, "version": {"minLength": 1, "type": "string"}}, "required": ["digest", "license", "name", "version"], "type": "object"}
   },
   "required": ["aggregators", "approval", "environments", "release", "schema_version", "template_sets", "tools"],
   "title": "Quarry exact release runtime and support matrix v1",
