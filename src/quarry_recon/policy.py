@@ -23,6 +23,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from . import sources
+
 IDENTITIES = ("none", "work_unit", "partition")
 #: how the value is read: a PERFORMANCE knob through the strict parsers, or a module constant
 READERS = ("strict_int", "budget_seconds", "module")
@@ -39,15 +41,7 @@ EXCLUSION_KINDS = (
 )
 #: acquisition-side lanes: what they may obtain is owned by the provider's enablement/balance/reserve/
 #: page policy, never a flag. A lane is here when Quarry owns the call, key or budget (ownership, not free).
-PROVIDER_LANES = ("probe.favicon", "probe.cert", "probe.shodan_host", "vertical.censys",
-                  "vertical.certspotter", "vertical.crtsh", "vertical.shosubgo", "vertical.github_subs",
-                  "osint.whoxy")
-#: ...and the ids above that are not in the source registry, listed exactly rather than by prefix.
-PROVIDER_LANES_OUTSIDE_REGISTRY = ("osint.whoxy",)
-
-#: bound lanes that are not registered sources, listed exactly. The OSINT preflight has no source
-#: registry of its own; a lane's bound still appears in `quarry policy` and `--unbound` lifts it.
-BOUND_LANES_OUTSIDE_REGISTRY = ("osint.asrank", "osint.rdap")
+PROVIDER_LANES = sources.provider_control_sources()
 
 #: which door each acquisition lane executes through, declared so the acquisition closure can be checked
 #: against real call sites rather than the mere existence of a gate.
@@ -61,45 +55,19 @@ PROVIDER_DOORS: dict[str, str] = {
     "vertical.shosubgo": "run_provider",       # Quarry's in-process Shodan DNS API adapter
     # runs the tool directly (`exec_tool`), so neither registry gate covers it — it gates itself
     "vertical.github_subs": "direct_tool",
-    "osint.whoxy": "direct_http",              # plain HTTP in `osint.py`, outside the source registry
+    "osint.whoxy": "direct_http",              # plain HTTP in `osint.py`, self-gated
 }
 DOORS = ("run_provider", "run_providers", "run_contract", "direct_http", "direct_tool")
 
 #: every registered source, classified (the mechanism that finds an omission, not a hand-kept list):
 #: quarry_provider = we call/key it; external_tool = its own config; target_facing = the target; local.
+# The source registry carries this per contract.  Keeping a second manually
+# maintained policy table created exact holes for OSINT and control-plane lanes.
 SOURCE_OWNERSHIP: dict[str, str] = {
-    **{lane: "quarry_provider" for lane in
-       ("probe.favicon", "probe.cert", "probe.shodan_host", "vertical.censys", "vertical.certspotter",
-        "vertical.crtsh", "vertical.shosubgo", "vertical.github_subs")},
-    **{lane: "external_tool" for lane in
-       ("vertical.subfinder", "crawl.gau", "crawl.waymore_urls", "crawl.waymore_responses",
-        "horizontal.caduceus", "horizontal.asnmap", "enrich.smap", "probe.smap")},
-    **{lane: "local" for lane in
-       ("vertical.openintel", "horizontal.kaeferjaeger", "horizontal.mapcidr",
-        "params.gf", "crawl.js_beautify", "crawl.jsluice_urls", "crawl.jsluice_secrets",
-        "crawl.gitleaks", "crawl.trufflehog", "crawl.xnlinkfinder",
-        "origin.correlation", "vertical.alterx_permute",
-        # reads bundles already on disk and contacts nothing; the accepted-chunk fetch is
-        # `crawl.js_fetch`, where the rate and budget live
-        "crawl.jxscout_chunks",
-        # analyses bundles already on disk, publishes an artifact, contacts nothing
-        "crawl.jxscout_ast")},
-    **{lane: "target_facing" for lane in
-       ("content.ffuf", "crawl.js_fetch", "crawl.katana_headless", "crawl.katana_standard",
-        "dns.dnsx_records", "enrich.a1d_brute", "enrich.dnsx_cname", "enrich.dnsx_resolve",
-        "enrich.gowitness", "enrich.httpx", "enrich.nuclei_waf", "enrich.wildcard_a1d",
-        "horizontal.cloud_buckets", "horizontal.revdns", "horizontal.tlsx_san", "params.arjun",
-        "params.blind_xss", "params.dalfox", "params.dalfox_xss_fast", "params.nuclei_oast",
-        "params.nuclei_scan", "params.nuclei_takeover", "params.oob_probe",
-        "params.redirect_confirm", "probe.ffuf_vhost",
-        "probe.gowitness", "probe.httpx", "probe.naabu_infra", "probe.naabu_web", "probe.nmap_service",
-        "probe.tlsx_certs", "probe.nuclei_waf", "vertical.puredns_brute", "vertical.puredns_resolve",
-        "vertical.wildcard_http",
-        # both active: the CSP lane fetches the apex through `fetch.scoped_headers` (guarded, paced), the
-        # sourcemap lane fetches scoped `sourceMappingURL` targets.
-        "horizontal.csp", "crawl.sourcemaps")},
+    source_id: str(spec["ownership"])
+    for source_id, spec in sources.all_source_contracts().items()
 }
-OWNERSHIP_KINDS = ("quarry_provider", "external_tool", "target_facing", "local")
+OWNERSHIP_KINDS = tuple(sorted(sources.OWNERSHIP_KINDS))
 
 
 @dataclass(frozen=True)

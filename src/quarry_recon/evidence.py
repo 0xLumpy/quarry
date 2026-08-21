@@ -310,6 +310,16 @@ _NETWORK_AUTHORITY_SOURCE = {
 }
 
 
+def _canonical_source_id(source: str) -> str:
+    """Transport/event identity for a display provenance label.
+
+    Review rows intentionally retain short human-facing labels such as
+    ``openapi`` and ``ssti-probe``.  Those labels are not authority ids: the
+    registry owns the matching ``evidence.*`` identity.
+    """
+    return _NETWORK_AUTHORITY_SOURCE.get(source, source)
+
+
 def acquire(ctx, url: str, dest, host: str, *, source: str, **kw):
     """The acquisition entry point for every evidence lane, so shared ownership reporting cannot be missed:
     returns `(acq|None, final, status)` and emits `evidence_durability` on a complete-but-unowned
@@ -536,7 +546,8 @@ def _durability(ctx, source: str, url: str, host: str, acq, dest) -> None:
     whole = acq.disposition == "complete-unowned"
     # the state key stays `dest` so one artifact path is one log
     held = _held_path(acq, dest)
-    events.coverage_partial(source, kind=events.COVERAGE_OWNERSHIP, measure="evidence_durability",
+    event_source = _canonical_source_id(source)
+    events.coverage_partial(event_source, kind=events.COVERAGE_OWNERSHIP, measure="evidence_durability",
                             unit=f"{source}.artifact:{Path(dest).name}", eligible=1, tested=0,
                             omitted=1,
                             reason=((f"acquired {'complete' if whole else 'PARTIAL'} ({acq.bytes} "
@@ -558,7 +569,8 @@ def _refused(ctx, source: str, url: str, host: str, acq, dest) -> None:
     """The acquisition state on disk withheld this URL; nothing was requested."""
     if acq.disposition == "replayed-complete":
         return                              # not a shortfall: the evidence is here and was not re-bought
-    events.coverage_partial(source, kind=events.COVERAGE_OWNERSHIP, measure="evidence_ownership",
+    event_source = _canonical_source_id(source)
+    events.coverage_partial(event_source, kind=events.COVERAGE_OWNERSHIP, measure="evidence_ownership",
                             unit=f"{source}.url:{url}", eligible=1, tested=0, omitted=1,
                             reason=(f"acquisition refused by the ownership state on disk "
                                     f"({acq.disposition}); nothing was requested: {acq.error}"))
@@ -589,7 +601,8 @@ def _deferred(ctx, source: str, url: str, host: str, acq, klass: str, note: str)
     """Record an artifact acquired whole and not interpreted in process. A coverage record and a review row;
     neither claims the body was empty, oversized-and-dropped, or failed."""
     # deferred interpretation is a gating coverage gap
-    events.coverage_partial(source, kind=events.COVERAGE_CAP, measure="evidence_interpretation",
+    event_source = _canonical_source_id(source)
+    events.coverage_partial(event_source, kind=events.COVERAGE_CAP, measure="evidence_interpretation",
                             unit=f"{source}.artifact:{acq.path.name}", eligible=1, tested=0, omitted=1,
                             reason=(f"acquired complete ({acq.bytes} bytes, sha256 {acq.sha256[:16]}) "
                                     f"and stored at {acq.path}; in-process interpretation deferred "
@@ -843,7 +856,8 @@ def fetch_and_extract(ctx, url: str, *, source: str, subdir: str) -> dict:
         # acquired complete, interpretation deferred: whole on disk, re-runnable with no further request
         res["deferred"] = True
         # not `sample`: nobody chose this subset, so it is a gap, recoverable from the kept artifact
-        events.coverage_partial(source, kind=events.COVERAGE_CAP, measure="evidence_interpretation",
+        events.coverage_partial(_canonical_source_id(source), kind=events.COVERAGE_CAP,
+                                measure="evidence_interpretation",
                                 unit=f"{source}.artifact:{dest.name}", eligible=1, tested=0, omitted=1,
                                 reason=(f"acquired complete ({acq.bytes} bytes, sha256 {acq.sha256[:16]}) "
                                         f"and stored at {dest}; in-process mining deferred above "
@@ -935,7 +949,7 @@ def fetch_exposed(ctx, urls: list[str]) -> int:
             "host": normalize.host_of_url(u), "raw_ref": r["dest"],
             "note": note, "sources": ["exposed-fetch"]})
     # disjoint buckets: this record is resources we requested, `acquire()` owns refusals
-    _fetched("evidence.exposed", eligible - refused_n, attempted, completed,
+    _fetched("evidence.exposed_fetch", eligible - refused_n, attempted, completed,
              "in-scope exposed resource(s)", replayed=replayed_n)
     return added
 
@@ -1030,7 +1044,7 @@ def _actuator_index_links(ctx, base: str, host: str) -> set[str]:
     if not acq.contacted and not acq.complete:
         return set()                               # refused by the ownership state
     if not acq.complete:
-        events.coverage_partial("actuator-probe", kind=events.COVERAGE_TIMEOUT,
+        events.coverage_partial("evidence.actuator_probe", kind=events.COVERAGE_TIMEOUT,
                                 measure="actuator_index", unit=f"actuator-probe.base:{base}",
                                 eligible=1, tested=0, omitted=1,
                                 reason=(f"actuator index INCOMPLETE after {acq.bytes} byte(s) "
@@ -1247,7 +1261,8 @@ def parse_openapi(ctx, urls: list[str]) -> int:
             continue                               # refused by the ownership state
         if not acq.complete:
             # the coverage record is authoritative, the review row readable; the timeout kind gates
-            events.coverage_partial("openapi", kind=events.COVERAGE_TIMEOUT, measure="api_documents",
+            events.coverage_partial("evidence.openapi", kind=events.COVERAGE_TIMEOUT,
+                                    measure="api_documents",
                                     unit=f"openapi.doc:{u}", eligible=1, tested=0, omitted=1,
                                     reason=(f"API document INCOMPLETE after {acq.bytes} byte(s) "
                                             f"({acq.disposition}: {acq.error}) — not parsed; every "
@@ -1481,7 +1496,7 @@ def probe_ssti(ctx, urls: list[str]) -> int:
             got = len(resolved) if bucket == PROBED else 0
             if not members and not got:
                 continue
-            events.coverage_partial("ssti-probe", kind=_BUCKET_KIND[bucket], measure="ssti_params",
+            events.coverage_partial("evidence.ssti_probe", kind=_BUCKET_KIND[bucket], measure="ssti_params",
                                     unit=f"ssti-probe.url:{u}#{bucket}", eligible=got + len(members),
                                     tested=got, omitted=len(members),
                                     reason=(f"{bucket}: "

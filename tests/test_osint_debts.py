@@ -118,7 +118,8 @@ class TestTheRDAPLaneBoundsTHROUGHPUTNotMembership:
     def test_the_bound_is_REGISTERED_so_the_policy_prints_it(self):
         b = policy.by_name("RDAP_LOOKUPS")
         assert b and b.relaxable and b.unbounded_value == 0 and b.consumer_honours_unbounded
-        assert b.lane in policy.BOUND_LANES_OUTSIDE_REGISTRY
+        from quarry_recon import sources
+        assert b.lane in sources.auxiliary_sources()
 
 
 class TestAzmapUnionsBothDomainLists:
@@ -534,7 +535,8 @@ class TestASRankDiscoversASNs:
     def test_the_bound_is_REGISTERED(self):
         b = policy.by_name("ASRANK_ORGS")
         assert b and b.relaxable and b.unbounded_value == 0 and b.consumer_honours_unbounded
-        assert b.lane in policy.BOUND_LANES_OUTSIDE_REGISTRY
+        from quarry_recon import sources
+        assert b.lane in sources.auxiliary_sources()
 
     def test_the_FOLLOW_UP_evidence_is_retained_with_its_asns(self, tmp_path, monkeypatch):
         """The ASNs only the full-membership query returned cannot cite a page written before it ran —

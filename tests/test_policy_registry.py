@@ -213,10 +213,8 @@ class TestTheRegistryTellsTheTruth:
         `probe.favicon` and `probe.cert` — the two lanes that actually spend Shodan query credits — were
         missing, so the "no paid lane in the registry" guarantee was weaker than it read."""
         from quarry_recon import sources
-        known = set(sources.all_sources())
-        outside = set(policy.PROVIDER_LANES_OUTSIDE_REGISTRY)
-        assert outside == {"osint.whoxy"}, outside      # EXACT, so `osint.typo` cannot slip through
-        unknown = [lane for lane in policy.PROVIDER_LANES if lane not in known and lane not in outside]
+        known = set(sources.all_source_contracts())
+        unknown = [lane for lane in policy.PROVIDER_LANES if lane not in known]
         assert not unknown, unknown
 
     def test_EVERY_registered_source_is_classified(self):
@@ -224,33 +222,31 @@ class TestTheRegistryTellsTheTruth:
         what it omits — `vertical.certspotter` is Quarry's own HTTP with Quarry's token and Quarry's page
         bound, and it was missing. A new lane fails here until someone says which kind it is."""
         from quarry_recon import sources
-        registered = set(sources.all_sources())
+        registered = set(sources.all_source_contracts())
         classified = set(policy.SOURCE_OWNERSHIP)
         assert registered - classified == set(), sorted(registered - classified)
         assert classified - registered == set(), sorted(classified - registered)
         assert set(policy.SOURCE_OWNERSHIP.values()) <= set(policy.OWNERSHIP_KINDS)
-        # ...and the two views agree in both directions
-        provider = {k for k, v in policy.SOURCE_OWNERSHIP.items() if v == "quarry_provider"}
-        assert provider == set(policy.PROVIDER_LANES) - set(policy.PROVIDER_LANES_OUTSIDE_REGISTRY)
+        # Campaign closure is a narrower, registry-declared subset of the
+        # provider-owned contracts (not every public OSINT lookup spends).
+        provider = {k for k, v in policy.SOURCE_OWNERSHIP.items() if v == "quarry_provider"
+                    and sources.get_any(k).get("provider_control") is True}
+        assert provider == set(policy.PROVIDER_LANES)
 
     def test_every_BOUND_names_a_registered_lane(self):
         """A bound whose lane is a stale alias misattributes every policy line it prints, and cannot join
         with the planned-lane roster settle will need. Four were aliases: `crawl.sourcemap`, `probe.vhost`,
         `params.nuclei` and `vertical.permute`."""
         from quarry_recon import sources
-        registered = set(sources.all_sources()) | set(policy.BOUND_LANES_OUTSIDE_REGISTRY)
+        registered = set(sources.all_source_contracts())
         stale = sorted({b.lane for b in policy.BOUNDS} - registered)
         assert not stale, stale
 
-    def test_the_out_of_registry_bound_lanes_are_EXACT(self):
-        """An exception list is a hole in a completeness test, so it is enumerated and justified rather
-        than matched by prefix — `osint.*` would admit any typo as a new exemption."""
-        assert policy.BOUND_LANES_OUTSIDE_REGISTRY == ("osint.asrank", "osint.rdap")
+    def test_OSINT_bound_lanes_are_auxiliary_contracts(self):
+        """OSINT is not planned, but bounds name canonical auxiliary contracts."""
         from quarry_recon import sources
-        registered = set(sources.all_sources())
-        for lane in policy.BOUND_LANES_OUTSIDE_REGISTRY:
-            assert lane not in registered, f"{lane} IS registered — drop the exemption"
-            assert lane.startswith("osint."), lane
+        auxiliary = set(sources.auxiliary_sources())
+        assert {"osint.asrank", "osint.rdap"} <= auxiliary
 
     def test_an_ACTIVE_lane_is_never_classified_local(self):
         """Completeness cannot catch a category that is merely WRONG: both of these fetch over the network,

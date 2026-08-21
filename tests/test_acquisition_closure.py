@@ -190,9 +190,9 @@ class TestTheClosureIsComplete:
         return {p: p.read_text(encoding="utf-8") for p in root.rglob("*.py")}
 
     def test_every_acquisition_lane_declares_a_door(self):
-        owned = {lane for lane, kind in policy.SOURCE_OWNERSHIP.items() if kind == "quarry_provider"}
+        owned = set(policy.PROVIDER_LANES)
         declared = set(policy.PROVIDER_DOORS)
-        assert declared == owned | set(policy.PROVIDER_LANES_OUTSIDE_REGISTRY), declared ^ owned
+        assert declared == owned, declared ^ owned
         assert set(policy.PROVIDER_DOORS.values()) <= set(policy.DOORS)
 
     def test_both_REGISTRY_doors_gate(self):
@@ -259,9 +259,8 @@ class TestTheClosureIsComplete:
             assert f'"{lane}"' in src, lane
 
     def test_the_registry_ids_are_real(self):
-        gated_outside = set(policy.PROVIDER_LANES_OUTSIDE_REGISTRY)
         for lane in policy.PROVIDER_LANES:
-            assert lane in sources.all_sources() or lane in gated_outside, lane
+            assert lane in sources.all_source_contracts(), lane
 
 
 class TestARefusedLaneStillHasALifecycle:

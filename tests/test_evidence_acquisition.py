@@ -1934,7 +1934,7 @@ class TestOwnershipEvidenceIsAttributedToITSLane:
             ctx, [{"url": "https://t/debug", "framework": "werkzeug", "note": "console"}])
         evs = [json.loads(x) for x in (tmp_path / "events.jsonl").read_text().splitlines()]
         own = [e for e in evs if e.get("measure") == "evidence_ownership"]
-        assert own and own[-1].get("source_id") == "framework-probe", own
+        assert own and own[-1].get("source_id") == "evidence.framework_probe", own
         assert not [e for e in own if e.get("source_id") == "openapi"], "not the openapi lane's unit"
         row = [r for k, r in added if k == evidence.OWNERSHIP_ENTITY and r.get("klass") == "acquisition-refused"][0]
         assert row["sources"] == ["framework-probe"], row

@@ -296,3 +296,155 @@ sources:
   params.blind_xss:          {tool: dalfox, phase: params, tier: optional, class: deep, default: off, reason: "engagement gate (MODES.BLIND_XSS)",
     input: worthy_xss_candidates, output: "oob_interaction (operator-observed until imported)", workers: governor, rate: http_rl, timeout: scaled, failure: partial-ok, fallback: skip, parser: "OOB import", log: one-line,
     notes: "Rides params.dalfox_xss_fast when MODES.BLIND_XSS arms it (--blind-oob). CORRELATION is dalfox's: it mints the per-payload nonce, registers, polls and maps it back; beacons are OPERATOR-OBSERVED until `quarry oob import` records them. The BACKEND is the public interactsh pool unless oob.callback_server names one you host"}
+
+# Non-planned acquisition/control contracts.  These are deliberately separate from
+# `sources`: adding them there would change phase planning.  They are nevertheless
+# canonical source identities: native calls, subprocesses and event emitters must
+# name one of these contracts rather than minting a nearby alias.
+# Shared only where the execution semantics are genuinely identical.  YAML
+# merges make the complete fourteen-field contract visible on every entry.
+auxiliary_defaults:
+  target_fetch: &aux_target_fetch
+    input: scoped target URL or hostname
+    output: retained response+evidence
+    workers: n/a
+    rate: http_rl
+    timeout: http
+    failure: quiet-warn
+    fallback: skip
+    parser: internal
+    log: delta
+  provider_http: &aux_provider_http
+    input: OSINT anchor
+    output: candidate+raw-evidence
+    workers: n/a
+    rate: provider_pace
+    timeout: fixed
+    failure: quiet-warn
+    fallback: skip
+    parser: internal
+    log: one-line
+  external_provider: &aux_external_provider
+    input: apex or ASN seed
+    output: candidate+raw-evidence
+    workers: n/a
+    rate: provider_pace
+    timeout: fixed
+    failure: quiet-warn
+    fallback: skip
+    parser: internal
+    log: one-line
+  target_dns: &aux_target_dns
+    input: scoped apex hostname
+    output: DNS record
+    workers: n/a
+    rate: dns_rate
+    timeout: fixed
+    failure: quiet-warn
+    fallback: skip
+    parser: internal
+    log: one-line
+  offline_classify: &aux_offline_classify
+    input: observed IPs
+    output: CDN/WAF classification
+    workers: n/a
+    rate: n/a
+    timeout: scaled
+    failure: fail-closed
+    fallback: direct-httpx
+    parser: strict-jsonl
+    log: one-line
+  oob_control: &aux_oob_control
+    input: OOB session and polling window
+    output: callback interaction log
+    workers: n/a
+    rate: control-plane
+    timeout: fixed-window
+    failure: quiet-warn
+    fallback: skip
+    parser: interactsh-json
+    log: one-line
+  notification: &aux_notification
+    input: operator notification payload
+    output: delivery receipt
+    workers: n/a
+    rate: provider_pace
+    timeout: fixed
+    failure: quiet-warn
+    fallback: skip
+    parser: internal
+    log: one-line
+  local_event: &aux_local_event
+    input: ownership transition log
+    output: coverage state
+    workers: n/a
+    rate: n/a
+    timeout: n/a
+    failure: partial-ok
+    fallback: retain-state
+    parser: internal
+    log: one-line
+
+auxiliary_sources:
+  evidence.exposed_fetch:     {<<: *aux_target_fetch, tool: internal, phase: auxiliary, tier: optional, class: active, default: on, ownership: target_facing, transport: {kind: native-pinned-http, authority: target, profile: native-target-http}}
+  evidence.graphql_introspect: {<<: *aux_target_fetch, tool: internal, phase: auxiliary, tier: optional, class: active, default: on, ownership: target_facing, transport: {kind: native-pinned-http, authority: target, profile: native-target-http}}
+  evidence.actuator_probe:    {<<: *aux_target_fetch, tool: internal, phase: auxiliary, tier: optional, class: active, default: on, ownership: target_facing, transport: {kind: native-pinned-http, authority: target, profile: native-target-http}}
+  evidence.deep_evidence:     {<<: *aux_target_fetch, tool: internal, phase: auxiliary, tier: optional, class: active, default: off, reason: "deep evidence opt-in", ownership: target_facing, transport: {kind: native-pinned-http, authority: target, profile: native-target-http}}
+  evidence.openapi:           {<<: *aux_target_fetch, tool: internal, phase: auxiliary, tier: optional, class: active, default: on, ownership: target_facing, transport: {kind: native-pinned-http, authority: target, profile: native-target-http}}
+  evidence.framework_probe:   {<<: *aux_target_fetch, tool: internal, phase: auxiliary, tier: optional, class: active, default: on, ownership: target_facing, transport: {kind: native-pinned-http, authority: target, profile: native-target-http}}
+  evidence.ssti_probe:        {<<: *aux_target_fetch, tool: internal, phase: auxiliary, tier: optional, class: active, default: on, ownership: target_facing, transport: {kind: native-pinned-http, authority: target, profile: native-target-http}}
+  evidence.ownership:         {<<: *aux_local_event, tool: internal, phase: auxiliary, tier: core, class: passive, default: on, ownership: local, transport: {kind: local-event, authority: offline, profile: local-internal}}
+
+  osint.asrank:               {<<: *aux_provider_http, tool: internal, phase: auxiliary, tier: optional, class: passive, default: on, ownership: quarry_provider, transport: {kind: native-provider-http, authority: public-provider, profile: native-public-provider}}
+  osint.azmap:                {<<: *aux_provider_http, tool: internal, phase: auxiliary, tier: optional, class: passive, default: on, ownership: quarry_provider, transport: {kind: native-provider-http, authority: public-provider, profile: native-public-provider}}
+  osint.whoxy:                {<<: *aux_provider_http, tool: internal, phase: auxiliary, tier: optional, class: passive, default: key, reason: "keyed (Whoxy)", ownership: quarry_provider, provider_control: true, transport: {kind: native-provider-http, authority: public-provider, profile: native-public-provider}}
+  osint.rdap:                 {<<: *aux_provider_http, tool: internal, phase: auxiliary, tier: optional, class: passive, default: on, ownership: quarry_provider, transport: {kind: native-provider-http, authority: public-provider, profile: native-public-provider}}
+  osint.rdap_resolve:         {<<: *aux_target_fetch, tool: internal, phase: auxiliary, tier: optional, class: active, default: on, ownership: target_facing, transport: {kind: native-pinned-http, authority: target, profile: native-target-http}}
+  osint.asnmap:               {<<: *aux_external_provider, tool: asnmap, phase: auxiliary, tier: optional, class: passive, default: on, ownership: external_tool, transport: {kind: external-provider, authority: public-provider, profile: public-provider}}
+  osint.porch_pirate:         {<<: *aux_external_provider, tool: porch-pirate, phase: auxiliary, tier: optional, class: passive, default: on, ownership: external_tool, transport: {kind: external-provider, authority: public-provider, profile: public-provider}}
+  osint.whois:                {<<: *aux_external_provider, tool: whois, phase: auxiliary, tier: optional, class: passive, default: on, ownership: external_tool, transport: {kind: external-provider, authority: public-provider, profile: provider-referral}}
+  osint.dmarc:                {<<: *aux_target_dns, tool: dig, phase: auxiliary, tier: optional, class: active, default: on, ownership: target_facing, transport: {kind: external-dns, authority: target, profile: target-dns}}
+
+  vertical.wildcard_guard:    {<<: *aux_target_fetch, tool: internal, phase: auxiliary, tier: core, class: active, default: on, ownership: target_facing, transport: {kind: native-pinned-http, authority: target, profile: native-target-http}}
+  enrich.wildcard_guard:      {<<: *aux_target_fetch, tool: internal, phase: auxiliary, tier: core, class: active, default: on, ownership: target_facing, transport: {kind: native-pinned-http, authority: target, profile: native-target-http}}
+  probe.cdncheck:             {<<: *aux_offline_classify, tool: cdncheck, phase: auxiliary, tier: core, class: passive, default: on, ownership: local, transport: {kind: offline-transform, authority: offline, profile: deny-all}}
+  params.oob_control:         {<<: *aux_oob_control, tool: interactsh-client, phase: auxiliary, tier: core, class: active, default: on, ownership: operator_control, transport: {kind: external-control-plane, authority: operator-infrastructure, profile: oob-control-proxy}}
+  notify.slack:               {<<: *aux_notification, tool: internal, phase: auxiliary, tier: optional, class: passive, default: key, reason: "operator notification configured", ownership: operator_control, transport: {kind: native-control-http, authority: operator-infrastructure, profile: operator-channel}}
+  notify.discord:             {<<: *aux_notification, tool: internal, phase: auxiliary, tier: optional, class: passive, default: key, reason: "operator notification configured", ownership: operator_control, transport: {kind: native-control-http, authority: operator-infrastructure, profile: operator-channel}}
+  notify.telegram:            {<<: *aux_notification, tool: internal, phase: auxiliary, tier: optional, class: passive, default: key, reason: "operator notification configured", ownership: operator_control, transport: {kind: native-control-http, authority: operator-infrastructure, profile: operator-channel}}
+  notify.webhook:             {<<: *aux_notification, tool: internal, phase: auxiliary, tier: optional, class: passive, default: key, reason: "operator notification configured", ownership: operator_control, transport: {kind: native-control-http, authority: operator-infrastructure, profile: operator-channel}}
+
+# Phase entries predate explicit ownership/transport fields.  Keep their planning
+# contracts compact and overlay these canonical semantics at load time.  Each id
+# must occur exactly once in each table; sources.py validates this invariant.
+semantics:
+  ownership:
+    quarry_provider: [probe.favicon, probe.cert, probe.shodan_host, vertical.censys, vertical.certspotter, vertical.crtsh, vertical.shosubgo, vertical.github_subs]
+    external_tool: [vertical.subfinder, crawl.gau, crawl.waymore_urls, crawl.waymore_responses, horizontal.caduceus, horizontal.asnmap, enrich.smap, probe.smap]
+    local: [vertical.openintel, horizontal.kaeferjaeger, horizontal.mapcidr, params.gf, crawl.js_beautify, crawl.jsluice_urls, crawl.jsluice_secrets, crawl.gitleaks, crawl.trufflehog, crawl.xnlinkfinder, origin.correlation, vertical.alterx_permute, crawl.jxscout_chunks, crawl.jxscout_ast]
+    target_facing: [content.ffuf, crawl.js_fetch, crawl.katana_headless, crawl.katana_standard, crawl.sourcemaps, dns.dnsx_records, enrich.a1d_brute, enrich.wildcard_a1d, enrich.dnsx_cname, enrich.dnsx_resolve, enrich.gowitness, enrich.httpx, enrich.nuclei_waf, horizontal.cloud_buckets, horizontal.csp, horizontal.revdns, horizontal.tlsx_san, params.arjun, params.blind_xss, params.dalfox, params.dalfox_xss_fast, params.nuclei_oast, params.nuclei_scan, params.nuclei_takeover, params.oob_probe, params.redirect_confirm, probe.ffuf_vhost, probe.gowitness, probe.httpx, probe.naabu_infra, probe.naabu_web, probe.nmap_service, probe.nuclei_waf, probe.tlsx_certs, vertical.puredns_brute, vertical.puredns_resolve, vertical.wildcard_http]
+  provider_control: [probe.favicon, probe.cert, probe.shodan_host, vertical.censys, vertical.certspotter, vertical.crtsh, vertical.shosubgo, vertical.github_subs]
+  transport:
+    - {kind: native-pinned-http, authority: target, profile: native-target-http, sources: [horizontal.csp, crawl.js_fetch, crawl.sourcemaps]}
+    - {kind: native-pinned-http, authority: target, profile: native-no-redirect, sources: [params.redirect_confirm, params.oob_probe]}
+    - {kind: native-provider-http, authority: public-provider, profile: cloud-bucket-provider, sources: [horizontal.cloud_buckets]}
+    - {kind: native-provider-http, authority: public-provider, profile: native-public-provider, sources: [probe.favicon, probe.cert, probe.shodan_host, vertical.censys, vertical.certspotter, vertical.crtsh, vertical.shosubgo]}
+    - {kind: external-http, authority: target, profile: target-http-exact, sources: [content.ffuf, probe.ffuf_vhost, probe.httpx, enrich.httpx, vertical.wildcard_http, enrich.wildcard_a1d, params.arjun, params.dalfox_xss_fast]}
+    - {kind: external-http, authority: target, profile: target-http-proxy, sources: [crawl.katana_standard, params.blind_xss, params.dalfox]}
+    - {kind: external-browser, authority: target, profile: browser-pipe-proxy, sources: [crawl.katana_headless, probe.gowitness, enrich.gowitness]}
+    - {kind: external-template-http, authority: target, profile: nuclei-authorized-http, sources: [params.nuclei_oast, params.nuclei_scan, params.nuclei_takeover, probe.nuclei_waf, enrich.nuclei_waf]}
+    - {kind: external-dns, authority: target, profile: target-dns, sources: [dns.dnsx_records, enrich.dnsx_cname, enrich.dnsx_resolve, horizontal.revdns, vertical.puredns_brute, vertical.puredns_resolve, enrich.a1d_brute]}
+    - {kind: external-tls, authority: target, profile: target-cidr-tls, sources: [horizontal.tlsx_san, horizontal.caduceus]}
+    - {kind: external-tls, authority: target, profile: target-tls, sources: [probe.tlsx_certs]}
+    - {kind: external-ip, authority: target, profile: target-connect-scan, sources: [probe.naabu_web, probe.naabu_infra]}
+    - {kind: external-ip, authority: target, profile: target-connect-service, sources: [probe.nmap_service]}
+    - {kind: external-provider, authority: public-provider, profile: public-provider, sources: [vertical.subfinder, horizontal.asnmap, crawl.gau, crawl.waymore_urls, crawl.waymore_responses]}
+    - {kind: external-provider, authority: public-provider, profile: github-provider, sources: [vertical.github_subs]}
+    - {kind: external-provider, authority: public-provider, profile: shodan-internetdb-provider, sources: [probe.smap, enrich.smap]}
+    - {kind: local-corpus, authority: offline, profile: local-internal, sources: [horizontal.kaeferjaeger]}
+    - {kind: local-transform, authority: offline, profile: local-internal, sources: [origin.correlation]}
+    - {kind: cidr-transform, authority: offline, profile: deny-all, sources: [horizontal.mapcidr]}
+    - {kind: offline-corpus, authority: offline, profile: deny-all, sources: [vertical.openintel]}
+    - {kind: offline-transform, authority: offline, profile: deny-all, sources: [vertical.alterx_permute, params.gf, crawl.js_beautify, crawl.jsluice_urls, crawl.jsluice_secrets, crawl.xnlinkfinder, crawl.gitleaks, crawl.trufflehog]}
+    - {kind: offline-transform, authority: offline, profile: unsupported-systemd-sandbox-escape, sources: [crawl.jxscout_ast]}
+    - {kind: offline-transform, authority: offline, profile: offline-bwrap-network-deny, sources: [crawl.jxscout_chunks]}

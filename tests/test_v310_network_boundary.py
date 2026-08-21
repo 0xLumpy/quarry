@@ -321,7 +321,13 @@ def test_duplicate_ofd_sendmsg_changes_unix_passcred_sender_identity():
 
 def test_transport_registry_is_exactly_source_keyed_and_complete():
     registered = network_policy.REGISTERED_TRANSPORT_DOORS
-    assert set(registered) == set(policy.SOURCE_OWNERSHIP) == set(sources.all_sources())
+    assert set(registered) == set(sources.all_sources())
+    assert set(policy.SOURCE_OWNERSHIP) == set(sources.all_source_contracts())
+    auxiliary = {
+        source_id for source_id, spec in sources.auxiliary_sources().items()
+        if spec["transport"]["kind"] != "local-event"
+    }
+    assert set(network_policy.AUXILIARY_TRANSPORT_DOORS) == auxiliary
     assert len(registered) == len(set(registered))
     for source_id, door in registered.items():
         assert door.source_id == source_id

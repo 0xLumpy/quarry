@@ -118,10 +118,24 @@ def test_readme_states_the_current_source_count():
 def test_source_registry_has_exact_ownership_and_transport_references():
     from quarry_recon import network_policy, policy, sources
 
-    registered = set(sources.all_sources())
+    registered = set(sources.all_source_contracts())
     assert sources.validate() == []
     assert set(policy.SOURCE_OWNERSHIP) == registered
-    assert set(network_policy.REGISTERED_TRANSPORT_DOORS) == registered
+    assert set(network_policy.REGISTERED_TRANSPORT_DOORS) == set(sources.all_sources())
+    assert set(network_policy.AUXILIARY_TRANSPORT_DOORS) == registered - {"evidence.ownership"} - set(sources.all_sources())
+
+
+def test_auxiliary_source_contracts_are_complete_without_expanding_phase_plans():
+    from quarry_recon import sources
+
+    auxiliary = sources.auxiliary_sources()
+    assert sources.get("osint.whoxy") is None
+    assert sources.get_any("osint.whoxy") == auxiliary["osint.whoxy"]
+    assert {"osint.whoxy", "osint.asrank", "osint.azmap", "osint.rdap", "osint.rdap_resolve",
+            "osint.asnmap", "osint.porch_pirate", "osint.whois", "osint.dmarc", "probe.cdncheck",
+            "params.oob_control"} <= set(auxiliary)
+    for contract in auxiliary.values():
+        assert set(sources.FULL_CONTRACT_FIELDS) <= set(contract)
 
 
 def test_nuclei_policy_label_is_exact_in_registry_and_generated_docs():

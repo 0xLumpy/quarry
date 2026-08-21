@@ -195,7 +195,7 @@ class TestEventSourceIdsRegistered:
     outside the authoritative registry. Dynamic (f-string/variable) ids are validated at runtime by the
     contract itself (unknown -> tool_blocked)."""
     EVENT_FNS = {"tool_start", "tool_finish", "tool_progress", "coverage_partial", "tool_blocked",
-                 "ledger", "coverage_reset", "artifact_written"}
+                 "ledger", "coverage_reset", "artifact_written", "spend"}
     CONTRACT_FNS = {"run_provider", "run_contract"}
 
     def _literal_source_ids(self):
@@ -203,6 +203,12 @@ class TestEventSourceIdsRegistered:
         import quarry_recon.phases as pkg
         files = list(pathlib.Path(pkg.__file__).parent.glob("*.py"))
         files.append(pathlib.Path(inspect.getsourcefile(importlib.import_module("quarry_recon.cloud"))))
+        # OSINT and evidence sublanes are deliberately non-planned, but their
+        # direct events are still canonical source identities.
+        files.extend([
+            pathlib.Path(inspect.getsourcefile(importlib.import_module("quarry_recon.osint"))),
+            pathlib.Path(inspect.getsourcefile(importlib.import_module("quarry_recon.evidence"))),
+        ])
         out = {}
         for f in files:
             if f.stem == "__init__":
@@ -219,7 +225,7 @@ class TestEventSourceIdsRegistered:
 
     def test_all_literal_event_source_ids_are_registered(self):
         from quarry_recon import sources
-        reg = set(sources.all_sources())
+        reg = set(sources.all_source_contracts())
         unregistered = {sid: sorted(mods) for sid, mods in self._literal_source_ids().items() if sid not in reg}
         assert not unregistered, f"event/contract source_ids not in sources.yaml: {unregistered}"
 

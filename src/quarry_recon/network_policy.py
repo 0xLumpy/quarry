@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 
+from . import sources
 from .oos_regex import OOSRegexError, compile_oos, oos_search
 
 
@@ -260,8 +261,6 @@ _register(("crawl.jxscout_chunks",), "offline-transform", "offline",
           forbidden_argv=("--share-net",), connect_time_peer=False,
           broker_required=False)
 
-REGISTERED_TRANSPORT_DOORS = MappingProxyType(dict(_registered_doors))
-
 # Canonical internal/OSINT/notification transport owners outside the phase
 # source registry.  This exception set is exact and tested; no prefix wildcard
 # can silently add a new ambient network caller.
@@ -328,6 +327,29 @@ _auxiliary_doors = {
         )
     },
 }
+
+
+def _check_canonical_transport(source_id: str, door: TransportDoor) -> None:
+    """Executable details live here; transport semantics live in sources.yaml."""
+    contract = sources.get_any(source_id)
+    expected = contract.get("transport") if isinstance(contract, dict) else None
+    actual = {"kind": door.kind, "authority": door.authority_class, "profile": door.profile}
+    if expected != actual:
+        raise RuntimeError(f"transport contract drift for {source_id}: {expected!r} != {actual!r}")
+
+
+if set(_registered_doors) != set(sources.all_sources()):
+    raise RuntimeError("planned transport doors do not match planned source registry")
+_networked_auxiliary_sources = {
+    source_id for source_id, contract in sources.auxiliary_sources().items()
+    if contract.get("transport", {}).get("kind") != "local-event"
+}
+if set(_auxiliary_doors) != _networked_auxiliary_sources:
+    raise RuntimeError("auxiliary transport doors do not match auxiliary source registry")
+for _source_id, _source_door in {**_registered_doors, **_auxiliary_doors}.items():
+    _check_canonical_transport(_source_id, _source_door)
+
+REGISTERED_TRANSPORT_DOORS = MappingProxyType(dict(_registered_doors))
 AUXILIARY_TRANSPORT_DOORS = MappingProxyType(dict(_auxiliary_doors))
 TRANSPORT_DOORS = MappingProxyType({**_registered_doors, **_auxiliary_doors})
 del _sid, _helper
