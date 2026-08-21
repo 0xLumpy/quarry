@@ -6271,6 +6271,78 @@ def _semantic_source_registry(
         raise evidence.EvidenceError("source registry artifact makes an impermissible execution claim")
 
 
+def _semantic_path_identity(
+    gate: dict, bodies: Mapping[str, bytes], **context: object,
+) -> None:
+    """Bind the measured path corpus to one signed H0 collection instance."""
+    if gate["gate_id"] != "C-PATH-IDENTITY":  # pragma: no cover - registry invariant
+        raise evidence.EvidenceError("path identity verifier received the wrong gate")
+    identity = context["identity"]
+    report = context["report"]
+    scope = context["scope"]
+    inputs = context["input_bodies"]
+    if (not isinstance(identity, dict) or not isinstance(report, dict) or
+            not isinstance(scope, dict) or not isinstance(inputs, Mapping)):
+        raise evidence.EvidenceError("path identity verifier requires accepted release context")
+
+    scope_bindings = {row["name"]: row for row in scope["input_bindings"]}
+    bound_inputs: dict[str, bytes] = {}
+    for name, path in path_identity_evidence.INPUT_PATHS.items():
+        binding = scope_bindings.get(name)
+        body = inputs.get(name)
+        if (binding is None or binding["path"] != path or type(body) is not bytes or
+                raw_sha256(body) != binding["digest"]):
+            raise evidence.EvidenceError("path identity source input is absent, redirected or drifted")
+        bound_inputs[name] = body
+
+    corpus_body = bodies.get("property-corpus")
+    decisions_body = bodies.get("containment-decisions")
+    if corpus_body != bound_inputs["path-identity-corpus"] or type(decisions_body) is not bytes:
+        raise evidence.EvidenceError("path identity artifacts do not contain the exact bound corpus and decisions")
+    signed = {item["name"]: item for item in gate["artifacts"]}
+    for name, body in (("containment-decisions", decisions_body), ("property-corpus", corpus_body)):
+        record = signed.get(name)
+        if (record is None or record["media_type"] != "application/json" or
+                record["digest"] != raw_sha256(body)):
+            raise evidence.EvidenceError("path identity artifact does not match its signed gate record")
+
+    try:
+        path_identity_evidence.read_property_corpus(corpus_body)
+        decisions = path_identity_evidence.read_containment_decisions(
+            decisions_body,
+            candidate_identity_digest=evidence.canonical_digest(identity),
+            input_bodies=bound_inputs,
+        )
+    except path_identity_evidence.PathIdentityEvidenceError as exc:
+        raise evidence.EvidenceError(str(exc)) from exc
+
+    instances = report["instances"]
+    if len(instances) != 1 or instances[0]["lane"] != "H0-hermetic":
+        raise evidence.EvidenceError("path identity evidence requires one exact signed H0 instance")
+    instance = instances[0]
+    expected_artifacts = [
+        {"digest": raw_sha256(decisions_body), "name": "containment-decisions"},
+        {"digest": raw_sha256(corpus_body), "name": "property-corpus"},
+    ]
+    if instance["artifacts"] != expected_artifacts:
+        raise evidence.EvidenceError("path identity artifacts are not owned by the exact signed H0 instance")
+    interval = decisions["collection_interval"]
+    if not (
+        _timestamp(instance["started_at"], "path identity H0 started_at") <=
+        _timestamp(interval["started_at"], "path identity collection started_at") <=
+        _timestamp(interval["finished_at"], "path identity collection finished_at") <=
+        _timestamp(instance["finished_at"], "path identity H0 finished_at")
+    ):
+        raise evidence.EvidenceError("path identity collection lies outside its signed H0 interval")
+    observed = decisions["environment"]
+    expected = instance["environment"]
+    if (observed["python_implementation"] != "CPython" or
+            observed["python_version"] != expected["python"] or
+            observed["platform_system"].casefold() != expected["os"].casefold() or
+            observed["platform_machine"] != expected["architecture"]):
+        raise evidence.EvidenceError("path identity collection environment does not match signed H0")
+
+
 def _semantic_manifest(
     gate: dict, bodies: Mapping[str, bytes], **context: object,
 ) -> None:
@@ -7070,6 +7142,7 @@ SEMANTIC_VERIFIERS = MappingProxyType({
     "B-STATIC-SECURITY": _semantic_static_security,
     "B-DETERMINISM": _semantic_determinism,
     "C-SOURCE-REGISTRY": _semantic_source_registry,
+    "C-PATH-IDENTITY": _semantic_path_identity,
     "C-PACKAGE-BUILD": _semantic_package_build,
     "C-PYTHON-MATRIX": _semantic_python_matrix,
     "C-NETWORK-BOUNDARY": _semantic_network_boundary,

@@ -89,7 +89,7 @@ def test_collector_invokes_full_roster_and_records_zero_mutation(collected):
     )
 
 
-def test_local_observations_are_explicitly_unattested_and_non_promoting(collected):
+def test_raw_observations_are_self_unattested_and_require_the_release_adapter(collected):
     document, _bodies = collected
     assert document["disposition"] == "source_substrate"
     assert document["closure_status"] == "OPEN"
@@ -103,7 +103,8 @@ def test_local_observations_are_explicitly_unattested_and_non_promoting(collecte
         "collection_interval_authenticated": False,
         "toolchain_authenticated": False,
     }
-    assert "C-PATH-IDENTITY" not in contracts.SEMANTIC_VERIFIERS
+    assert contracts.SEMANTIC_VERIFIERS["C-PATH-IDENTITY"] is \
+        contracts._semantic_path_identity
     assert "C-PATH-IDENTITY" not in contracts.PROVISIONAL_SEMANTIC_VERIFIERS
     assert contracts.REQUIRED_ARTIFACTS["C-PATH-IDENTITY"] == (
         ("containment-decisions", "application/json"),

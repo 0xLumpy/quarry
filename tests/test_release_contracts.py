@@ -20,6 +20,7 @@ from quarry_recon import release_contracts as contracts
 from quarry_recon import release_evidence as evidence
 from quarry_recon import release_v310_05
 from quarry_recon import resource_contract
+from quarry_recon import path_identity_evidence
 from quarry_recon import source_registry_evidence
 
 pytestmark = pytest.mark.offline
@@ -28,6 +29,7 @@ ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "tests/fixtures/release_contracts/ed25519-golden-v1.json"
 APPROVAL_SEED = hashlib.sha256(b"Quarry test-only approval signing key v1").digest()
 GATE_SEED = hashlib.sha256(b"Quarry test-only gate signing key v1").digest()
+_PATH_IDENTITY_CACHE: dict[str, dict] = {}
 
 
 def _public_key(seed: bytes) -> bytes:
@@ -455,6 +457,35 @@ def _supporting_bodies(
                 candidate_identity_digest=evidence.canonical_digest(identity), input_bodies=source_inputs,
             )
         )
+    elif gate_id == "C-PATH-IDENTITY":
+        candidate_digest = evidence.canonical_digest(identity)
+        path_inputs = {
+            name: (ROOT / path).read_bytes()
+            for name, path in path_identity_evidence.INPUT_PATHS.items()
+        }
+        if candidate_digest not in _PATH_IDENTITY_CACHE:
+            _PATH_IDENTITY_CACHE[candidate_digest] = path_identity_evidence.build_containment_decisions(
+                candidate_identity_digest=candidate_digest,
+                input_bodies=path_inputs,
+            )
+        decisions = copy.deepcopy(_PATH_IDENTITY_CACHE[candidate_digest])
+        instance = evidence_instances[0]
+        decisions["collection_interval"] = {
+            "started_at": instance["started_at"].replace("Z", ".000000Z"),
+            "finished_at": instance["finished_at"].replace("Z", ".000000Z"),
+        }
+        decisions["environment"].update({
+            "python_implementation": "CPython",
+            "python_version": instance["environment"]["python"],
+            "platform_system": instance["environment"]["os"],
+            "platform_machine": instance["environment"]["architecture"],
+        })
+        bodies["containment-decisions"] = path_identity_evidence.canonical_containment_decisions_bytes(
+            decisions,
+            candidate_identity_digest=candidate_digest,
+            input_bodies=path_inputs,
+        )
+        bodies["property-corpus"] = path_inputs["path-identity-corpus"]
     elif gate_id == "B-SCHEMA":
         registry_body = (ROOT / evidence.REGISTRY_PATH).read_bytes()
         fixture_manifest_body = (ROOT / contracts.SCHEMA_VALIDATION_FIXTURE_MANIFEST_PATH).read_bytes()
@@ -2621,7 +2652,7 @@ class TestIncompleteSemanticRegistry:
             | {
                 "A-IDENTITY", "A-EVIDENCE-SCHEMA", "A-TAXONOMY", "A-CORPUS", "A-THRESHOLDS", "A-SUPPORT",
                 "B-HERMETIC-ALL", "B-SCHEMA", "B-DOCS-POLICY", "B-MANIFEST", "B-QUALITY", "B-COVERAGE", "B-STATIC-SECURITY", "B-DETERMINISM",
-                "C-PACKAGE-BUILD", "C-PACKAGE-INSTALL", "C-PYTHON-MATRIX", "C-SBOM", "C-VULNERABILITY", "C-PROVENANCE", "C-SOURCE-REGISTRY", "C-NETWORK-BOUNDARY", "C-NET-DENY",
+                "C-PACKAGE-BUILD", "C-PACKAGE-INSTALL", "C-PYTHON-MATRIX", "C-SBOM", "C-VULNERABILITY", "C-PROVENANCE", "C-SOURCE-REGISTRY", "C-PATH-IDENTITY", "C-NETWORK-BOUNDARY", "C-NET-DENY",
                 *contracts.V310_05_SEMANTIC_GATES,
             }
         )
@@ -2670,6 +2701,46 @@ class TestSourceRegistryAggregateEvidence:
         )
         with pytest.raises(evidence.EvidenceError, match=match):
             contracts.aggregate_records(**arguments)
+
+
+class TestPathIdentitySemanticEvidence:
+    @staticmethod
+    def _case(tmp_path):
+        arguments = _scenario(tmp_path)
+        gate = _gate(arguments, "C-PATH-IDENTITY")
+        bodies = {
+            row["name"]: (arguments["artifact_root"] / row["path"]).read_bytes()
+            for row in arguments["artifact_index"]["artifacts"]
+            if row["gate_id"] == "C-PATH-IDENTITY"
+        }
+        report = contracts.read_evidence_report(
+            bodies.pop("gate-evidence"),
+            identity=arguments["identity"],
+            gate_id="C-PATH-IDENTITY",
+        )
+        return gate, bodies, {
+            "identity": arguments["identity"],
+            "input_bodies": arguments["input_bodies"],
+            "report": report,
+            "scope": arguments["scope"],
+        }
+
+    def test_exact_measured_corpus_is_owned_by_one_signed_h0_instance(self, tmp_path):
+        gate, bodies, context = self._case(tmp_path)
+        contracts._semantic_path_identity(gate, bodies, **context)
+
+    def test_forged_case_result_fails_after_outer_digest_rebinding(self, tmp_path):
+        gate, bodies, context = self._case(tmp_path)
+        document = json.loads(bodies["containment-decisions"])
+        document["cases"][0]["actual_disposition"] = "refused"
+        bodies["containment-decisions"] = contracts.canonical_json_line(document)
+        digest = contracts.raw_sha256(bodies["containment-decisions"])
+        next(row for row in gate["artifacts"] if row["name"] == "containment-decisions")[
+            "digest"
+        ] = digest
+        context["report"]["instances"][0]["artifacts"][0]["digest"] = digest
+        with pytest.raises(evidence.EvidenceError, match="contradicts its expected disposition"):
+            contracts._semantic_path_identity(gate, bodies, **context)
 
 
 class TestVulnerabilitySemanticEvidence:
