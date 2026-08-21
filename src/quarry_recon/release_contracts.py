@@ -435,6 +435,12 @@ REQUIRED_ARTIFACTS = {
     "E-ARTIFACTS": (("publication-subjects", "application/json"),),
 }
 
+_ARCHIVE_FETCH_INPUTS = MappingProxyType({
+    "archive-fetch-runtime-bootstrap": "src/quarry_recon/bootstrap.py",
+    "archive-fetch-h0-tests": "tests/test_qr39_007_installer_staging.py",
+    "archive-fetch-h1-tests": "tests/test_archive_fetch_integration.py",
+})
+
 SCHEMA_PATHS = {
     "aggregate-schema": "release/evidence/schemas/release-aggregate-v1.schema.json",
     "artifact-index-schema": "release/evidence/schemas/artifact-index-v1.schema.json",
@@ -621,6 +627,7 @@ SCOPE_INPUT_PATHS = {
     **fault_runner_evidence.INPUT_PATHS,
     **fault_store_evidence.INPUT_PATHS,
     **path_identity_evidence.INPUT_PATHS,
+    **_ARCHIVE_FETCH_INPUTS,
     "private-files-case-roster": "release/evidence/private-files-case-roster-v1.json",
     "private-files-evidence-producer": "scripts/emit_private_files_evidence.py",
     "private-files-evidence-runtime": "src/quarry_recon/private_files_evidence.py",
@@ -1272,6 +1279,36 @@ _FAULT_RUNNER_H0_NODEIDS = tuple(
 _FAULT_RUNNER_H1_NODEIDS = tuple(
     nodeid for nodeid in _FAULT_RUNNER_NODEIDS
     if nodeid.split("::", 1)[0] in _FAULT_RUNNER_H1_PATHS
+)
+_ARCHIVE_FETCH_H0_NODEIDS = (
+    "tests/test_qr39_007_installer_staging.py::test_happy_path_extracts_go_tree_inside_op_dir",
+    "tests/test_qr39_007_installer_staging.py::test_sha_mismatch_refuses",
+    "tests/test_qr39_007_installer_staging.py::test_traversal_member_refused_and_nothing_escapes",
+    "tests/test_qr39_007_installer_staging.py::test_absolute_member_refused",
+    "tests/test_qr39_007_installer_staging.py::test_symlink_member_refused",
+    "tests/test_qr39_007_installer_staging.py::test_verified_descriptor_is_the_used_descriptor",
+    "tests/test_qr39_007_installer_staging.py::test_safe_members_returns_all_when_clean",
+    "tests/test_qr39_007_installer_staging.py::test_go_swap_builds_replacement_before_touching_live_and_exchanges_atomically",
+    "tests/test_qr39_007_installer_staging.py::test_go_launcher_failure_precedes_tree_activation",
+    "tests/test_qr39_007_installer_staging.py::test_go_swap_staging_copy_failure_leaves_live_untouched",
+    "tests/test_qr39_007_installer_staging.py::test_go_swap_rehashes_the_privileged_staging_copy_before_activation",
+    "tests/test_qr39_007_installer_staging.py::test_go_launcher_is_published_by_one_rename_not_an_in_place_symlink_update",
+    "tests/test_qr39_007_installer_staging.py::test_go_receipt_and_payload_durability_precede_activation",
+    "tests/test_qr39_007_installer_staging.py::test_go_operation_cleanup_is_loud_until_absence_is_proven",
+    "tests/test_qr39_007_installer_staging.py::test_go_cleanup_cancellation_preempts_an_ordinary_installer_failure",
+    "tests/test_qr39_007_installer_staging.py::test_go_swap_falls_back_when_renameat2_unavailable",
+    "tests/test_qr39_007_installer_staging.py::test_jxscout_swaps_only_after_verification_and_is_transactional",
+    "tests/test_qr39_007_installer_staging.py::test_failed_data_refresh_leaves_previous_file_intact",
+    "tests/test_qr39_007_installer_staging.py::test_go_preservation_failure_is_loud_no_false_restore",
+    "tests/test_qr39_007_installer_staging.py::test_go_launcher_failure_does_not_claim_tree_rollback",
+    "tests/test_qr39_007_installer_staging.py::test_failed_data_update_keeps_existing_valid_file_and_reports_failure",
+    "tests/test_qr39_007_installer_staging.py::test_set_data_file_failed_refresh_keeps_existing_and_reports_failure",
+    "tests/test_qr39_007_installer_staging.py::test_go_preserve_failure_exchanges_back_keeps_original",
+    "tests/test_qr39_007_installer_staging.py::test_jxscout_ast_verifies_both_digests_before_activating",
+    "tests/test_qr39_007_installer_staging.py::test_jxscout_chunks_first_install_rollback_removes_new_tree",
+)
+_ARCHIVE_FETCH_H1_NODEIDS = (
+    "tests/test_archive_fetch_integration.py::test_local_redirect_download_verifies_and_extracts_the_same_archive",
 )
 _PRIVATE_FILES_INPUT_NAMES = (
     "private-files-case-roster",
@@ -7256,6 +7293,105 @@ def _semantic_fault_runner(
     )
 
 
+def _semantic_archive_fetch(
+    gate: dict, bodies: Mapping[str, bytes], **context: object,
+) -> None:
+    """Reconcile the existing archive/activation matrix with one real H1 flow."""
+    if gate["gate_id"] != "C-ARCHIVE-FETCH":  # pragma: no cover - registry invariant
+        raise evidence.EvidenceError("archive-fetch verifier received the wrong gate")
+    identity = context["identity"]
+    report = context["report"]
+    resolver = context["resolver"]
+    scope = context["scope"]
+    inputs = context["input_bodies"]
+    if (not isinstance(identity, dict) or not isinstance(report, dict) or
+            not isinstance(resolver, ArtifactResolver) or not isinstance(scope, dict) or
+            not isinstance(inputs, Mapping)):
+        raise evidence.EvidenceError("archive-fetch verifier requires accepted aggregate context")
+
+    scope_bindings = {row["name"]: row for row in scope["input_bindings"]}
+    for name, path in _ARCHIVE_FETCH_INPUTS.items():
+        binding = scope_bindings.get(name)
+        body = inputs.get(name)
+        if (binding is None or binding["path"] != path or type(body) is not bytes or
+                raw_sha256(body) != binding["digest"]):
+            raise evidence.EvidenceError(
+                "archive-fetch source input is absent, redirected or drifted"
+            )
+
+    expected_subjects = {
+        "activation-trace": _ARCHIVE_FETCH_H1_NODEIDS,
+        "adversarial-matrix": _ARCHIVE_FETCH_H0_NODEIDS,
+    }
+    signed = {row["name"]: row for row in gate["artifacts"]}
+    for name, subjects in expected_subjects.items():
+        body = bodies.get(name)
+        record = signed.get(name)
+        if (type(body) is not bytes or record is None or
+                record["media_type"] != "application/json" or
+                record["digest"] != raw_sha256(body)):
+            raise evidence.EvidenceError(
+                "archive-fetch artifact does not match its signed gate record"
+            )
+        expected = _machine_report_document(
+            gate_id="C-ARCHIVE-FETCH", name=name, identity=identity,
+            subjects=subjects,
+        )
+        if _artifact_document(body, "C-ARCHIVE-FETCH", name) != expected:
+            raise evidence.EvidenceError(
+                "archive-fetch artifact does not carry the exact frozen case roster"
+            )
+
+    instances = report["instances"]
+    if [row["lane"] for row in instances] != [
+        "H0-hermetic", "H1-tool-integration",
+    ]:
+        raise evidence.EvidenceError(
+            "archive-fetch evidence requires one exact signed H0 and H1 instance"
+        )
+    h0, h1 = instances
+
+    def selection(count: int) -> dict[str, int]:
+        return {
+            "collected": count,
+            "deselected": 0,
+            "failed": 0,
+            "passed": count,
+            "selected": count,
+            "skipped": 0,
+            "xfailed": 0,
+            "xpassed": 0,
+        }
+
+    expected_h0 = selection(len(_ARCHIVE_FETCH_H0_NODEIDS))
+    expected_h1 = selection(len(_ARCHIVE_FETCH_H1_NODEIDS))
+    expected_total = {
+        key: expected_h0[key] + expected_h1[key] for key in expected_h0
+    }
+    if (h0["selection"] != expected_h0 or h1["selection"] != expected_h1 or
+            gate["selection"] != expected_total):
+        raise evidence.EvidenceError(
+            "archive-fetch signed records do not select the exact H0/H1 partition"
+        )
+    if h0["artifacts"] != [{
+        "digest": raw_sha256(bodies["adversarial-matrix"]),
+        "name": "adversarial-matrix",
+    }] or h1["artifacts"] != [{
+        "digest": raw_sha256(bodies["activation-trace"]),
+        "name": "activation-trace",
+    }]:
+        raise evidence.EvidenceError(
+            "archive-fetch artifacts are not owned by their exact signed lanes"
+        )
+    _reconcile_h0_node_subset(
+        resolver=resolver,
+        identity=identity,
+        instance=h0,
+        nodeids=_ARCHIVE_FETCH_H0_NODEIDS,
+        label="archive-fetch",
+    )
+
+
 def _semantic_manifest(
     gate: dict, bodies: Mapping[str, bytes], **context: object,
 ) -> None:
@@ -8067,6 +8203,7 @@ SEMANTIC_VERIFIERS = MappingProxyType({
     "C-PYTHON-MATRIX": _semantic_python_matrix,
     "C-NETWORK-BOUNDARY": _semantic_network_boundary,
     "C-NET-DENY": _semantic_network_denial,
+    "C-ARCHIVE-FETCH": _semantic_archive_fetch,
     "C-PACKAGE-INSTALL": _semantic_package_install,
     "C-SBOM": _semantic_sbom,
     "C-VULNERABILITY": _semantic_vulnerability,

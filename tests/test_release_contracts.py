@@ -369,6 +369,7 @@ def _h0_collection_nodes() -> list[str]:
     nodes.extend(contracts._FAULT_FINALIZE_NODEIDS)
     nodes.extend(contracts._FAULT_CAMPAIGN_NODEIDS)
     nodes.extend(contracts._FAULT_RUNNER_H0_NODEIDS)
+    nodes.extend(contracts._ARCHIVE_FETCH_H0_NODEIDS)
     return sorted(set(nodes), key=lambda value: value.encode("utf-8"))
 
 
@@ -613,6 +614,23 @@ def _supporting_bodies(
             plan,
             candidate_identity_digest=evidence.canonical_digest(identity),
             input_bodies=fault_inputs,
+        )
+    elif gate_id == "C-ARCHIVE-FETCH":
+        bodies["activation-trace"] = contracts.canonical_json_line(
+            contracts._machine_report_document(
+                gate_id=gate_id,
+                name="activation-trace",
+                identity=identity,
+                subjects=contracts._ARCHIVE_FETCH_H1_NODEIDS,
+            )
+        )
+        bodies["adversarial-matrix"] = contracts.canonical_json_line(
+            contracts._machine_report_document(
+                gate_id=gate_id,
+                name="adversarial-matrix",
+                identity=identity,
+                subjects=contracts._ARCHIVE_FETCH_H0_NODEIDS,
+            )
         )
     elif gate_id == "C-FAULT-REVISION":
         bodies["fault-matrix"] = contracts.canonical_json_line(
@@ -2045,6 +2063,17 @@ def _scenario(tmp_path: Path, *, approved_at: str = "2026-08-01T00:00:00Z"):
                         "passed": count, "selected": count, "skipped": 0,
                         "xfailed": 0, "xpassed": 0,
                     }
+                if gate_id == "C-ARCHIVE-FETCH":
+                    count = len(
+                        contracts._ARCHIVE_FETCH_H0_NODEIDS
+                        if environment["lane"] == "H0-hermetic"
+                        else contracts._ARCHIVE_FETCH_H1_NODEIDS
+                    )
+                    selection = {
+                        "collected": count, "deselected": 0, "failed": 0,
+                        "passed": count, "selected": count, "skipped": 0,
+                        "xfailed": 0, "xpassed": 0,
+                    }
                 if gate_id == "C-PRIVATE-FILES":
                     selection = {
                         "collected": 3, "deselected": 0, "failed": 0,
@@ -2194,6 +2223,15 @@ def _scenario(tmp_path: Path, *, approved_at: str = "2026-08-01T00:00:00Z"):
                         instance for instance in instances
                         if instance["lane"] == "H1-tool-integration"
                     )
+                if gate_id == "C-ARCHIVE-FETCH":
+                    target_lane = (
+                        "H1-tool-integration" if artifact_name == "activation-trace"
+                        else "H0-hermetic"
+                    )
+                    target_instance = next(
+                        instance for instance in instances
+                        if instance["lane"] == target_lane
+                    )
                 if gate_id == "C-PRIVATE-FILES":
                     target_lane = (
                         "H0-hermetic" if artifact_name == "filesystem-trace"
@@ -2270,6 +2308,11 @@ def _scenario(tmp_path: Path, *, approved_at: str = "2026-08-01T00:00:00Z"):
         }:
             selection = copy.deepcopy(instances[0]["selection"])
         if gate_id == "C-FAULT-RUNNER":
+            selection = {
+                name: sum(instance["selection"][name] for instance in instances)
+                for name in selection
+            }
+        if gate_id == "C-ARCHIVE-FETCH":
             selection = {
                 name: sum(instance["selection"][name] for instance in instances)
                 for name in selection
@@ -2902,7 +2945,7 @@ class TestIncompleteSemanticRegistry:
             | {
                 "A-IDENTITY", "A-EVIDENCE-SCHEMA", "A-TAXONOMY", "A-CORPUS", "A-THRESHOLDS", "A-SUPPORT",
                 "B-HERMETIC-ALL", "B-SCHEMA", "B-DOCS-POLICY", "B-MANIFEST", "B-QUALITY", "B-COVERAGE", "B-STATIC-SECURITY", "B-DETERMINISM",
-                "C-PACKAGE-BUILD", "C-PACKAGE-INSTALL", "C-PYTHON-MATRIX", "C-SBOM", "C-VULNERABILITY", "C-PROVENANCE", "C-SOURCE-REGISTRY", "C-CORPUS-SYNTHETIC", "C-PRIVATE-FILES", "C-PATH-IDENTITY", "C-FAULT-STORE", "C-FAULT-REVISION", "C-FAULT-FINALIZE", "C-FAULT-CAMPAIGN", "C-FAULT-RUNNER", "C-NETWORK-BOUNDARY", "C-NET-DENY",
+                "C-PACKAGE-BUILD", "C-PACKAGE-INSTALL", "C-PYTHON-MATRIX", "C-SBOM", "C-VULNERABILITY", "C-PROVENANCE", "C-SOURCE-REGISTRY", "C-CORPUS-SYNTHETIC", "C-PRIVATE-FILES", "C-PATH-IDENTITY", "C-ARCHIVE-FETCH", "C-FAULT-STORE", "C-FAULT-REVISION", "C-FAULT-FINALIZE", "C-FAULT-CAMPAIGN", "C-FAULT-RUNNER", "C-NETWORK-BOUNDARY", "C-NET-DENY",
                 "E-DOCS", "E-PROJECT-HYGIENE", "E-ARTIFACTS",
                 *contracts.V310_05_SEMANTIC_GATES,
             }
@@ -3222,6 +3265,63 @@ class TestFaultRunnerSemanticEvidence:
         arguments, gate, bodies, report = self._case(tmp_path / "lane")
         report["instances"][1]["selection"]["selected"] -= 1
         with pytest.raises(evidence.EvidenceError, match="exact H0/H1 partition"):
+            self._verify(arguments, gate, bodies, report)
+
+
+class TestArchiveFetchSemanticEvidence:
+    @staticmethod
+    def _case(tmp_path):
+        arguments = _scenario(tmp_path)
+        gate = _gate(arguments, "C-ARCHIVE-FETCH")
+        indexed = {
+            row["name"]: row for row in arguments["artifact_index"]["artifacts"]
+            if row["gate_id"] == "C-ARCHIVE-FETCH"
+        }
+        bodies = {
+            name: (arguments["artifact_root"] / indexed[name]["path"]).read_bytes()
+            for name in ("activation-trace", "adversarial-matrix")
+        }
+        report = contracts.read_evidence_report(
+            (arguments["artifact_root"] / indexed["gate-evidence"]["path"]).read_bytes(),
+            identity=arguments["identity"],
+            gate_id="C-ARCHIVE-FETCH",
+        )
+        return arguments, gate, bodies, report
+
+    @staticmethod
+    def _verify(arguments, gate, bodies, report):
+        with contracts.ArtifactResolver(
+            arguments["artifact_root"], arguments["artifact_index"],
+            identity=arguments["identity"],
+        ) as resolver:
+            contracts._semantic_archive_fetch(
+                gate,
+                bodies,
+                identity=arguments["identity"],
+                input_bodies=arguments["input_bodies"],
+                report=report,
+                resolver=resolver,
+                scope=arguments["scope"],
+            )
+
+    def test_exact_archive_matrix_and_real_redirect_flow_bind_h0_h1(self, tmp_path):
+        arguments, gate, bodies, report = self._case(tmp_path)
+        self._verify(arguments, gate, bodies, report)
+
+    def test_h1_flow_substitution_fails_after_digest_rebinding(self, tmp_path):
+        arguments, gate, bodies, report = self._case(tmp_path)
+        document = json.loads(bodies["activation-trace"])
+        document["records"][0]["result"]["subject"] = "tests/substituted.py::test_case"
+        document["records"][0]["result_digest"] = evidence.canonical_digest(
+            document["records"][0]["result"]
+        )
+        bodies["activation-trace"] = contracts.canonical_json_line(document)
+        digest = contracts.raw_sha256(bodies["activation-trace"])
+        next(row for row in gate["artifacts"] if row["name"] == "activation-trace")[
+            "digest"
+        ] = digest
+        report["instances"][1]["artifacts"][0]["digest"] = digest
+        with pytest.raises(evidence.EvidenceError, match="exact frozen case roster"):
             self._verify(arguments, gate, bodies, report)
 
 

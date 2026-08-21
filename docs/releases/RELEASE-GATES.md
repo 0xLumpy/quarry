@@ -306,6 +306,13 @@ only when one signed H0 instance owns both exact artifacts, encloses the
 collection interval and matches the Python/OS/architecture. The gate remains
 `OPEN` until such candidate-bound H0 evidence is accepted.
 
+`C-ARCHIVE-FETCH` reuses the 25 existing H0 archive, receipt, rollback and
+atomic-activation cases and one H1 local HTTP redirect/download/extract flow.
+The semantic verifier requires the exact frozen node rosters, requires the real
+H1 `curl` capability, assigns the adversarial matrix to H0 and the activation
+trace to H1, and reconciles the H0 subset with `B-HERMETIC-ALL`. The gate
+remains `OPEN` until those candidate-bound signed H0/H1 records are accepted.
+
 #### Fault and recovery matrix
 
 Every fault gate injects failures before, during, and after the relevant commit
