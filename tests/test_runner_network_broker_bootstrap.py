@@ -16,6 +16,12 @@ from quarry_recon.network_policy import PRIVATE_POLICY_ENV
 pytestmark = pytest.mark.offline
 
 
+@pytest.fixture(autouse=True)
+def _do_not_seal_the_pytest_process(monkeypatch):
+    """Unit bootstrap calls must not irreversibly make the pytest parent non-dumpable."""
+    monkeypatch.setattr(runner_worker, "seal_worker_identity", lambda: None)
+
+
 def _request(*, environment=(), tool="fixture", cmd=("/bin/true",)):
     return protocol.normalize_invocation(
         request_id="ab" * 16,
