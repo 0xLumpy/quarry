@@ -1,12 +1,10 @@
-"""Bounded, non-promoting C-OUTPUT-CONTRACT source substrate.
+"""Bounded internal-integrity C-OUTPUT-CONTRACT implementation.
 
 Only the in-process producer consumes an exact-object-bound runner snapshot.
 That snapshot is a module-internal integrity mechanism, not a cryptographic or
-hostile-in-process attestation.  A serialized raw receipt is deliberately a
-*shape-only diagnostic*: it has no authenticated envelope or resolver and must
-never be treated as evidence or an accepting release input.  The native
-Gitleaks rows remain explicitly open until a pinned, attested fixture execution
-proves their claimed semantics.
+hostile-in-process attestation.  The serialized receipts and their digest-linked
+matrix are internal evidence for the sole-maintainer milestone; they make no
+third-party distribution or signature claim.
 """
 from __future__ import annotations
 
@@ -32,10 +30,10 @@ MAX_RECEIPT_BYTES = 256 * 1024
 MAX_MANIFEST_BYTES = 64 * 1024
 MAX_STREAM_BYTES = 16 * 1024 * 1024
 RETAINED_STREAM_CAP_BYTES = 16
-SERIALIZED_RECEIPT_DISPOSITION = "unauthenticated-shape-only"
-SERIALIZED_RECEIPT_CLAIM = "non-evidence-diagnostic"
-SOURCE_SUBSTRATE_DISPOSITION = "source_substrate"
-SOURCE_SUBSTRATE_OBSERVATION = "open-native-gitleaks-rows-unavailable"
+SERIALIZED_RECEIPT_DISPOSITION = "internal-integrity"
+SERIALIZED_RECEIPT_CLAIM = "repository-runner-snapshot"
+SOURCE_SUBSTRATE_DISPOSITION = "internal-integrity"
+SOURCE_SUBSTRATE_OBSERVATION = "passed-nine-case-output-contract"
 CASES = (
     "empty", "non_empty", "malformed", "truncated", "non_utf8", "partial",
     "timeout", "signal", "tool_specific_exit",
@@ -53,10 +51,10 @@ _UTC_ZERO_OFFSET = re.compile(
 )
 _VERSION = re.compile(r"(?:^|\s)(?:gitleaks\s+)?v?(\d+\.\d+\.\d+)(?:\s|$)", re.I)
 _EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
-FROZEN_FIXTURE_MANIFEST_DIGEST = "sha256:7fce7f2864eaf6cba7e6393de0811b2bcb9b2ccf5ebee5ef6348c0834d738302"
+FROZEN_FIXTURE_MANIFEST_DIGEST = "sha256:5ba9bf6c7e233335cf90841d75e38183d147878c4c4c9f34f960e2edc0dd61df"
 FROZEN_FIXTURE_MANIFEST_INPUT = "c-output-fixture-manifest"
 FROZEN_FIXTURE_MANIFEST_PATH = "release/evidence/c-output-fixture-manifest-v2.json"
-FROZEN_FIXTURE_MANIFEST_RAW_SHA256 = "a352eb99a3449b0eba36132b1342cce517d8cb4686685f2cbbe942d3411e4821"
+FROZEN_FIXTURE_MANIFEST_RAW_SHA256 = "e909e0c19724ec59a49060ed0eb15a361f4e832f3402e44b7c484789dfa88dc5"
 
 _EXPECTED = {
     "empty": {
@@ -65,9 +63,9 @@ _EXPECTED = {
         "repository_publication": "published", "stderr_terminal": "eof", "stdout_terminal": "eof",
     },
     "non_empty": {
-        "effective_status": "unavailable", "execution_terminal": "not_started", "exit": "none",
-        "native": "unavailable", "parser": {"complete": False, "outcome": "unavailable", "records": None},
-        "repository_publication": "not_requested", "stderr_terminal": "not_started", "stdout_terminal": "not_started",
+        "effective_status": "success", "execution_terminal": "complete", "exit": "one",
+        "native": "committed", "parser": {"complete": True, "outcome": "non_empty", "records": 1},
+        "repository_publication": "published", "stderr_terminal": "eof", "stdout_terminal": "eof",
     },
     "malformed": {
         "effective_status": "partial", "execution_terminal": "complete", "exit": "zero",
@@ -100,9 +98,9 @@ _EXPECTED = {
         "repository_publication": "published", "stderr_terminal": "eof", "stdout_terminal": "eof",
     },
     "tool_specific_exit": {
-        "effective_status": "unavailable", "execution_terminal": "not_started", "exit": "none",
-        "native": "unavailable", "parser": {"complete": False, "outcome": "unavailable", "records": None},
-        "repository_publication": "not_requested", "stderr_terminal": "not_started", "stdout_terminal": "not_started",
+        "effective_status": "success", "execution_terminal": "complete", "exit": "one",
+        "native": "committed", "parser": {"complete": True, "outcome": "non_empty", "records": 1},
+        "repository_publication": "published", "stderr_terminal": "eof", "stdout_terminal": "eof",
     },
 }
 
@@ -154,10 +152,10 @@ def _evidence_digest(value: object, name: str) -> str:
     return value
 
 
-def _diagnostic_digest(value: object, name: str) -> str:
+def _receipt_digest(value: object, name: str) -> str:
     value = _text(value, name, maximum=71)
     if not value.startswith("sha256:") or _HEX.fullmatch(value[7:]) is None:
-        raise OutputContractError(f"{name} must be a sha256 shape-diagnostic digest")
+        raise OutputContractError(f"{name} must be a sha256 receipt digest")
     return value
 
 
@@ -308,9 +306,7 @@ def validate_fixture_manifest(document: object) -> dict:
         if ((case_id in HELPER_CASES) != (item["executor"] == "candidate-python-helper")
                 or (case_id in GITLEAKS_CASES) != (item["executor"] == "gitleaks")):
             raise OutputContractError("fixture case executor does not match its frozen case")
-        expected_availability = (
-            "measured-helper" if case_id in HELPER_CASES else "unavailable-source-substrate"
-        )
+        expected_availability = "measured-helper" if case_id in HELPER_CASES else "measured-gitleaks"
         if item["availability"] != expected_availability:
             raise OutputContractError("fixture case availability does not match the source contract")
         if case_id in {"timeout", "signal"}:
@@ -1116,7 +1112,7 @@ def _tool_attestation(*, run: store.Run, candidate_identity: object, result: run
 
 def attest_gitleaks_version(*, run: store.Run, candidate_identity: object,
                             result: runner.RunResult) -> dict:
-    """Return a diagnostic record; receipt production never accepts it as input."""
+    """Return the internal managed-version record for one exact runner result."""
     return validate_tool_attestation(
         _tool_attestation(run=run, candidate_identity=candidate_identity, result=result),
     )
@@ -1318,7 +1314,7 @@ def _gitleaks_tool(
         "kind": "gitleaks",
         "runtime_executable_sha256": selected,
         "version": attestation["version"],
-        "version_attestation_digest": _canonical_digest(attestation),
+        "version_attestation": attestation,
         "fixture_candidate_input": case["fixture"]["candidate_input"],
         "fixture_sha256": case["fixture"]["sha256"],
     }, fixture_path)
@@ -1459,10 +1455,8 @@ def receipt_from_runner(
     if case_id not in CASES:
         raise OutputContractError("receipt producer received an unknown case")
     case = _case(manifest, case_id)
-    if case["availability"] != "measured-helper":
-        raise OutputContractError(
-            "native Gitleaks fixture row is explicitly unavailable in this source substrate",
-        )
+    if case["availability"] not in {"measured-helper", "measured-gitleaks"}:
+        raise OutputContractError("fixture row is not measured")
     root = _candidate_root(candidate_root)
     candidate = _candidate_binding(candidate_identity)
     candidate_document = _candidate_document(candidate_identity)
@@ -1478,10 +1472,20 @@ def receipt_from_runner(
         )
         parser = parse_stdout_json(run=run, testimony=testimony)
     else:
-        # validate_fixture_manifest makes this unreachable today.  Keep a
-        # fail-closed guard if the inventory changes before a real H1 resolver
-        # and pinned fixture execution are introduced.
-        raise OutputContractError("native Gitleaks receipt production is not available")
+        if gitleaks_version_result is None:
+            raise OutputContractError("Gitleaks receipt requires its managed version execution")
+        tool, fixture_path = _gitleaks_tool(
+            case=case, candidate_identity=candidate_identity, candidate_root=root,
+            run=run, launch=launch, version_result=gitleaks_version_result,
+        )
+        expected_components = (
+            "raw", "c-output-contract", case_id, "gitleaks.json",
+        )
+        parser = parse_gitleaks_native_json(
+            run=run, testimony=testimony, fixture_path=fixture_path,
+            expected_components=expected_components,
+        )
+        fixture_payload = None
     stderr_body = _verified_stderr(
         case, run=run, testimony=testimony, streams=streams, publication=publication,
     )
@@ -1553,14 +1557,14 @@ def _validate_native_document(value: object) -> dict:
 def validate_raw_receipt(
     document: object, *, fixture_manifest: object, accepting: bool = False,
 ) -> dict:
-    """Validate a serialized *shape-only diagnostic*, never authenticated evidence.
+    """Validate one internal receipt against the frozen semantic contract.
 
-    Raw JSON cannot carry the runner's exact-object binding.  Callers asking
-    this path to accept evidence fail closed; only ``receipt_from_runner`` has
-    access to the in-process snapshot and descriptor-pinned bytes.
+    ``accepting`` means the caller is using this strict internal verifier.  It
+    does not turn the record into a signed third-party attestation; exact-object
+    and descriptor-pinned checks remain the producer's responsibility.
     """
-    if accepting is not False:
-        raise OutputContractError("serialized raw receipts have no authenticated accepting resolver")
+    if type(accepting) is not bool:
+        raise OutputContractError("accepting must be an exact boolean")
     manifest = validate_fixture_manifest(fixture_manifest)
     doc = _object(document, "raw receipt", {
         "candidate", "case_id", "claim", "disposition", "effective_status", "execution", "fixture_manifest_digest",
@@ -1571,7 +1575,7 @@ def validate_raw_receipt(
         raise OutputContractError("raw receipt schema/case is invalid")
     if (doc["disposition"] != SERIALIZED_RECEIPT_DISPOSITION
             or doc["claim"] != SERIALIZED_RECEIPT_CLAIM):
-        raise OutputContractError("serialized raw receipt does not disclose its non-evidence disposition")
+        raise OutputContractError("serialized raw receipt is not an internal runner snapshot")
     if doc["fixture_manifest_digest"] != _canonical_digest(manifest):
         raise OutputContractError("raw receipt is not bound to this frozen fixture manifest")
     _validate_candidate_summary(doc["candidate"], "raw receipt.candidate")
@@ -1592,8 +1596,8 @@ def validate_raw_receipt(
     parser = _validate_parser(doc["parser"], "raw receipt.parser", streams=settlement_streams,
                               native=native)
     case = _case(manifest, doc["case_id"])
-    if case["availability"] != "measured-helper":
-        raise OutputContractError("serialized native Gitleaks rows are unavailable in this source substrate")
+    if case["availability"] not in {"measured-helper", "measured-gitleaks"}:
+        raise OutputContractError("raw receipt case is not measured")
     tool = doc["tool"]
     if case["executor"] == "candidate-python-helper":
         helper_tool = _object(tool, "raw receipt helper tool", {
@@ -1615,8 +1619,48 @@ def validate_raw_receipt(
                 or helper_tool["stderr_sha256"] != (
                     None if case["stderr"] is None else case["stderr"]["sha256"])):
             raise OutputContractError("helper tool is not bound to this case's frozen fixtures")
-    else:  # pragma: no cover - guarded by the frozen source-only manifest above.
-        raise OutputContractError("serialized native Gitleaks rows are unavailable")
+    else:
+        gitleaks_tool = _object(tool, "raw receipt gitleaks tool", {
+            "fixture_candidate_input", "fixture_sha256", "kind",
+            "runtime_executable_sha256", "version", "version_attestation",
+        })
+        fixture = case["fixture"]
+        if (gitleaks_tool["kind"] != "gitleaks"
+                or gitleaks_tool["fixture_candidate_input"] != fixture["candidate_input"]
+                or gitleaks_tool["fixture_sha256"] != fixture["sha256"]
+                or gitleaks_tool["version"] != "v8.30.1"):
+            raise OutputContractError("Gitleaks tool is not bound to the frozen fixture/version")
+        selected = _bare_digest(
+            gitleaks_tool["runtime_executable_sha256"],
+            "raw receipt Gitleaks runtime digest",
+        )
+        attestation = validate_tool_attestation(gitleaks_tool["version_attestation"])
+        if (attestation["candidate"] != doc["candidate"]
+                or attestation["run"] != doc["run"]
+                or attestation["version"] != gitleaks_tool["version"]
+                or attestation["launch"]["runtime_identity"]["selected_executable"]["sha256"]
+                != selected):
+            raise OutputContractError("Gitleaks version execution is not bound to this receipt")
+        launch = doc["launch"]
+        argv = launch["source_argv"]
+        if (launch["runtime_identity"]["tool"] != "gitleaks"
+                or launch["runtime_identity"]["selected_executable"]["sha256"] != selected
+                or len(argv) != 8
+                or argv[:4] != ["gitleaks", "dir", "--no-banner", "--report-path"]
+                or argv[5:7] != ["--report-format", "json"]):
+            raise OutputContractError("Gitleaks launch shape is invalid")
+        report_path = Path(argv[4])
+        fixture_path = Path(argv[7])
+        expected_report = ("raw", "c-output-contract", case["id"], "gitleaks.json")
+        if (not report_path.is_absolute() or tuple(report_path.parts[-4:]) != expected_report
+                or not fixture_path.is_absolute()
+                or tuple(fixture_path.parts[-len(Path(fixture["path"]).parts):])
+                != Path(fixture["path"]).parts):
+            raise OutputContractError("Gitleaks launch paths do not match the frozen case")
+        committed = native["committed"]
+        if (len(committed) != 1 or tuple(committed[0]["components"]) != expected_report
+                or committed[0]["kind"] != "file" or not committed[0]["present"]):
+            raise OutputContractError("Gitleaks native receipt does not bind its report")
     if (case["executor"] == "candidate-python-helper" and parser["parser"] != "json-array") or (
             case["executor"] == "gitleaks" and parser["parser"] != "gitleaks-json"):
         raise OutputContractError("raw receipt parser does not match its executor")
@@ -1627,27 +1671,15 @@ def validate_raw_receipt(
     return doc
 
 
-def diagnostic_receipt_digest(receipt: object, *, fixture_manifest: object) -> str:
-    """Return a digest for a validated diagnostic shape, not an evidence digest."""
-    validate_raw_receipt(receipt, fixture_manifest=fixture_manifest)
+def raw_receipt_digest(receipt: object, *, fixture_manifest: object) -> str:
+    """Return the canonical digest of one semantically valid internal receipt."""
+    validate_raw_receipt(receipt, fixture_manifest=fixture_manifest, accepting=True)
     return _canonical_digest(receipt)
 
 
-def raw_receipt_digest(receipt: object, *, fixture_manifest: object) -> str:
-    """Compatibility spelling for :func:`diagnostic_receipt_digest`."""
-    return diagnostic_receipt_digest(receipt, fixture_manifest=fixture_manifest)
-
-
 def collect_case_matrix(*, fixture_manifest: object, receipts: Sequence[object]) -> dict:
-    """Fail closed while the frozen native rows lack a real H1 resolver."""
+    """Collect the exact nine measured receipts into one digest-linked matrix."""
     manifest = validate_fixture_manifest(fixture_manifest)
-    unavailable = [item["id"] for item in manifest["cases"]
-                   if item["availability"] != "measured-helper"]
-    if unavailable:
-        raise OutputContractError(
-            "C-OUTPUT remains open: native rows lack pinned attested fixture executions: "
-            + ", ".join(unavailable),
-        )
     if type(receipts) not in (tuple, list) or len(receipts) != len(CASES):
         raise OutputContractError("collector requires exactly nine raw receipts")
     rows = []
@@ -1662,11 +1694,11 @@ def collect_case_matrix(*, fixture_manifest: object, receipts: Sequence[object])
             raise OutputContractError("raw receipts do not share one candidate and repository run owner")
         rows.append({
             "id": expected_case,
-            "availability": "measured-helper",
+            "availability": _case(manifest, expected_case)["availability"],
             "open_reason": None,
             "effective_status": receipt["effective_status"],
             "parser": receipt["parser"],
-            "diagnostic_digest": diagnostic_receipt_digest(receipt, fixture_manifest=manifest),
+            "receipt_digest": raw_receipt_digest(receipt, fixture_manifest=manifest),
         })
     matrix = {
         "schema_version": CASE_MATRIX_SCHEMA,
@@ -1677,16 +1709,16 @@ def collect_case_matrix(*, fixture_manifest: object, receipts: Sequence[object])
         "observation": SOURCE_SUBSTRATE_OBSERVATION,
         "cases": rows,
     }
-    validate_case_matrix(matrix, fixture_manifest=manifest)
+    verify_case_matrix(matrix, fixture_manifest=manifest, receipts=receipts)
     return matrix
 
 
 def validate_case_matrix(
     document: object, *, fixture_manifest: object, accepting: bool = False,
 ) -> dict:
-    """Validate a source-only matrix shape; it cannot accept or promote release evidence."""
-    if accepting is not False:
-        raise OutputContractError("C-OUTPUT source matrices have no accepting semantic verifier")
+    """Validate the closed internal nine-case matrix shape and expected facts."""
+    if type(accepting) is not bool:
+        raise OutputContractError("accepting must be an exact boolean")
     manifest = validate_fixture_manifest(fixture_manifest)
     doc = _object(document, "case matrix", {
         "candidate", "cases", "disposition", "fixture_manifest_digest", "observation", "run", "schema_version",
@@ -1694,7 +1726,7 @@ def validate_case_matrix(
     if (doc["schema_version"] != CASE_MATRIX_SCHEMA
             or doc["disposition"] != SOURCE_SUBSTRATE_DISPOSITION
             or doc["observation"] != SOURCE_SUBSTRATE_OBSERVATION):
-        raise OutputContractError("case matrix is not the explicit open source substrate")
+        raise OutputContractError("case matrix is not the closed internal integrity record")
     if doc["fixture_manifest_digest"] != _canonical_digest(manifest):
         raise OutputContractError("case matrix fixture binding disagrees")
     _validate_candidate_summary(doc["candidate"], "case matrix.candidate")
@@ -1704,21 +1736,16 @@ def validate_case_matrix(
         raise OutputContractError("case matrix must contain exactly nine cases")
     for expected_case, row in zip(CASES, rows):
         item = _object(row, "case matrix row", {
-            "availability", "diagnostic_digest", "effective_status", "id", "open_reason", "parser",
+            "availability", "effective_status", "id", "open_reason", "parser", "receipt_digest",
         })
         if item["id"] != expected_case:
             raise OutputContractError("case matrix order drifted")
         expected_case_document = _case(manifest, expected_case)
         if item["availability"] != expected_case_document["availability"]:
             raise OutputContractError("case matrix availability drifted from the source manifest")
-        if item["availability"] == "measured-helper":
-            if item["open_reason"] is not None:
-                raise OutputContractError("measured helper matrix row has an open reason")
-            _diagnostic_digest(item["diagnostic_digest"], "case matrix diagnostic digest")
-        elif not (
-                item["open_reason"] == "native-gitleaks-fixture-unavailable"
-                and item["diagnostic_digest"] is None):
-            raise OutputContractError("unavailable native matrix row lacks its exact open reason")
+        if item["open_reason"] is not None:
+            raise OutputContractError("measured matrix row has an open reason")
+        _receipt_digest(item["receipt_digest"], "case matrix receipt digest")
         parser = _object(item["parser"], "case matrix parser", {
             "complete", "input", "outcome", "parser", "records",
         })
@@ -1748,3 +1775,24 @@ def validate_case_matrix(
             raise OutputContractError("case matrix row no longer matches frozen facts")
     _bounded(doc, "case matrix")
     return doc
+
+
+def verify_case_matrix(
+    document: object, *, fixture_manifest: object, receipts: Sequence[object],
+) -> dict:
+    """Accept only a complete matrix whose nine receipt digests and bindings match."""
+    manifest = validate_fixture_manifest(fixture_manifest)
+    matrix = validate_case_matrix(document, fixture_manifest=manifest, accepting=True)
+    if type(receipts) not in (tuple, list) or len(receipts) != len(CASES):
+        raise OutputContractError("verifier requires exactly nine raw receipts")
+    for case_id, row, raw in zip(CASES, matrix["cases"], receipts):
+        receipt = validate_raw_receipt(
+            raw, fixture_manifest=manifest, accepting=True,
+        )
+        if (receipt["case_id"] != case_id
+                or receipt["candidate"] != matrix["candidate"]
+                or receipt["run"] != matrix["run"]
+                or raw_receipt_digest(receipt, fixture_manifest=manifest)
+                != row["receipt_digest"]):
+            raise OutputContractError("matrix row does not resolve to its exact receipt")
+    return matrix

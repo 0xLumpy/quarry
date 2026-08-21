@@ -1,11 +1,11 @@
-"""Focused non-promoting C-OUTPUT source-contract regressions.
+"""Focused internal-integrity C-OUTPUT contract regressions.
 
 The helper rows below deliberately use the real repository runner and its
 private-stage publication seam.  The low-level supervisor is a faithful test
 builder: it settles the same descriptor claims and artifact proofs as the
 production supervisor, but supplies bytes only from the candidate-bound frozen
 fixtures.  It never fabricates an external record: serialized receipt JSON is
-validated only as an explicitly unauthenticated shape diagnostic.
+validated as internal receipts without a third-party attestation claim.
 """
 from __future__ import annotations
 
@@ -361,7 +361,7 @@ def test_faithful_repository_fixture_builder_produces_all_helper_receipts(tmp_pa
         validator = Draft202012Validator(raw_schema)
         for receipt in receipts:
             assert list(validator.iter_errors(receipt)) == []
-    with pytest.raises(contract.OutputContractError, match="C-OUTPUT remains open"):
+    with pytest.raises(contract.OutputContractError, match="exactly nine"):
         contract.collect_case_matrix(fixture_manifest=manifest, receipts=receipts)
     assert runner.repository_execution_testimony(results["partial"], repository=run)[
         "execution_settlement"
@@ -372,7 +372,7 @@ def test_faithful_repository_fixture_builder_produces_all_helper_receipts(tmp_pa
 @pytest.mark.requires_tool("git")
 @pytest.mark.skipif(GIT is None, reason="Git is required")
 def test_serialized_shape_schema_and_manual_reject_stream_and_case_mutations(tmp_path, monkeypatch):
-    """Raw JSON is strict diagnostic shape only, including frozen stream facts."""
+    """Internal receipt JSON is strict, including frozen stream facts."""
     Draft202012Validator = pytest.importorskip("jsonschema").Draft202012Validator
     manifest = _manifest()
     root, identity = _candidate_repository(tmp_path, manifest)
@@ -406,8 +406,9 @@ def test_serialized_shape_schema_and_manual_reject_stream_and_case_mutations(tmp
         with pytest.raises(contract.OutputContractError):
             contract.validate_raw_receipt(document, fixture_manifest=manifest)
 
-    with pytest.raises(contract.OutputContractError, match="no authenticated accepting resolver"):
-        contract.validate_raw_receipt(truncated, fixture_manifest=manifest, accepting=True)
+    assert contract.validate_raw_receipt(
+        truncated, fixture_manifest=manifest, accepting=True,
+    ) == truncated
 
     old_capped = copy.deepcopy(truncated)
     mutate_stream(old_capped, 1, retained_bytes=1, retained_sha256=_digest(b"["))
@@ -596,20 +597,19 @@ def test_helper_receipt_rejects_an_admitted_argv_that_misstates_fixture_encoding
 
 
 @pytest.mark.offline
-def test_native_gitleaks_rows_are_explicitly_open_and_cannot_produce_receipts():
-    """AKIA-looking fixture text is not treated as a verified native finding."""
+def test_native_gitleaks_rows_require_measured_finding_receipts():
     manifest = _manifest()
     for case_id in ("non_empty", "tool_specific_exit"):
         case = next(item for item in manifest["cases"] if item["id"] == case_id)
-        assert case["availability"] == "unavailable-source-substrate"
+        assert case["availability"] == "measured-gitleaks"
         assert case["expected"] == {
-            "effective_status": "unavailable", "execution_terminal": "not_started", "exit": "none",
-            "native": "unavailable",
-            "parser": {"complete": False, "outcome": "unavailable", "records": None},
-            "repository_publication": "not_requested", "stderr_terminal": "not_started",
-            "stdout_terminal": "not_started",
+            "effective_status": "success", "execution_terminal": "complete", "exit": "one",
+            "native": "committed",
+            "parser": {"complete": True, "outcome": "non_empty", "records": 1},
+            "repository_publication": "published", "stderr_terminal": "eof",
+            "stdout_terminal": "eof",
         }
-        with pytest.raises(contract.OutputContractError, match="explicitly unavailable"):
+        with pytest.raises(contract.OutputContractError):
             contract.receipt_from_runner(
                 fixture_manifest=manifest, case_id=case_id, run=None, candidate_identity=None,
                 candidate_root=".", result=None,
@@ -638,7 +638,7 @@ def test_v2_schemas_are_syntactically_strict_about_the_frozen_manifest():
     with pytest.raises(contract.OutputContractError, match="retained stream cap"):
         contract.validate_fixture_manifest(wrong_cap)
     false_native_claim = copy.deepcopy(manifest)
-    false_native_claim["cases"][1]["expected"]["effective_status"] = "success"
+    false_native_claim["cases"][1]["expected"]["effective_status"] = "unavailable"
     assert list(validator.iter_errors(false_native_claim))
     with pytest.raises(contract.OutputContractError):
         contract.validate_fixture_manifest(false_native_claim)
@@ -666,12 +666,11 @@ def test_case_matrix_schema_and_manual_parser_shape_are_in_parity():
         "cases": [],
     }
     for case in manifest["cases"]:
-        measured = case["availability"] == "measured-helper"
         matrix["cases"].append({
             "id": case["id"],
             "availability": case["availability"],
-            "diagnostic_digest": digest if measured else None,
-            "open_reason": None if measured else "native-gitleaks-fixture-unavailable",
+            "receipt_digest": digest,
+            "open_reason": None,
             "effective_status": case["expected"]["effective_status"],
             "parser": {
                 "complete": case["expected"]["parser"]["complete"],
