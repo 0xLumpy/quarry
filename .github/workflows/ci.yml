@@ -155,7 +155,8 @@ jobs:
             (
               cd "$build_root"
               python -m build --sdist --wheel --outdir dist
-            ) >"$RUNNER_TEMP/quarry-build-$build_name.log" 2>&1
+            ) 2>&1 | sed -E '/^(copying|adding|creating|removing) /d' \
+              >"$RUNNER_TEMP/quarry-build-$build_name.log"
             test -s "$RUNNER_TEMP/quarry-build-$build_name.log"
             test "$(wc -c < "$RUNNER_TEMP/quarry-build-$build_name.log")" -le 65536
             git -C "$build_root" diff --exit-code
