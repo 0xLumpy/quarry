@@ -423,5 +423,4 @@ def test_every_ci_job_declares_one_primary_lane_and_h0_selects_positively():
     for lane, arguments in pytest_commands:
         if lane == "H0-hermetic":
             pytest_arguments = arguments[arguments.index("pytest") + 1:]
-            assert pytest_arguments[pytest_arguments.index("-m") + 1] == "offline"
-            assert "--quarry-taxonomy-manifest" in pytest_arguments
+            assert pytest_arguments == ["-m", "offline"]
