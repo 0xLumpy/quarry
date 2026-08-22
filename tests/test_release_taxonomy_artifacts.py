@@ -21,6 +21,7 @@ pytestmark = pytest.mark.offline
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW_PATH = ".github/workflows/ci.yml"
+WORKFLOW_BODY_PATH = "release/evidence/dormant-ci-workflow-v1.yml"
 
 
 def _taxonomy_bytes() -> bytes:
@@ -43,7 +44,7 @@ def _taxonomy_document() -> dict:
 
 
 def _workflow_body() -> bytes:
-    return (ROOT / WORKFLOW_PATH).read_bytes()
+    return (ROOT / WORKFLOW_BODY_PATH).read_bytes()
 
 
 def _job_map_body() -> bytes:
@@ -593,12 +594,13 @@ class TestCommittedWorkflowParity:
         with pytest.raises(AssertionError):
             _assert_exact_workflow_inventory(document, tmp_path)
 
-    def test_job_map_covers_each_current_job_matrix_instance_and_lane(self):
-        # Production deliberately binds raw bytes only. This static parity
-        # boundary owns YAML interpretation and rejects duplicate YAML keys.
+    def test_job_map_covers_each_frozen_evidence_job_matrix_instance_and_lane(self):
+        # The distribution-attestation topology is dormant and retains its
+        # exact formerly bound workflow bytes outside GitHub's workflow path.
+        # This static parity boundary still rejects a false frozen job map.
         provisional = evidence.load_json_bytes(_job_map_body()[:-1])
         workflow_paths = _assert_exact_workflow_inventory(provisional, ROOT)
-        workflow_bodies = {path: (ROOT / path).read_bytes() for path in workflow_paths}
+        workflow_bodies = {path: _workflow_body() for path in workflow_paths}
         document = evidence.read_verification_job_map(
             _job_map_body(),
             workflow_bodies=workflow_bodies,

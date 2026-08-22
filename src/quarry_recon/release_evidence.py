@@ -109,7 +109,7 @@ FUTURE_RUNNER_INPUTS = {
     "security-exceptions": "release/evidence/security-exceptions-v1.json",
     "verification-job-map": VERIFICATION_JOB_MAP_PATH,
     "verification-job-map-schema": VERIFICATION_JOB_MAP_SCHEMA_PATH,
-    "verification-workflow-ci": ".github/workflows/ci.yml",
+    "verification-workflow-ci": "release/evidence/dormant-ci-workflow-v1.yml",
 }
 
 GATE_STATUSES = frozenset({"pass", "fail", "open", "blocked", "not_applicable"})

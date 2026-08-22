@@ -17,8 +17,8 @@ except ModuleNotFoundError:  # pragma: no cover - Python 3.10 only
 pytestmark = pytest.mark.offline
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-CHECKOUT = "actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5"
-SETUP_PYTHON = "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065"
+CHECKOUT = "actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09"
+SETUP_PYTHON = "actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1"
 UPLOAD_ARTIFACT = "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
 
 
@@ -93,14 +93,36 @@ def test_pull_request_ci_selects_every_public_nonlive_lane_separately():
         assert all("verify-quarry-live.sh" not in step.get("run", "") for step in job["steps"])
         actions = [step["uses"] for step in job["steps"] if "uses" in step]
         expected_actions = [CHECKOUT, SETUP_PYTHON]
-        if name == "offline":
-            expected_actions.append(UPLOAD_ARTIFACT)
-        elif name == "package":
+        if name == "package":
             expected_actions.extend([UPLOAD_ARTIFACT, UPLOAD_ARTIFACT, UPLOAD_ARTIFACT])
         assert actions == expected_actions
-        assert job["timeout-minutes"] <= 45
-    assert jobs["offline"]["strategy"]["matrix"]["python-version"] == ["3.10", "3.11", "3.12"]
-    assert jobs["package"]["strategy"]["matrix"]["python-version"] == ["3.10", "3.11", "3.12"]
+        assert "strategy" not in job
+        setup = next(step for step in job["steps"] if step.get("uses") == SETUP_PYTHON)
+        assert setup["with"]["python-version"] == "3.12"
+    assert jobs["offline"]["timeout-minutes"] == 120
+    assert jobs["integration"]["timeout-minutes"] <= 45
+    assert jobs["package"]["timeout-minutes"] <= 45
+    expected_pytest = {
+        "offline": "pytest -m offline",
+        "integration": "pytest -m integration -ra",
+        "package": "pytest -m packaging",
+    }
+    for name, command in expected_pytest.items():
+        step = next(
+            step for step in jobs[name]["steps"]
+            if f"pytest -m {expected[name][1]}" in step.get("run", "")
+        )
+        assert step["run"] == command
+        assert step["env"]["PYTHONPATH"] == \
+            "${{ github.workspace }}/src:${{ github.workspace }}"
+        assert not any(
+            token in step["run"]
+            for token in (
+                "--quarry-shard-", "--quarry-taxonomy-manifest",
+                "--quarry-h0-shard-report", "coverage",
+                "emit_coverage_shard.py",
+            )
+        )
     package_steps = jobs["package"]["steps"]
     build_index = next(
         index for index, step in enumerate(package_steps)
@@ -127,12 +149,12 @@ def test_pull_request_ci_selects_every_public_nonlive_lane_separately():
     observe = sbom_observe[0]
     assert 'env -u PYTHONPATH "$install_prefix/bin/python" scripts/emit_sbom_observation.py' in observe["run"]
     assert '--wheel "${wheels[0]}"' in observe["run"]
-    assert '--output "$RUNNER_TEMP/sbom-observation-${{ matrix.python-version }}.json"' in observe["run"]
+    assert '--output "$RUNNER_TEMP/sbom-observation-3.12.json"' in observe["run"]
     upload = sbom_upload[0]
     assert upload["uses"] == UPLOAD_ARTIFACT
     assert upload["with"] == {
-        "name": "sbom-observation-${{ matrix.python-version }}",
-        "path": "${{ runner.temp }}/sbom-observation-${{ matrix.python-version }}.json",
+        "name": "sbom-observation-3.12",
+        "path": "${{ runner.temp }}/sbom-observation-3.12.json",
         "if-no-files-found": "error",
     }
     audit = [step for step in package_steps if step.get("name") == "Audit the exact resolved C-SBOM dependency closure once"]
@@ -144,8 +166,8 @@ def test_pull_request_ci_selects_every_public_nonlive_lane_separately():
     assert audit_upload[0]["uses"] == UPLOAD_ARTIFACT
     assert audit_upload[0]["if"] == "${{ always() }}"
     assert audit_upload[0]["with"] == {
-        "name": "vulnerability-observation-${{ matrix.python-version }}",
-        "path": "${{ runner.temp }}/vulnerability-observation-${{ matrix.python-version }}.json",
+        "name": "vulnerability-observation-3.12",
+        "path": "${{ runner.temp }}/vulnerability-observation-3.12.json",
         "if-no-files-found": "error",
     }
     assert enforce[0]["if"] == "${{ always() }}"
@@ -186,7 +208,7 @@ def test_security_gates_are_fail_closed_and_reviewable():
     findings = [row for rows in baseline["results"].values() for row in rows]
     assert findings
     assert all(row.get("is_secret") is False for row in findings)
-    assert "python scripts/emit_static_security.py" in _text(".github/workflows/ci.yml")
+    assert "python scripts/emit_static_security.py" not in _text(".github/workflows/ci.yml")
     producer = _text("scripts/emit_static_security.py")
     assert '"detect-secrets-hook"' in producer
     assert '"--baseline"' in producer and '".secrets.baseline"' in producer

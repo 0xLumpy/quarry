@@ -45,7 +45,9 @@ def _context() -> tuple[dict, dict[str, bytes], dict]:
         "verification-job-map": (
             ROOT / "release/evidence/verification-job-map-v1.json"
         ).read_bytes(),
-        "verification-workflow-ci": (ROOT / ".github/workflows/ci.yml").read_bytes(),
+        "verification-workflow-ci": (
+            ROOT / "release/evidence/dormant-ci-workflow-v1.yml"
+        ).read_bytes(),
     }
     scope = {
         "input_bindings": [
@@ -62,7 +64,10 @@ def _context() -> tuple[dict, dict[str, bytes], dict]:
                     "verification-job-map",
                     "release/evidence/verification-job-map-v1.json",
                 ),
-                ("verification-workflow-ci", ".github/workflows/ci.yml"),
+                (
+                    "verification-workflow-ci",
+                    "release/evidence/dormant-ci-workflow-v1.yml",
+                ),
             )
         ]
     }
