@@ -108,6 +108,7 @@ def test_wildcard_guard_uses_bound_dns_and_keeps_its_source_trace(monkeypatch, t
         run=run, profile=SimpleNamespace(block_private_targets=False, http_rl=0),
         scope=SimpleNamespace(passive_only=False), echo=lambda _line: None,
     )
+    monkeypatch.setattr(vertical, "have", lambda tool: tool == "httpx")
     monkeypatch.setattr(socket, "getaddrinfo",
                         lambda *_a, **_k: pytest.fail("ambient getaddrinfo reached"))
     monkeypatch.setattr(network_dns, "resolve", _resolver(("192.0.2.10",)))
