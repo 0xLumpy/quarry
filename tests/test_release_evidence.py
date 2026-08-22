@@ -49,7 +49,7 @@ def _schema(name: str) -> bytes:
     })
 
 
-def _tracked_bodies(*, pyproject_version: str = "0.3.9", runtime_version: str = "0.3.9") -> dict[str, bytes]:
+def _tracked_bodies(*, pyproject_version: str = "0.3.10", runtime_version: str = "0.3.10") -> dict[str, bytes]:
     bodies = {
         "pyproject.toml": f'[project]\nname = "quarry-recon"\nversion = "{pyproject_version}"\n'.encode(),
         "src/quarry_recon/__init__.py": f'__version__ = "{runtime_version}"\n'.encode(),
@@ -359,7 +359,7 @@ class TestCandidateCollection:
         assert first["git_commit"] == fake.COMMIT
         assert first["git_tree"] == fake.TREE
         assert first["dirty"] is False
-        assert first["package_version"] == "0.3.9"
+        assert first["package_version"] == "0.3.10"
         assert first["schema_versions"] == evidence.SCHEMA_VERSIONS
         assert first["submodules"] == []
         assert str(tmp_path).encode() not in evidence.canonical_json_bytes(first)

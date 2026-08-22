@@ -43,11 +43,11 @@ block is not checked. The provider is the final authority; Quarry never blocks a
 ## What is redacted, and what is not
 
 `redact()` attempts to mask only **Quarry's own configured** secrets (the values above, length ≥ 6) in
-recorded or sent text such as manifests, display commands, notes, events, and notifications. In `v0.3.9`
-it performs literal replacement: encoded, transformed, split, or overlapping representations are not a
-proven confidentiality boundary, and a coincidental substring can alter benign telemetry. Treat it as
-defense in depth. The pending integrity contract requires typed per-tool credential delivery and exclusion
-from recordable values by construction.
+recorded or sent text such as manifests, display commands, notes, events, and notifications. It performs
+literal replacement: encoded, transformed, split, or overlapping representations are not a proven
+confidentiality boundary, and a coincidental substring can alter benign telemetry. Treat it as defense in
+depth. In `v0.3.10`, typed per-tool credential delivery keeps configured secrets out of recordable values
+by construction at the execution boundary.
 
 The function does **not** mask non-secret fields such as `censys.org`, `telegram.chat_id`, and
 `oob.callback_server`; those are identifiers and stay readable.
@@ -55,8 +55,9 @@ The function does **not** mask non-secret fields such as `censys.org`, `telegram
 A **discovered** secret — one a scanner finds on the target — is different: it is evidence and is intended
 to remain **whole** on its entity and in every full-fidelity private artifact. A short `preview` and a
 `fingerprint` may sit beside it for recognition and deduplication, but they do not replace the value.
-`v0.3.9` still has report paths where literal configured-secret masking or lossy rendering violates that
-rule; those are release defects, not a reason to destructively redact the evidence.
+In `v0.3.10`, private report rendering preserves each discovered-secret observation and its material and
+artifact digests; reconciliation fails closed instead of silently dropping a row. Literal masking of the
+operator's configured secrets remains defense in depth, not a reason to redact discovered evidence.
 
 ## Reserved
 

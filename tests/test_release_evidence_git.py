@@ -60,7 +60,7 @@ def test_real_git_candidate_is_repeatable_and_ignored_notes_stay_outside_evidenc
     assert first["git_commit"] == _git(repository, "rev-parse", "HEAD")
     assert first["git_tree"] == _git(repository, "rev-parse", "HEAD^{tree}")
     assert first["dirty"] is False
-    assert first["package_version"] == "0.3.9"
+    assert first["package_version"] == "0.3.10"
     assert os.fspath(repository).encode() not in evidence.canonical_json_bytes(first)
 
     with (repository / ".git" / "info" / "exclude").open("a", encoding="utf-8") as stream:

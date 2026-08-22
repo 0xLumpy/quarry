@@ -2,15 +2,16 @@
 
 ## Applicability
 
-The signing, detached-approval, tag and publication procedure below is dormant
+The signing, detached-approval and publication procedure below is dormant
 for the unpublished `v0.3.10` internal-integrity milestone. It becomes required
 when Quarry is published to an external package index, gains a second
-maintainer, or is operated as a service. For `v0.3.10`, the package remains
-version `0.3.9`; acceptance means the scoped integrity invariants pass on the
+maintainer, or is operated as a service. For `v0.3.10`, acceptance means the
+scoped integrity invariants pass on the
 maintainer's actual local and Linux CI environments and the maintainer records
-an unsigned sign-off in the release ledger. No production trust policy, signed
-tag, detached approval, CI image attestation, or publication receipt is a
-milestone prerequisite.
+an unsigned sign-off in the release ledger. The `v0.3.10` tag is a personal
+bookmark whose tag-triggered CI confirms the signed-off tree; it is not a
+signed distribution attestation. No production trust policy, detached approval,
+CI image attestation, or publication receipt is a milestone prerequisite.
 
 This applicability rule does not relax observation provenance, immutable
 sealed-run evidence, content-digest verification, reproducibility, or the

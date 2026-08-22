@@ -7,8 +7,8 @@ fingerprinting, crawling, JS analysis, content discovery and parameter scanning 
 and 67 sources, into one structured JSONL store you can grep, export and hand to a human.
 
 It is built for long runs on real targets. Typed tool outcomes, explicit coverage, durable evidence and
-honest remainder are core contracts. `v0.3.9` does not yet enforce those contracts uniformly across every
-lane; the pending integrity release tracks the gaps instead of presenting them as complete.
+honest remainder are core contracts. `v0.3.10` closes the foundational execution, repository, policy and
+report-truth integrity gaps tracked by the internal milestone.
 
 > [!IMPORTANT]
 > Quarry performs active network and application testing by default. Use it only on systems you are
@@ -29,10 +29,10 @@ Quarry is under active development. Commands, schemas, and report formats may st
 - **Ranked output** — inertly encoded HOTLIST for humans, `digest.json` queues, and a lossless
   `private-report.json` projection with stable observation/artifact references
 - **Version-managed installs** — registry tools declare a version, ref or digest (`nmap` is
-  distro-managed by policy); complete activation rollback and runtime-identity enforcement remain
-  release gates
+  distro-managed by policy); activation rolls back atomically and runtime launch is bound to the
+  verified managed identity
 - **Scope model** — engagement matchers separate authorized contact from passive candidates; uniform
-  connect-time protected-destination enforcement remains a release gate
+  connect-time policy withholds scanner-self, metadata and unrelated control-plane destinations
 - **Cost control** — paid sources have credit reserves and per-project evidence reuse
 
 ## Requirements
@@ -40,7 +40,7 @@ Quarry is under active development. Commands, schemas, and report formats may st
 Run Quarry on a VPS. Reconnaissance runs can be long, and high-volume DNS traffic may be throttled
 or blocked on residential connections.
 
-Python 3.10–3.12, `sudo` for system packages, and outbound internet access.
+Python 3.12, `sudo` for system packages, and outbound internet access.
 
 | | Minimum | Recommended |
 |---|---|---|
@@ -160,12 +160,10 @@ shosubgo), and CertSpotter and ProjectDiscovery tools run without their optional
 | `notify` | run notifications (Slack/Discord/Telegram/webhook) |
 | `oob` | out-of-band callback server (defaults to the public interactsh pool) |
 
-Quarry masks exact configured key values in its recorded text as defense in depth. In `v0.3.9` this is
-literal replacement, not a guarantee for encoded, transformed, or split representations. The pending
-integrity release tracks the stronger boundary: each child receives only its declared credentials, and
-Quarry-owned credentials are excluded by construction from manifests, logs, reports, and recorded
-commands. Target-discovered secrets are evidence and **must** remain complete in private output; current
-lossy paths are tracked as release defects rather than documented as acceptable redaction.
+Quarry masks exact configured key values in its recorded text as defense in depth. Each child receives
+only its declared credentials, and Quarry-owned credentials are excluded by construction from manifests,
+logs, reports, and recorded commands. Target-discovered secrets are evidence and **must** remain complete
+in private output.
 
 ## Phases
 
@@ -220,8 +218,9 @@ The output contract requires target evidence and private operator reports to be 
 discovered secret you cannot read is not useful evidence. Quarry-owned API/provider, notification and OOB
 credentials are operational inputs, not evidence, and must not enter operational records. A normal private
 report is not a share-safe or AI-safe export: those surfaces require separately requested, policy-labelled
-derived views and never replace canonical evidence. `v0.3.9` still has open implementation gaps against
-these boundaries, recorded in the [current-HEAD audit](docs/audit/CURRENT-HEAD.md#head-08-truthful-lossless-private-reports-and-complete-provenance).
+derived views and never replace canonical evidence. `v0.3.10` enforces this private-report truth boundary;
+the historical failure analysis remains in the
+[audit baseline](docs/audit/CURRENT-HEAD.md#head-08-truthful-lossless-private-reports-and-complete-provenance).
 Separately, single oversized bodies are not kept: JS above 15 MB and sourcemaps above 20 MB are skipped and
 counted as an omission. See [outputs and coverage](docs/outputs-and-coverage.md).
 
@@ -260,8 +259,8 @@ counted as an omission. See [outputs and coverage](docs/outputs-and-coverage.md)
 
 Migrated tool lanes classify execution as `success`, `empty`, `partial`, `blocked`, `timed-out`, `failed`
 or `skipped`. Instrumented coverage distinguishes zero observations from missing credentials, bad
-resolvers, target/tool blocking, limits and timeouts. `v0.3.9` still has silent or lossy paths, so these are
-not yet universal guarantees; see the [current audit](docs/audit/CURRENT-HEAD.md).
+resolvers, target/tool blocking, limits and timeouts. The v0.3.10 integrity milestone makes settlement
+and evidence-loss outcomes fail closed; see the [release ledger](docs/releases/v0.3.10.md).
 
 Instrumented bounded lanes in vertical, probe, crawl, content, params and enrich also
 report coverage: how much input they were eligible for, how much they tested, and what they omitted
@@ -288,9 +287,9 @@ profile before execution.
 - Scope is `APEX_DOMAINS` plus any `CIDR` you configure. Related hosts found on owned
   infrastructure are recorded as review candidates, never scanned as new roots.
 - The scope matcher withholds out-of-scope hostnames from planned active work while retaining passive
-  observations. Uniform enforcement by the actual connected peer is an open integrity gate.
-- Scanner-self, loopback, link-local and cloud-metadata destinations are protected by policy. `v0.3.9`
-  does not yet prove that exclusion at connect time across rebinding, proxy, direct-IP and CIDR paths.
+  observations. The same policy is enforced against the actual connected peer.
+- Scanner-self, loopback, link-local and cloud-metadata destinations are protected at connect time
+  across hostname, redirect, proxy, direct-IP and CIDR paths.
 - In-scope names that resolve to private, CGNAT or ULA addresses **are** contacted by default.
   Set `MODES.BLOCK_PRIVATE_TARGETS: true` when the engagement or your scan location requires
   otherwise.
@@ -327,8 +326,8 @@ uncorrelated unless they carry a Quarry-issued token.
 ## Documentation
 
 - [docs/governance/PRODUCT-CONTRACT.md](docs/governance/PRODUCT-CONTRACT.md) — current product and evidence invariants
-- [docs/audit/CURRENT-HEAD.md](docs/audit/CURRENT-HEAD.md) — audited current-HEAD closure and open blockers
-- [docs/releases/v0.3.10.md](docs/releases/v0.3.10.md) — stabilization scope and status
+- [docs/audit/CURRENT-HEAD.md](docs/audit/CURRENT-HEAD.md) — retained historical audit baseline
+- [docs/releases/v0.3.10.md](docs/releases/v0.3.10.md) — completed stabilization scope and evidence
 - [docs/releases/RELEASE-GATES.md](docs/releases/RELEASE-GATES.md) — release evidence and promotion contract
 - [docs/target-prep.md](docs/target-prep.md) — building a target profile
 - [docs/example.md](docs/example.md) — a full run, command by command
@@ -353,17 +352,16 @@ QUARRY_LIVE_APPROVED=1 RANGE_APEX=fixture.example bash scripts/verify-quarry-liv
 Every collected pytest node must carry exactly one primary marker: `offline`, `integration`, `corpus`,
 `packaging`, or `live`. `requires_tool("name")` is a named H1/P0 capability, not a selectable safety lane;
 `synthetic_process` is a constrained H0-only exception for a controlled current-interpreter child. The
-default development runs select H0 positively; CI separately selects H0, H1, and P0 and never selects
-the live lane. The H0 Python deny hooks are development tripwires, not the OS containment or
-candidate-bound evidence required by the still-open
-[release gates](docs/releases/RELEASE-GATES.md). A separate Linux runner now produces an exact-candidate,
-bubblewrap-isolated collect-only development diagnostic; its host runtime is untrusted and it emits no
-release-gate record. See [tests/README.md](tests/README.md) for exact counts, commands, and limitations.
+default development runs select H0 positively; pre-release CI separately selects H0, H1, and P0 and
+never selects the live lane. The H0 Python deny hooks are development tripwires; the dormant external
+distribution evidence machinery is documented separately in
+[release gates](docs/releases/RELEASE-GATES.md). See [tests/README.md](tests/README.md) for exact counts,
+commands, and limitations.
 
 ## Status
 
-`v0.3.9`. The nine phases and the store layout have been in place since v0.2; v0.3 added coverage
-accounting, resumable scheduling, provider cost control and pinned installs. The next release is the
-foundational v0.3.10 integrity/truth stabilization; its current promotion status is tracked in the
-[release register](docs/releases/v0.3.10.md). A query layer follows that stabilization rather than serving
+`v0.3.10`. The nine phases and the store layout have been in place since v0.2; v0.3 added coverage
+accounting, resumable scheduling, provider cost control and pinned installs. The v0.3.10 internal
+integrity/truth milestone is complete; its evidence and accepted limitations are recorded in the
+[release ledger](docs/releases/v0.3.10.md). A query layer follows that stabilization rather than serving
 as its substitute.

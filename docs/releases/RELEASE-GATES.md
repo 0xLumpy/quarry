@@ -4,13 +4,15 @@
 
 `v0.3.10` is an unpublished internal-integrity milestone for its sole
 maintainer and user. Production signing keys, signature thresholds and roles,
-key validity or rotation, detached multiparty approval, signed tags,
+key validity or rotation, detached multiparty approval, signed distribution tags,
 publication receipts, and CI-VM image attestation are
 `not_applicable_until_publish`. They become required when Quarry is published,
-has a second maintainer, or is operated as a service. The package remains
-version `0.3.9`; the milestone identity is its clean commit/tree plus frozen
+has a second maintainer, or is operated as a service. The package version is
+`0.3.10`; the milestone identity is its clean commit/tree plus frozen
 scope, inputs, managed tool receipts, and observed local/Linux-CI environment.
 The maintainer's ledger sign-off is deliberately not a cryptographic signature.
+The `v0.3.10` tag is a personal bookmark and its tag-triggered CI is the final
+confirmation gate, not a distribution attestation.
 
 This disposition does not weaken Quarry-native evidence: exact observation and
 tool provenance, canonical content digests, sealed-run immutability,
@@ -18,21 +20,11 @@ reproducibility, fault behavior, and output contracts remain required. The
 public-distribution lifecycle later in this document is retained as dormant
 design, not as a `v0.3.10` ship blocker.
 
-Status: Phase 0 gate contract. It defines the evidence required to promote a
-release; it does not assert that all required runners, thresholds, schemas, or
-evidence collectors already exist.
-
-The current `offline-ci` workflow and historical local test runs are useful
-observations, but they do not yet satisfy this contract. Pytest rejects any node
-without exactly one primary lane and the CI job positively selects the complete
-structural `H0` classification, but the CI deny guard is not OS containment.
-The separate Linux development runner can now bind an exact candidate, job map
-and isolation profile while collecting H0 behind bubblewrap, but it is
-deliberately non-authoritative and uses an untrusted host runtime. No accepted
-candidate-bound gate record exists. Several professional toolchain gates are
-also not configured, and `verify-quarry.sh` treats unavailable live
-prerequisites as `SKIP`. Quarry therefore begins Phase 0 with the aggregate
-release status **open**, not green.
+Status: the v0.3.10 internal-integrity obligations are closed by the release
+ledger's content-bound results, GitHub run #63, and maintainer sign-off. The
+machine aggregate, detached signatures and publication lifecycle defined below
+remain a dormant future-distribution contract; their `open` vocabulary is
+`N/A UNTIL PUBLISH` for v0.3.10 and cannot reopen the internal milestone.
 
 ## Principles
 
@@ -59,9 +51,10 @@ release status **open**, not green.
   from a configured runner that records identity, isolation, inputs, results,
   and artifacts.
 
-## Result vocabulary and aggregation
+## Dormant publication result vocabulary and aggregation
 
-The contract universe has 64 obligations. The accepted corpus manifest selects
+This section is dormant and `N/A UNTIL PUBLISH` for v0.3.10. For a future
+external distribution, the contract universe has 64 obligations. The accepted corpus manifest selects
 `S`, a subset of the seven `C-CORPUS-*` gates, so a candidate scope contains
 `57 + |S|` obligations and `55 + |S|` pre-aggregate record slots. Each
 scope-selected obligation has exactly one status. `E-AGGREGATE` is the
@@ -143,8 +136,8 @@ summary has raw-file SHA-256 `9e52b4761325961ca7bbed8d60f2d1c4163163100cee3be61e
 This is an exact structural and isolation observation, not a release record. The package is non-nominated
 `0.3.9`; the mounted development-host `/usr` runtime is untrusted, its executable dependency closure is
 incomplete, and the runner executes no tests. The summary declares `authority: none`,
-`promotion_eligible: false`, and `A-TAXONOMY` `open`. No evidence slot is populated; `A-TAXONOMY` remains
-`open`, and `RG00` remains `OPEN`.
+`promotion_eligible: false`, and `A-TAXONOMY` `open`. No evidence slot is populated. Those are historical
+dormant-publication values and do not override the v0.3.10 internal closure recorded above.
 
 ### Isolation requirements
 
@@ -189,11 +182,11 @@ record contains the pre-approved `not_applicable` rationale.
 
 ## Gate phases
 
-### Phase A: contract and prerequisite closure
+### Phase A: dormant publication contract and prerequisite closure
 
-These gates make subsequent results interpretable. They must close before a
-nominated commit can be accepted as the release candidate. Creating a
-nomination commit is not promotion and closes none of these gates.
+These gates describe a future external-distribution nomination. Their Phase 0
+statuses below are dormant and `N/A UNTIL PUBLISH` for v0.3.10; they do not
+override its internal evidence and maintainer sign-off.
 
 | Gate | Requirement | Evidence | Phase 0 status |
 |---|---|---|---|
@@ -201,12 +194,14 @@ nomination commit is not promotion and closes none of these gates.
 | `A-TAXONOMY` | Every test/job maps to exactly one primary lane; incompatible markers and unmarked tests fail collection | Classification manifest plus collected/selected/deselected counts | `open` — exact-one enforcement, the formal job map and a candidate-bound collect-only diagnostic exist, but no accepted nominated-candidate classification gate record exists |
 | `A-EVIDENCE-SCHEMA` | Gate records validate against a versioned schema and the aggregator conforms deterministically to the committed fixed conformance manifest | The candidate-independent manifest plus a candidate-bound report that binds its exact test source/node, paired positive aggregate digests, normalized refusal digests, and gate-evidence counts; this is not the candidate release aggregate | `open` — the v1 manifest/report schema and semantic reconciliation exist, but an accepted nominated-candidate report has not been collected |
 | `A-CORPUS` | The selected corpus has a frozen synthetic fixture identity and a candidate-independent disclosure attestation; private aliases/two-pass attestations are required only when a private source is selected | Public fixture and disclosure-attestation digests; private attestations remain private | `open` — A/C semantic reconciliation exists, but the accepted fixture and attestation digests are not populated |
-| `A-THRESHOLDS` | Versioned correctness, quality, resource, and regression thresholds exist for the release scope | Reviewed threshold manifest | `open` — numeric performance/coverage baselines are not yet accepted |
-| `A-SUPPORT` | Supported OS, architecture, Python, and tool/template matrices are finite and versioned | Support matrix digest | `open` — package metadata alone is not a finite tested matrix |
+| `A-THRESHOLDS` | Versioned correctness, quality, resource, and regression thresholds exist for the release scope | Reviewed threshold manifest | `N/A UNTIL PUBLISH` — the manifest remains dormant; the v0.3.10 internal rule blocks hangs, overspend, evidence loss/corruption/omission, leaked execution state and silent starvation, while latency, throughput, RSS, disk use and artifact size are record-only with no hard limits |
+| `A-SUPPORT` | Supported OS, architecture, Python, and tool/template matrices are finite and versioned | Support matrix digest | `N/A UNTIL PUBLISH` for aggregation; the internal matrix is Python 3.12 on the observed local/Linux-CI environments with frozen tool/template identities |
 
-### Phase B: pull-request gates
+### Phase B: pre-release gates
 
-These are mandatory on every change and run only in `H0-hermetic`.
+These define the dormant publication evidence shape. Ordinary development uses
+local `pytest -m offline`; pre-release confirmation positively selects H0, H1,
+and P0 on Python 3.12 and never selects live work.
 
 | Gate | Type | Requirement | Machine evidence |
 |---|---|---|---|
@@ -219,9 +214,9 @@ These are mandatory on every change and run only in `H0-hermetic`.
 | `B-DETERMINISM` | Functional | Canonical serializers, synthetic fixture generation, reports, manifests, and derived views are byte-stable across exactly two isolated runs | Retained paired file/tree manifests and a candidate-bound structured diff; `artifact_differences` is exactly zero |
 | `B-DOCS-POLICY` | Professionalism | CLI/help/config/schema/source registry and policy labels agree; broad Nuclei, private reach, and public Interactsh choices are stated accurately | Candidate-bound parity report: fixed passing test roster, raw test/material digests, and one signed H0 instance |
 
-At Phase 0 these gates are `open` as release gates even when constituent tests
-already pass locally, because accepted full-suite execution, release-runtime,
-threshold, and machine-evidence contracts have not been configured.
+Their old Phase 0 `open` descriptions apply only to dormant external promotion.
+They do not supersede the completed v0.3.10 internal checks recorded in the
+release ledger.
 
 `B-DOCS-POLICY` therefore remains `open` until its candidate-bound report is
 accepted from an H0-hermetic evidence instance; a locally passing parity suite
@@ -249,27 +244,23 @@ remain open; these checks do not close the release gate.
 | `C-PACKAGE-BUILD` | `P0` | Clean sdist/wheel build; package metadata and version agree; required data, license, notices, schemas, and entry points are present | Artifact inventory and digest, metadata validation, build log |
 | `C-PACKAGE-INSTALL` | `P0` | Install into a clean disposable prefix and exercise public imports/CLI from the installed artifact, never the checkout | Install inventory, import/CLI results, environment identity |
 | `C-PYTHON-MATRIX` | `P0`/`H0` | Oldest and every stable Python minor satisfying the published metadata pass required gates. Every accepted H0/P0 support environment binds its exact B-HERMETIC-ALL or C-PACKAGE-BUILD/C-PACKAGE-INSTALL evidence instance; the report separately rehashes the shared candidate package/install source artifacts | One candidate-bound `quarry.python-matrix-report.v1`, which binds and parses the exact package metadata range; any missing or substituted environment, run, source instance or artifact is `blocked` |
-| `C-SBOM` | `P0` | Three raw installed-runtime observations, one for each accepted P0 Python 3.10/3.11/3.12 environment, are merged into a candidate-bound direct/transitive dependency and bundled-tool/template inventory with licenses and content identities | Three raw observation records plus the merged candidate-bound SBOM digest and inventory reconciliation report |
-| `C-VULNERABILITY` | `P0` | Three retained `pip-audit` observations of the exact resolved non-root C-SBOM dependency closure are reconciled with their matching C-SBOM environments. A pass additionally requires a trusted, fresh database snapshot attestation that covers dependency, container, tool, and template subjects; exceptions are explicit, owned, approved, and time-bounded. | Three raw observation wrappers (exact stdout/stderr/status and argv), candidate findings/dispositions, and the provider attestation |
+| `C-SBOM` | `P0` | One raw installed-runtime observation from the accepted Python 3.12 P0 environment records the direct/transitive dependency and bundled-tool/template inventory with licenses and content identities | Python 3.12 observation record and inventory reconciliation output |
+| `C-VULNERABILITY` | `P0` | One retained `pip-audit` observation audits the exact resolved non-root Python 3.12 C-SBOM dependency closure; public-distribution provider attestation remains dormant | Raw observation wrapper with exact stdout/stderr/status and argv; external findings/provider attestation is `N/A UNTIL PUBLISH` |
 | `C-PROVENANCE` | `P0` | The releasable sdist/wheel subjects bind source candidate and the exact trusted P0 builder execution; namespaced materials bind the validated build/install reports, final SBOM graph/observations, and vulnerability/provider evidence; signatures/digests verify | Provenance and signature verification report |
 | `C-INSTALL-ROLLBACK` | `H1`/`P0` | Failure at every acquisition/verification/activation point preserves the last-known-good install and never exposes a partial active version | Fault matrix, before/after identities, filesystem trace |
 
-The CI package matrix emits one raw C-SBOM observation per P0 Python
-environment and uploads that observation once for the matrix job. A trusted
-release collector must bind all three raw observations to their exact accepted
-P0 evidence instances and merge them into the candidate-bound C-SBOM. The
-accepted P0 runtime and signing evidence remain `OPEN`; CI observations are
-inputs and do not close the gate.
+The CI package job emits and uploads one raw C-SBOM observation for its accepted
+Python 3.12 P0 environment. External merging, signing, and provider attestation
+remain dormant and `N/A UNTIL PUBLISH`.
 
 The same one `pip-audit --strict --no-deps --disable-pip -r /dev/stdin`
 invocation per P0 row audits the exact, sorted non-root dependency closure
 derived from that row's C-SBOM observation. Its bounded C-VULNERABILITY wrapper
 contains the canonical input roster plus exact CycloneDX stdout, stderr, exit
-status, scanner argv, and C-SBOM subject. It is source substrate only: pip-audit output supplies neither a
-trusted database snapshot nor current freshness; an independent release
-vulnerability authority must return explicit advisory results for every P0
-runner-image, tool, and template subject. Until a trusted collector provides that
-attestation, this gate and `RG02` remain `OPEN`.
+status, scanner argv, and C-SBOM subject. For a future public distribution, an
+independent vulnerability authority must additionally establish database
+freshness and explicit advisory results. That ceremony is not an internal
+v0.3.10 blocker.
 
 #### Tool integration and compatibility
 
@@ -394,7 +385,10 @@ signed H1 owner for the exact combined 124-row matrix.  The gate remains
 
 #### Performance and scale matrix
 
-Performance observations require a versioned benchmark manifest. It identifies the
+The committed threshold/benchmark manifest remains a dormant future-publication
+input for v0.3.10; its unresolved numeric fields do not block the internal
+milestone. The approved internal rule is authoritative: integrity failures
+block, while performance values are record-only. A future active benchmark manifest identifies the
 fixture digest, operation, concurrency, warmup/repetition rule, CPU/memory/disk
 limits, host or runner class, tool identities, and both absolute and regression
 measurements. For `v0.3.10`, resource and speed values are measure-and-record
@@ -446,15 +440,14 @@ digest. If live execution is required, each emits `pass` or `blocked` as
 applicable; a violated assertion remains `fail` under the general result
 vocabulary. A script-level `SKIP` never closes a slot.
 
-### Phase E: publication gate
+### Phase E: dormant publication gate
 
-The publication-only parts of this phase, including production trust,
-`E-APPROVAL`, signed tagging, and publication receipts, are N/A for the
-`v0.3.10` internal-integrity milestone under the applicability rule above.
-`E-DOCS`, `E-PROJECT-HYGIENE`, and the internal artifact/content checks remain
-applicable.
+This entire aggregate/signature phase is dormant and `N/A UNTIL PUBLISH` for
+the v0.3.10 internal-integrity milestone. The internal documentation, project
+hygiene and content checks were exercised by the local and GitHub gates; they do
+not require signed H0 records or an accepted aggregate.
 
-The publication decision is a separate, reproducible aggregation step:
+For a future publication, the decision is a separate reproducible aggregation step:
 
 | Gate | Requirement |
 |---|---|
@@ -464,7 +457,7 @@ The publication decision is a separate, reproducible aggregation step:
 | `E-ARTIFACTS` | Candidate-built package, SBOM, provenance, schemas and checksums are accepted publication subjects; the later publication receipt proves those exact bytes, and no substitutes, were promoted |
 | `E-APPROVAL` | Named release approver reviews the aggregate and signs a detached approval bound to its digest; approver cannot overwrite underlying gate results |
 
-The pre-publication `E-ARTIFACTS` verifier recomputes the exact subject set from
+For that future publication, the pre-publication `E-ARTIFACTS` verifier recomputes the exact subject set from
 the indexed candidate sdist, wheel, SBOM, provenance and every scope-bound
 schema.  This closes the local reconciliation machinery only; the gate remains
 `OPEN` until that canonical subject list is carried by an accepted signed H0
@@ -495,12 +488,9 @@ every gate whose inputs it changes.
 The committed v1 candidate-identity, schema-registry and gate-record contracts
 are in [`release/evidence`](../../release/evidence/). Their strict reader and
 clean-Git identity collector are implemented in
-[`release_evidence.py`](../../src/quarry_recon/release_evidence.py). These are a
-prerequisite slice, not accepted gate evidence: they do not verify signatures,
-open and rehash content-addressed artifacts, aggregate a scope-selected gate-record set or
-implement the nomination, approval, publication or documentation-reconciliation
-lifecycle defined below. `A-IDENTITY`, `A-EVIDENCE-SCHEMA` and `RG00` therefore
-remain open.
+[`release_evidence.py`](../../src/quarry_recon/release_evidence.py). Their
+external aggregation/signature path is retained dormant and is
+`N/A UNTIL PUBLISH`; it is not a v0.3.10 completion requirement.
 
 The separate committed development profile, exact job-map contracts and Linux
 H0 runner are also prerequisite machinery. The runner privately materializes
@@ -516,7 +506,7 @@ scope ledger. The collector and reader refuse any other release label; a later
 release requires its own explicit registry/scope contract rather than reusing
 the v0.3.10 input under a different label.
 
-### Forward-only evidence lifecycle
+### Dormant forward-only publication lifecycle
 
 The candidate commit contains the final source, package version, scope ledger,
 schemas and other validation inputs, but never results produced after

@@ -45,8 +45,11 @@ def test_public_project_integrity_files_are_committed_in_shape():
     assert "RELEASE-PROCESS.md" in contributing
 
     changelog = _text("CHANGELOG.md")
-    assert changelog.index("## [Unreleased]") < changelog.index("## [0.3.9]")
-    assert "remains unreleased" in changelog
+    assert changelog.index("## [Unreleased]") < changelog.index("## [0.3.10]")
+    assert changelog.index("## [0.3.10]") < changelog.index("## [0.3.9]")
+    assert "## [0.3.10] - 2026-08-22" in changelog
+    assert "Python 3.12 on Linux is the supported and tested runtime" in changelog
+    assert "ceremony are\n  dormant until Quarry is published" in changelog
 
     release_process = _text("docs/releases/RELEASE-PROCESS.md")
     release_process_words = " ".join(release_process.split())
@@ -56,7 +59,7 @@ def test_public_project_integrity_files_are_committed_in_shape():
 
 def test_package_metadata_uses_spdx_and_pinned_ci_tools():
     project = tomllib.loads(_text("pyproject.toml"))
-    assert project["project"]["version"] == "0.3.9"
+    assert project["project"]["version"] == "0.3.10"
     assert project["project"]["license"] == "MIT"
     assert project["project"]["license-files"] == ["LICENSE", "NOTICE"]
     assert project["build-system"]["requires"] == ["setuptools==80.9.0"]
@@ -73,6 +76,37 @@ def test_package_metadata_uses_spdx_and_pinned_ci_tools():
     }
     assert {item.split("==", 1)[0] for item in ci} == expected
     assert all(re.fullmatch(r"[a-z-]+==[0-9]+(?:\.[0-9]+)+", item) for item in ci)
+
+
+def test_v310_internal_closure_and_dormant_publication_state_are_exact():
+    matrix = json.loads(_text("release/evidence/support-matrix-v1.json"))
+    environments = matrix["environments"]
+    assert len(environments) == 4
+    assert {row["lane"] for row in environments} == {
+        "H0-hermetic",
+        "H1-tool-integration",
+        "C0-private-corpus",
+        "P0-package-supply",
+    }
+    assert {row["python"] for row in environments} == {"3.12.13"}
+
+    thresholds = json.loads(_text("release/evidence/threshold-benchmark-v1.json"))
+    assert thresholds["approval"] is None
+    assert all(
+        row["limit"] is None
+        for row in thresholds["thresholds"]
+        if row["gate_id"].startswith("C-PERF-")
+    )
+
+    ledger = _text("docs/releases/v0.3.10.md")
+    assert "**Decision:** **INTERNAL INTEGRITY COMPLETE**" in ledger
+    assert ledger.count("| `CLOSED` —") == 10
+    assert "GitHub Actions [run #63]" in ledger
+    assert "`RG00` through `RG09`" in ledger
+    assert "`N/A UNTIL PUBLISH`" in ledger
+    assert "hangs, resource overspend, evidence loss, corruption or omission" in ledger
+    assert "latency, throughput, RSS, disk use, and artifact size" in ledger
+    assert "`V310-01` and `V310-03` through `V310-10` maintainer sign-off" in ledger
 
 
 def test_pre_release_ci_triggers_exactly_and_selects_every_nonlive_lane_separately():

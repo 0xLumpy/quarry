@@ -88,7 +88,7 @@ def test_wheel_carries_spdx_license_and_runtime_data():
 
 def test_installed_candidate_comes_from_the_wheel_and_exposes_the_cli():
     distribution = importlib.metadata.distribution("quarry-recon")
-    assert distribution.version == "0.3.9"
+    assert distribution.version == "0.3.10"
     console_scripts = {
         entry.name: entry.value
         for entry in distribution.entry_points

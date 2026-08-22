@@ -6,9 +6,9 @@ implemented or closed; current status belongs in the release ledger under
 
 ## v0.3.10 — integrity and evidence truth
 
-Close the current execution, persistence, revision, campaign, installation,
-network-boundary, configuration and report-truth invariants. No new acquisition
-breadth belongs in this release. Exact scope and gates are maintained in
+Completed the execution, persistence, revision, campaign, installation,
+network-boundary, configuration and report-truth invariants without adding
+acquisition breadth. Exact scope and closure evidence are maintained in
 [`releases/v0.3.10.md`](releases/v0.3.10.md).
 
 ## v0.3.11 — operator evidence and reporting

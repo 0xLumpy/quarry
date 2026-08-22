@@ -1,5 +1,11 @@
 # Quarry current-HEAD closure ledger
 
+> **Historical baseline:** this ledger is bound to the audited 2026-08-14
+> revision below. Its `NO-GO`, `OPEN`, and `REOPENED` rows are superseded for
+> v0.3.10 milestone disposition by the current
+> [v0.3.10 release ledger](../releases/v0.3.10.md); they remain unchanged here as
+> audit history and are not current release blockers.
+
 **Audited source revision:** `19ab50cbdc2415c78e9bb5651dec2e072bb3a71b`
 
 **Audited Git tree:** `8311829d62be4b7099979e2c0e2f476c2f94fc34`

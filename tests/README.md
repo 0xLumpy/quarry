@@ -61,10 +61,10 @@ constrained H0 fixtures where semantics permit; it is not erased by assigning th
 The committed Linux development runner produced this manifest from a private export of the exact commit,
 inside its frozen bubblewrap profile, and bound it to the formal verification-job map and a candidate
 identity. The result is still a collect-only development diagnostic, not an accepted candidate artifact:
-the package is non-nominated `0.3.9`, the mounted host `/usr` runtime is untrusted and has no complete
-dependency-closure attestation, and the summary explicitly declares `authority: none` and
-`promotion_eligible: false`. It occupies no release evidence slot. `A-TAXONOMY` therefore remains `open`,
-and `RG00` remains `OPEN`.
+the package was non-nominated `0.3.9`, the mounted host `/usr` runtime was untrusted and had no complete
+dependency-closure attestation, and the summary explicitly declared `authority: none` and
+`promotion_eligible: false`. It occupies no release evidence slot. Its `A-TAXONOMY` and `RG00` values are
+historical dormant-publication results, not v0.3.10 internal-milestone blockers.
 
 ## Guard boundary
 

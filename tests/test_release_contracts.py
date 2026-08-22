@@ -1779,6 +1779,24 @@ def _ready_contracts(
         policy = _policy()
     scope = _read("release/evidence/release-scope-v1.json", contracts.read_release_scope)
     support = _read("release/evidence/support-matrix-v1.json", contracts.read_support_matrix)
+    # The aggregate/signature verifier is dormant for the internal milestone,
+    # but its synthetic conformance scenario intentionally retains the former
+    # three-interpreter publication topology. Keep that fixture independent of
+    # the committed Python-3.12-only support matrix.
+    h0 = next(row for row in support["environments"] if row["lane"] == "H0-hermetic")
+    h1 = next(row for row in support["environments"] if row["lane"] == "H1-tool-integration")
+    c0 = next(row for row in support["environments"] if row["lane"] == "C0-private-corpus")
+    p0 = next(row for row in support["environments"] if row["lane"] == "P0-package-supply")
+    support["environments"] = [
+        {**copy.deepcopy(h0), "python": "3.10.20"},
+        {**copy.deepcopy(h0), "python": "3.11.9"},
+        h0,
+        h1,
+        c0,
+        {**copy.deepcopy(p0), "python": "3.10.20"},
+        {**copy.deepcopy(p0), "python": "3.11.9"},
+        p0,
+    ]
     thresholds = _read(
         "release/evidence/threshold-benchmark-v1.json", contracts.read_threshold_manifest,
     )
@@ -1845,6 +1863,13 @@ def _ready_contracts(
     replacements = {
         "corpus-selection": contracts.canonical_json_line(corpus),
         "no-live-rule": contracts.canonical_json_line(no_live),
+        # The dormant publication verifier's frozen project-hygiene scenario
+        # models a pre-release changelog. The committed milestone changelog is
+        # now closed, so keep the synthetic ceremony input independent too.
+        "project-changelog": (
+            b"# Changelog\n\n## [Unreleased]\n\n"
+            b"`0.3.10` remains unreleased.\n\n## [0.3.9]\n"
+        ),
         "support-matrix": contracts.canonical_json_line(support),
         "threshold-benchmark": contracts.canonical_json_line(thresholds),
     }
@@ -2824,6 +2849,11 @@ class TestCommittedContracts:
         assert support["approval"]["signature"] is None
         assert len(support["tools"]) == 26
         assert len(support["template_sets"]) == 1
+        assert len(support["environments"]) == 4
+        assert {row["lane"] for row in support["environments"]} == {
+            "H0-hermetic", "H1-tool-integration", "C0-private-corpus", "P0-package-supply",
+        }
+        assert {row["python"] for row in support["environments"]} == {"3.12.13"}
         assert {row["runner_image"] for row in support["environments"]} == {
             "github-actions-ubuntu-latest", "local-linux",
         }
