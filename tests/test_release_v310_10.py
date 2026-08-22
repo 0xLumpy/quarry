@@ -75,8 +75,12 @@ def test_package_metadata_uses_spdx_and_pinned_ci_tools():
     assert all(re.fullmatch(r"[a-z-]+==[0-9]+(?:\.[0-9]+)+", item) for item in ci)
 
 
-def test_pull_request_ci_selects_every_public_nonlive_lane_separately():
+def test_pre_release_ci_triggers_exactly_and_selects_every_nonlive_lane_separately():
     workflow = yaml.safe_load(_text(".github/workflows/ci.yml"))
+    assert workflow["on"] == {
+        "workflow_dispatch": None,
+        "push": {"tags": ["v*"]},
+    }
     assert workflow["permissions"] == {"contents": "read"}
     jobs = workflow["jobs"]
     assert set(jobs) == {"offline", "integration", "package"}

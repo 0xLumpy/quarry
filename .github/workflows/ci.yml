@@ -1,11 +1,11 @@
 name: ci
 
-# Pull-request CI never selects the authorized-live lane. H0, H1, and P0 are
+# Pre-release CI never selects the authorized-live lane. H0, H1, and P0 are
 # separate positive selections so a marker mistake cannot silently broaden a job.
-on:
+"on":
+  workflow_dispatch:
   push:
-    branches: [main]
-  pull_request:
+    tags: ["v*"]
 
 permissions:
   contents: read

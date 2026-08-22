@@ -7,7 +7,7 @@ coverage are represented truthfully.
 ## Before opening a change
 
 - Work only with synthetic fixtures or systems you are explicitly authorized
-  to assess. Pull-request CI never authorizes live contact.
+  to assess. Pre-release CI never authorizes live contact.
 - Open a private security advisory for scope escapes, credential exposure,
   installation boundary failures, or evidence-integrity bypasses; do not file
   those details publicly.

@@ -44,7 +44,7 @@ repository or a public CI log.
 1. Start from a clean, reviewed commit. Verify the release-scope registry,
    schemas, workflow/job map, support matrix, thresholds, corpus selection,
    no-live rule, candidate release notes, and production trust policy.
-2. Run every pull-request gate and the supported non-live lane matrix. A skip,
+2. Run every pre-release CI gate and the supported non-live lane matrix. A skip,
    deselection, unsupported dependency, or unavailable required tool is not a
    pass.
 3. Build source and wheel artifacts in the declared package lane; inspect their
