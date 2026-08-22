@@ -118,6 +118,31 @@ unmeasurable lane are recorded as such, not as a clean empty. But because some l
 instrumented (see the `complete` caveat above), a clean-looking run is not a guarantee every lane ran.
 This is why the verdict, not the finding count, tells you whether a run is usable.
 
+## Supported v0.3.x resource envelope
+
+Quarry v0.3.x deliberately publishes a finite support envelope; it does not
+claim an unbounded or disk-indexed corpus. The exact machine contract is
+`resource_contract.support_envelope()` and is embedded in each resource-gate
+report. Its current limits are:
+
+| Area | Supported bound | Behavior at or beyond the bound |
+|---|---:|---|
+| Store keys | 100,000 effective keys per entity | Refused work is recorded as a terminal unschedulable gap; payload retention is not claimed. |
+| Store key size | 65,536 bytes per key | The oversized observation is refused and the run cannot report clean coverage. |
+| Store corpus bytes | 33,554,432 bytes per entity | The excess is a terminal gap, not a replayable key-only remainder. |
+| Store memory declaration | `rss_budget_mb: 160` | The v0.3 store still materializes the whole supported corpus; the disk-backed indexed repository remains deferred. |
+| Acquisition ownership | One cross-process writer per filesystem/destination; 5,000 ms lease wait | Reservations and destination publication serialize across processes; timeout is typed rather than an unowned write. |
+| Resolver corpus | At most 100,000 hosts, 253 UTF-8 bytes per host | Oversized input is refused before contact with exact durable work where it fits, otherwise a terminal gap. |
+| Resolver execution | 16 workers and 16 outstanding queries; one 30,000 ms corpus deadline | Late results cannot mutate the sealed result; unresolved work is durably retained or truthfully terminal. |
+| Resolver teardown | 500 ms terminate grace; 2,500 ms hard-kill fallback | Workers are reclaimed before the batch settles. |
+| Resolver records | 65,536-byte worker result; 38,101,405-byte remainder record | Oversized or incomplete records fail closed and cannot be called replayable. |
+
+Latency, throughput, RSS, disk-use, and artifact-size measurements are
+measure-and-record for v0.3.10. They do not block this integrity milestone
+merely for being slow. Hangs, resource overspend, evidence loss or corruption,
+leaked execution state, and silent starvation remain blocking integrity
+failures.
+
 ## Evidence and sharing boundary
 
 The product contract requires raw artifacts and normalized observations to be private canonical evidence.
@@ -144,7 +169,8 @@ The synthetic 24,068-observation replay is a public shape/determinism check, not
 unselected private corpus. Report timing/RSS/size records are descriptive while the reviewed benchmark
 manifest and numeric `C-PERF-REPORT` thresholds remain unset; measurements alone cannot close that gate.
 
-This is the required boundary, not a claim that every `v0.3.9` path already satisfies it. The current-HEAD
-audit records open lossless-normalization/reporting and typed credential-isolation defects under
+The historical current-HEAD audit entries under
 [`HEAD-05`](audit/CURRENT-HEAD.md#head-05-installation-runtime-identity-and-credential-isolation) and
-[`HEAD-08`](audit/CURRENT-HEAD.md#head-08-truthful-lossless-private-reports-and-complete-provenance).
+[`HEAD-08`](audit/CURRENT-HEAD.md#head-08-truthful-lossless-private-reports-and-complete-provenance)
+describe the defects that initiated this milestone. The v0.3.10 release ledger,
+not those historical findings, records current acceptance status.
